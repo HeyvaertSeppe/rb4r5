@@ -1,0 +1,38 @@
+[Unit]
+# Runs the XDJ-RX3 rekordbox player (rbp) full screen on this Pi, with the
+# DDJ-FLX4, the touchscreen, the keyboard and the USB library watcher.
+# `launch.py run` is the supervisor: it prepares the screen, mounts the chroot,
+# starts every process and restarts anything that dies.
+Description=rb4r5 - rekordbox player (XDJ-RX3 rbp) on Raspberry Pi 5
+Documentation=file://@REPO@/README.md file://@REPO@/docs/09-launcher.md
+After=multi-user.target sound.target local-fs.target
+Wants=sound.target
+# A getty on tty1 would paint a login prompt over the player's framebuffer.
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ @REPO@/launch.py run
+ExecStop=@PYTHON@ @REPO@/launch.py stop
+WorkingDirectory=@REPO@
+# The player needs the real framebuffer, the chroot mounts and /proc/<pid>/mem.
+User=root
+# Give the USB devices and the monitor time to appear on a cold boot.
+TimeoutStartSec=180
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+# A boot loop must not hide a real fault: give up after 5 tries in 10 minutes
+# (`journalctl -u rb4r5` and /var/log/rb4r5/rbp.log then say why).
+StartLimitBurst=5
+StartLimitIntervalSec=600
+# Audio and the UI both want low latency; the player's own RT requests are
+# neutralised by audioshim, so give the whole service a mild boost instead.
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+StandardOutput=append:@LOGS@/supervisor.log
+StandardError=append:@LOGS@/supervisor.log
+
+[Install]
+WantedBy=multi-user.target

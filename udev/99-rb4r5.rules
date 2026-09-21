@@ -1,0 +1,24 @@
+# rb4r5 device rules.
+#
+# The player and its daemons run as root, so none of this is strictly needed
+# for the service; it is here so the same hardware also works when you poke at
+# it from your own login (aplay, amidi, evtest, launch.py calibrate).
+
+# Pioneer DJ / AlphaTheta controllers (the DDJ-FLX4 is 2b73:xxxx).  Matching the
+# vendor rather than a product id covers the FLX4, FLX2, DDJ-400 and friends.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2b73", MODE="0660", GROUP="audio", TAG+="uaccess"
+
+# The controller's raw MIDI node - this is what flx4-bridge reads.
+SUBSYSTEM=="sound", KERNEL=="midiC[0-9]*D[0-9]*", GROUP="audio", MODE="0660"
+
+# Touchscreens: a USB HID panel shows up as an event device with MT axes.
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_INPUT_TOUCHSCREEN}=="1", \
+    GROUP="input", MODE="0660", TAG+="uaccess"
+
+# The framebuffer the player draws into.
+SUBSYSTEM=="graphics", KERNEL=="fb0", GROUP="video", MODE="0660"
+
+# If you would rather have udev tell the bridge about a replugged controller
+# than let it poll (it waits for the device by itself, so this is optional):
+#ACTION=="add", SUBSYSTEM=="sound", ATTRS{idVendor}=="2b73", \
+#    RUN+="/bin/systemctl try-restart rb4r5.service"

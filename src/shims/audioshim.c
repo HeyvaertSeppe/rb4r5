@@ -1,0 +1,802 @@
+/* audioshim.c - LD_PRELOAD: map the XDJ-RX3 audio devices onto the hardware
+ * that is actually present on a Raspberry Pi 5.
+ *
+ *   rbp opens three stereo ALSA devices (master / headphones / booth) named
+ *   hw:cs4344audiorev8,0|1|2 plus the control device hw:cs4344audiorev8.
+ *   None of them exist here, and JUCE does more than fail: getDeviceProperties()
+ *   cannot enumerate rates, the rate defaults to 0 and
+ *   DjEngineIF::audioDeviceAboutToStart() aborts with "sampleRate:0 != 44100".
+ *
+ *   More importantly the transport is clocked by the ALSA callback:
+ *   PlayEngine::update() only runs from DjEngineIF::audioDeviceIOCallback().
+ *   No running PCM => no playhead, no waveform, even though the UI repaints.
+ *
+ * This shim presents the RX3 devices as virtual handles and muxes them onto one
+ * real PCM:
+ *
+ *   DDJ-FLX4 (4 channels)   master -> ch 1/2 (MASTER out)
+ *                           cue    -> ch 3/4 (HEADPHONES out)
+ *                           booth  -> dropped
+ *   HDMI / any stereo PCM   master (or cue, see RB_AUDIO_CUE_ON_2CH) -> ch 1/2
+ *
+ * Everything hardware-specific is passed in by the launcher (rb4r5/audio.py),
+ * which enumerates /proc/asound and picks the device, so this file has no
+ * card numbers compiled into it:
+ *
+ *   RB_AUDIO_DEV        ALSA device name, e.g. "plughw:CARD=FLX4,DEV=0"
+ *                       (a comma-separated list is tried in order)
+ *   RB_AUDIO_CH         real channel count: 4 (FLX4) or 2 (HDMI)   [default 2]
+ *   RB_AUDIO_RATE       sample rate to negotiate                   [44100]
+ *   RB_AUDIO_FMT        ALSA format id to request                  [6 = S24_LE]
+ *   RB_AUDIO_CUE_ON_2CH 1 = a stereo sink carries the cue mix when the cue has
+ *                       audio (the Chromebit behaviour); 0 = always master
+ *   RB_AUDIO_CUE_MIRROR 1 = mirror master into ch 3/4 until the engine
+ *                       produces a real cue mix (4-channel sinks only)
+ *   STARTUP_MUTE_MS / STARTUP_FADE_MS   start-up pop suppression (see below)
+ *
+ * Prefer a "plughw:" device: alsa-lib then converts S24_LE -> whatever the
+ * FLX4 actually accepts (S24_3LE/S32_LE) and resamples if the device will not
+ * do 44100.  Use "hw:" only when the launcher has verified an exact match.
+ *
+ * Build: soft-float EABI5, GLIBC_2.4 only (see src/shims/Makefile).
+ */
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+/* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13 */
+__asm__(".symver dlsym, dlsym@GLIBC_2.4");
+__asm__(".symver dlopen, dlopen@GLIBC_2.4");
+__asm__(".symver dlerror, dlerror@GLIBC_2.4");
+__asm__(".symver dlclose, dlclose@GLIBC_2.4");
+
+#ifndef SYS_mmap2
+#define SYS_mmap2 __NR_mmap2
+#endif
+
+/* rbp's user_space_rtc_init() calls mmap(MAP_SHARED, fd=-1) after the /dev/mem
+ * open fails (memshim denies it).  That mmap returns MAP_FAILED and leaves a
+ * dangling RTC pointer which later SIGSEGV-loops.  Redirect the broken
+ * combination to anonymous memory so it succeeds with zeroes.  (memshim does
+ * the same; whichever shim resolves first wins, both are equivalent.) */
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    if (fd < 0 && (flags & MAP_SHARED) && !(flags & MAP_ANONYMOUS)) {
+        flags = (flags & ~MAP_SHARED) | MAP_PRIVATE | MAP_ANONYMOUS;
+        fd = -1;
+        offset = 0;
+    }
+    return (void *)syscall(SYS_mmap2, addr, length, prot, flags, fd,
+                           (unsigned long)offset >> 12);
+}
+
+#define LOG_PATH "/tmp/audioshim.log"
+
+static void alog(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        write(fd, buf, strlen(buf));
+        close(fd);
+    }
+}
+
+/* Opaque ALSA types */
+typedef void snd_pcm_t;
+typedef void snd_pcm_hw_params_t;
+typedef void snd_pcm_sw_params_t;
+typedef unsigned long snd_pcm_uframes_t;
+typedef long snd_pcm_sframes_t;
+
+#define SND_PCM_STREAM_PLAYBACK 0
+#define SND_PCM_STREAM_CAPTURE  1
+#define SND_PCM_ACCESS_RW_INTERLEAVED 3
+#define SND_PCM_FORMAT_S24_LE   6
+
+/* Virtual handles for the streams that are not the real device */
+static int g_h_hp     = 1;
+static int g_h_booth  = 2;
+static int g_h_dummy  = 3;
+static int g_h_cap    = 4;
+
+static snd_pcm_t *g_real_playback = NULL;
+static int g_playback_open_count  = 0;
+
+/* ---- runtime configuration (env, filled by the launcher) --------------- */
+static int   g_cfg_done     = 0;
+static char  g_dev_list[256] = "";
+static int   g_real_ch      = 2;
+static int   g_rate         = 44100;
+static int   g_format       = SND_PCM_FORMAT_S24_LE;
+static int   g_cue_on_2ch   = 0;
+static int   g_cue_mirror   = 0;
+
+static void cfg_init(void)
+{
+    const char *s;
+
+    if (g_cfg_done)
+        return;
+    g_cfg_done = 1;
+
+    s = getenv("RB_AUDIO_DEV");
+    if (s && *s)
+        snprintf(g_dev_list, sizeof(g_dev_list), "%s", s);
+
+    s = getenv("RB_AUDIO_CH");
+    if (s && *s) g_real_ch = atoi(s);
+    if (g_real_ch != 2 && g_real_ch != 4) g_real_ch = 2;
+
+    s = getenv("RB_AUDIO_RATE");
+    if (s && *s) g_rate = atoi(s);
+    if (g_rate < 8000 || g_rate > 192000) g_rate = 44100;
+
+    s = getenv("RB_AUDIO_FMT");
+    if (s && *s) g_format = atoi(s);
+
+    s = getenv("RB_AUDIO_CUE_ON_2CH");
+    if (s && *s && *s != '0') g_cue_on_2ch = 1;
+
+    s = getenv("RB_AUDIO_CUE_MIRROR");
+    if (s && *s && *s != '0') g_cue_mirror = 1;
+
+    alog("audioshim: cfg dev='%s' ch=%d rate=%d fmt=%d cue_on_2ch=%d cue_mirror=%d\n",
+         g_dev_list[0] ? g_dev_list : "(auto)", g_real_ch, g_rate, g_format,
+         g_cue_on_2ch, g_cue_mirror);
+}
+
+/* Real ALSA function pointers */
+static int (*real_snd_pcm_open)(snd_pcm_t **, const char *, int, int) = NULL;
+static int (*real_snd_pcm_close)(snd_pcm_t *) = NULL;
+static int (*real_snd_pcm_hw_params)(snd_pcm_t *, snd_pcm_hw_params_t *) = NULL;
+static int (*real_snd_pcm_hw_params_any)(snd_pcm_t *, snd_pcm_hw_params_t *) = NULL;
+static int (*real_snd_pcm_hw_params_set_access)(snd_pcm_t *, snd_pcm_hw_params_t *, int) = NULL;
+static int (*real_snd_pcm_hw_params_set_format)(snd_pcm_t *, snd_pcm_hw_params_t *, int) = NULL;
+static int (*real_snd_pcm_hw_params_set_channels)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int) = NULL;
+static int (*real_snd_pcm_hw_params_set_rate_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
+static int (*real_snd_pcm_hw_params_set_period_size_near)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *) = NULL;
+static int (*real_snd_pcm_hw_params_set_periods_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
+static int (*real_snd_pcm_sw_params_current)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
+static int (*real_snd_pcm_sw_params_get_boundary)(const snd_pcm_sw_params_t *, snd_pcm_uframes_t *) = NULL;
+static int (*real_snd_pcm_sw_params_set_silence_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
+static int (*real_snd_pcm_sw_params_set_silence_size)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
+static int (*real_snd_pcm_sw_params_set_start_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
+static int (*real_snd_pcm_sw_params_set_stop_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
+static int (*real_snd_pcm_sw_params)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
+static int (*real_snd_pcm_prepare)(snd_pcm_t *) = NULL;
+static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t) = NULL;
+
+/* Control interface types */
+typedef void snd_ctl_t;
+typedef void snd_pcm_info_t;
+
+static int (*real_snd_ctl_open)(snd_ctl_t **, const char *, int) = NULL;
+static int (*real_snd_ctl_close)(snd_ctl_t *) = NULL;
+
+static void init_real_alsa(void)
+{
+    static int initialized = 0;
+    if (initialized) return;
+    initialized = 1;
+
+    cfg_init();
+
+    void *lib = dlopen("libasound.so.2", RTLD_LAZY | RTLD_GLOBAL);
+    if (!lib) {
+        alog("audioshim: failed to dlopen libasound.so.2: %s\n", dlerror());
+        return;
+    }
+
+    real_snd_pcm_open = dlsym(lib, "snd_pcm_open");
+    real_snd_pcm_close = dlsym(lib, "snd_pcm_close");
+    real_snd_pcm_hw_params = dlsym(lib, "snd_pcm_hw_params");
+    real_snd_pcm_hw_params_any = dlsym(lib, "snd_pcm_hw_params_any");
+    real_snd_pcm_hw_params_set_access = dlsym(lib, "snd_pcm_hw_params_set_access");
+    real_snd_pcm_hw_params_set_format = dlsym(lib, "snd_pcm_hw_params_set_format");
+    real_snd_pcm_hw_params_set_channels = dlsym(lib, "snd_pcm_hw_params_set_channels");
+    real_snd_pcm_hw_params_set_rate_near = dlsym(lib, "snd_pcm_hw_params_set_rate_near");
+    real_snd_pcm_hw_params_set_period_size_near = dlsym(lib, "snd_pcm_hw_params_set_period_size_near");
+    real_snd_pcm_hw_params_set_periods_near = dlsym(lib, "snd_pcm_hw_params_set_periods_near");
+    real_snd_pcm_sw_params_current = dlsym(lib, "snd_pcm_sw_params_current");
+    real_snd_pcm_sw_params_get_boundary = dlsym(lib, "snd_pcm_sw_params_get_boundary");
+    real_snd_pcm_sw_params_set_silence_threshold = dlsym(lib, "snd_pcm_sw_params_set_silence_threshold");
+    real_snd_pcm_sw_params_set_silence_size = dlsym(lib, "snd_pcm_sw_params_set_silence_size");
+    real_snd_pcm_sw_params_set_start_threshold = dlsym(lib, "snd_pcm_sw_params_set_start_threshold");
+    real_snd_pcm_sw_params_set_stop_threshold = dlsym(lib, "snd_pcm_sw_params_set_stop_threshold");
+    real_snd_pcm_sw_params = dlsym(lib, "snd_pcm_sw_params");
+    real_snd_pcm_prepare = dlsym(lib, "snd_pcm_prepare");
+    real_snd_pcm_writei = dlsym(lib, "snd_pcm_writei");
+    real_snd_ctl_open = dlsym(lib, "snd_ctl_open");
+    real_snd_ctl_close = dlsym(lib, "snd_ctl_close");
+
+    alog("audioshim: real ALSA initialized\n");
+}
+
+/* Mix buffers.  The engine hands us S24_LE samples in int32 containers, which
+ * is what we write out too (alsa-lib's plug layer converts if the device wants
+ * S24_3LE or S32_LE). */
+#define MAX_FRAMES 4096
+static int32_t g_mix4ch[MAX_FRAMES * 4];    /* RX3 master L/R + cue L/R   */
+static int32_t g_out[MAX_FRAMES * 4];       /* what goes to the hardware  */
+static unsigned long g_write_count = 0;
+
+/* ---- Startup mute / fade-in --------------------------------------------
+ * rb's first audio buffers contain a full-scale transient (0x800000, the
+ * most-negative 24-bit value) for ~200 ms, which is a loud pop through the
+ * FLX4's master out.  Hold the output at zero for STARTUP_MUTE_MS after the
+ * first write, then fade in over STARTUP_FADE_MS so the unmute cannot click.
+ *   STARTUP_MUTE_MS=0 -> disabled; defaults 1500 / 300 ms. */
+static long g_startup_mute_frames = -1;
+static long g_startup_fade_frames = -1;
+static unsigned long long g_startup_frames_done = 0;
+static int g_startup_logged_mute = 0;
+static int g_startup_logged_open = 0;
+
+static void startup_env_init(void)
+{
+    if (g_startup_mute_frames >= 0) return;
+    long mute_ms = 1500, fade_ms = 300;
+    const char *s = getenv("STARTUP_MUTE_MS");
+    if (s && *s) mute_ms = atol(s);
+    s = getenv("STARTUP_FADE_MS");
+    if (s && *s) fade_ms = atol(s);
+    if (mute_ms < 0) mute_ms = 0;
+    if (fade_ms < 0) fade_ms = 0;
+    g_startup_mute_frames = mute_ms * (long)g_rate / 1000L;
+    g_startup_fade_frames = fade_ms * (long)g_rate / 1000L;
+    alog("audioshim: startup mute=%ldms fade=%ldms (%ld+%ld frames @%d Hz)\n",
+         mute_ms, fade_ms, g_startup_mute_frames, g_startup_fade_frames, g_rate);
+}
+
+static float startup_gain(unsigned long long t, unsigned long long mute,
+                          unsigned long long fade)
+{
+    if (t < mute) return 0.0f;
+    if (fade > 0 && t < mute + fade) return (float)(t - mute) / (float)fade;
+    return 1.0f;
+}
+
+static inline int is_real(snd_pcm_t *pcm)
+{
+    return (pcm && pcm == g_real_playback);
+}
+
+/* Fallback device discovery, used only when the launcher did not set
+ * RB_AUDIO_DEV (e.g. rbp started by hand).  Prefer the DJ controller, then any
+ * HDMI sink, then ALSA's default. */
+static int pick_device(char *out, size_t n)
+{
+    FILE *f = fopen("/proc/asound/cards", "r");
+    char line[256];
+    int card = -1, flx = -1, ddj = -1, hdmi = -1;
+
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f)) {
+        int idx;
+        if (sscanf(line, " %d [", &idx) == 1) {
+            card = idx;
+            continue;
+        }
+        if (card < 0)
+            continue;
+        if (strstr(line, "FLX4") && flx < 0)
+            flx = card;
+        if (strstr(line, "DDJ") && ddj < 0)
+            ddj = card;
+        if ((strstr(line, "HDMI") || strstr(line, "vc4")) && hdmi < 0)
+            hdmi = card;
+    }
+    fclose(f);
+
+    if (flx < 0) flx = ddj;
+    if (flx >= 0) {
+        snprintf(out, n, "plughw:%d,0", flx);
+        g_real_ch = 4;
+        return 1;
+    }
+    if (hdmi >= 0) {
+        snprintf(out, n, "plughw:%d,0", hdmi);
+        g_real_ch = 2;
+        return 1;
+    }
+    return 0;
+}
+
+/* Open the first device of RB_AUDIO_DEV (comma separated) that works. */
+static void open_real_playback(int mode)
+{
+    char list[256];
+    char autodev[64];
+    char *p, *save = NULL;
+    int err = -1;
+
+    cfg_init();
+    if (!real_snd_pcm_open)
+        return;
+
+    if (!g_dev_list[0]) {
+        if (pick_device(autodev, sizeof(autodev)))
+            snprintf(g_dev_list, sizeof(g_dev_list), "%s,default", autodev);
+        else
+            snprintf(g_dev_list, sizeof(g_dev_list), "%s", "default");
+        alog("audioshim: no RB_AUDIO_DEV, auto-picked '%s'\n", g_dev_list);
+    }
+
+    snprintf(list, sizeof(list), "%s", g_dev_list);
+    for (p = strtok_r(list, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
+        while (*p == ' ') p++;
+        if (!*p)
+            continue;
+        err = real_snd_pcm_open(&g_real_playback, p, SND_PCM_STREAM_PLAYBACK, mode);
+        alog("audioshim: opened real '%s' for Master (mode=%d), res=%d handle=%p\n",
+             p, mode, err, g_real_playback);
+        if (err == 0 && g_real_playback)
+            return;
+        g_real_playback = NULL;
+    }
+    alog("audioshim: NO usable playback device (last res=%d) - the transport "
+         "will not advance\n", err);
+}
+
+int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
+{
+    init_real_alsa();
+    alog("audioshim: snd_pcm_open(name='%s', stream=%d, mode=%d)\n",
+         name ? name : "null", stream, mode);
+
+    if (stream == SND_PCM_STREAM_PLAYBACK) {
+        if (g_playback_open_count == 0) {
+            /* Output 0: Master -> the real device */
+            if (!g_real_playback)
+                open_real_playback(mode & ~2); /* clear NONBLOCK: the hardware paces us */
+            *pcm = g_real_playback;
+            g_playback_open_count++;
+            return 0;
+        } else if (g_playback_open_count == 1) {
+            alog("audioshim: mapped virtual Headphone/cue device\n");
+            *pcm = (snd_pcm_t *)&g_h_hp;
+            g_playback_open_count++;
+            return 0;
+        } else if (g_playback_open_count == 2) {
+            alog("audioshim: mapped virtual Booth device\n");
+            *pcm = (snd_pcm_t *)&g_h_booth;
+            g_playback_open_count++;
+            return 0;
+        } else {
+            alog("audioshim: mapped dummy output device %d\n", g_playback_open_count);
+            *pcm = (snd_pcm_t *)&g_h_dummy;
+            g_playback_open_count++;
+            return 0;
+        }
+    }
+
+    /* Capture / mic -> virtual handle, so nothing fights for the hardware */
+    alog("audioshim: mapped virtual Capture device\n");
+    *pcm = (snd_pcm_t *)&g_h_cap;
+    return 0;
+}
+
+int snd_pcm_close(snd_pcm_t *pcm)
+{
+    init_real_alsa();
+    alog("audioshim: snd_pcm_close(handle=%p)\n", pcm);
+
+    if (is_real(pcm)) {
+        if (g_real_playback && real_snd_pcm_close) {
+            real_snd_pcm_close(g_real_playback);
+            g_real_playback = NULL;
+        }
+        g_playback_open_count = 0;
+    }
+    return 0;
+}
+
+int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_any)
+        return real_snd_pcm_hw_params_any(g_real_playback, params);
+    return 0;
+}
+
+int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int access)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_access)
+        return real_snd_pcm_hw_params_set_access(g_real_playback, params, access);
+    return 0;
+}
+
+int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int format)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_format) {
+        int err = real_snd_pcm_hw_params_set_format(g_real_playback, params, g_format);
+        alog("audioshim: real set_format(req=%d -> %d) res=%d\n", format, g_format, err);
+        return err;
+    }
+    return 0;
+}
+
+int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_channels) {
+        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params,
+                                                      (unsigned)g_real_ch);
+        alog("audioshim: real set_channels(req=%u -> %d) res=%d\n", val, g_real_ch, err);
+        if (err < 0 && g_real_ch == 4) {
+            /* the device would not take 4 channels after all: fall back to
+             * stereo so the engine still gets its clock */
+            err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, 2);
+            alog("audioshim: 4ch refused, fell back to stereo res=%d\n", err);
+            if (err >= 0)
+                g_real_ch = 2;
+        }
+        return err;
+    }
+    return 0;
+}
+
+int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_rate_near) {
+        if (val) *val = (unsigned)g_rate;
+        int err = real_snd_pcm_hw_params_set_rate_near(g_real_playback, params, val, dir);
+        alog("audioshim: real set_rate_near res=%d rate=%u\n", err, val ? *val : 0);
+        if (err >= 0 && val && (int)*val != g_rate) {
+            alog("audioshim: WARNING device runs at %u Hz, engine feeds %d Hz "
+                 "(use a plughw: device so alsa-lib resamples)\n", *val, g_rate);
+        }
+        return err;
+    }
+    if (val) *val = (unsigned)g_rate;
+    return 0;
+}
+
+int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val, int *dir)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_period_size_near) {
+        int err = real_snd_pcm_hw_params_set_period_size_near(g_real_playback, params, val, dir);
+        alog("audioshim: real set_period_size_near res=%d period=%lu\n", err, val ? *val : 0);
+        return err;
+    }
+    return 0;
+}
+
+int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_periods_near) {
+        int err = real_snd_pcm_hw_params_set_periods_near(g_real_playback, params, val, dir);
+        alog("audioshim: real set_periods_near res=%d periods=%u\n", err, val ? *val : 0);
+        return err;
+    }
+    return 0;
+}
+
+/* The engine asks what the (RX3) device can do before it opens it; answer for
+ * the stereo stream it believes in, not for the real sink. */
+int snd_pcm_hw_params_get_channels_min(const snd_pcm_hw_params_t *params, unsigned int *val)
+{
+    if (val) *val = 2;
+    return 0;
+}
+
+int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *params, unsigned int *val)
+{
+    if (val) *val = 2;
+    return 0;
+}
+
+int snd_pcm_hw_params_test_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int rate)
+{
+    cfg_init();
+    return ((int)rate == g_rate) ? 0 : -EINVAL;
+}
+
+int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_hw_params) {
+        int err = real_snd_pcm_hw_params(g_real_playback, params);
+        alog("audioshim: real hw_params res=%d\n", err);
+        return err;
+    }
+    return 0;
+}
+
+int snd_pcm_sw_params_current(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
+{
+    init_real_alsa();
+    int err = 0;
+    if (is_real(pcm) && real_snd_pcm_sw_params_current)
+        err = real_snd_pcm_sw_params_current(g_real_playback, params);
+    return err;
+}
+
+int snd_pcm_sw_params_get_boundary(const snd_pcm_sw_params_t *params, snd_pcm_uframes_t *val)
+{
+    init_real_alsa();
+    int err = 0;
+    if (real_snd_pcm_sw_params_get_boundary)
+        err = real_snd_pcm_sw_params_get_boundary(params, val);
+    if (err != 0 || !val || *val == 0) {
+        if (val) *val = 0x40000000;
+        err = 0;
+    }
+    return err;
+}
+
+int snd_pcm_sw_params_set_silence_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_sw_params_set_silence_threshold)
+        real_snd_pcm_sw_params_set_silence_threshold(g_real_playback, params, val);
+    return 0; /* always succeed */
+}
+
+int snd_pcm_sw_params_set_silence_size(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_sw_params_set_silence_size)
+        real_snd_pcm_sw_params_set_silence_size(g_real_playback, params, val);
+    return 0;
+}
+
+int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_sw_params_set_start_threshold)
+        real_snd_pcm_sw_params_set_start_threshold(g_real_playback, params, val);
+    return 0;
+}
+
+int snd_pcm_sw_params_set_stop_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_sw_params_set_stop_threshold)
+        real_snd_pcm_sw_params_set_stop_threshold(g_real_playback, params, val);
+    return 0;
+}
+
+int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_sw_params)
+        real_snd_pcm_sw_params(g_real_playback, params);
+    return 0;
+}
+
+int snd_pcm_prepare(snd_pcm_t *pcm)
+{
+    init_real_alsa();
+    if (is_real(pcm) && real_snd_pcm_prepare)
+        real_snd_pcm_prepare(g_real_playback);
+    return 0;
+}
+
+int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
+{
+    return 0;   /* the streams are already muxed into one device here */
+}
+
+snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
+{
+    init_real_alsa();
+    if (!buffer || size == 0) return size;
+
+    if (size > MAX_FRAMES)
+        size = MAX_FRAMES;
+
+    const int32_t *src = (const int32_t *)buffer;
+    static int32_t s_peak_master = 0;
+    static int32_t s_peak_hp = 0;
+    static int s_has_hp_audio = 0;
+
+    if (pcm == (snd_pcm_t *)&g_h_hp) {
+        /* Headphone/cue stream: park it in channels 2/3 of the mix and return.
+         * The master stream is what actually drives the write to the device. */
+        for (snd_pcm_uframes_t i = 0; i < size; i++) {
+            int32_t l = src[i * 2 + 0];
+            int32_t r = src[i * 2 + 1];
+            int32_t al = (l < 0) ? -l : l;
+            int32_t ar = (r < 0) ? -r : r;
+            if (al > s_peak_hp) s_peak_hp = al;
+            if (ar > s_peak_hp) s_peak_hp = ar;
+            g_mix4ch[i * 4 + 2] = l;
+            g_mix4ch[i * 4 + 3] = r;
+        }
+        if (s_peak_hp > 100) s_has_hp_audio = 1;
+        return size;
+    }
+
+    if (pcm == (snd_pcm_t *)&g_h_booth || pcm == (snd_pcm_t *)&g_h_dummy)
+        return size;                     /* the FLX4 has no booth output */
+
+    /* Master stream */
+    for (snd_pcm_uframes_t i = 0; i < size; i++) {
+        int32_t l = src[i * 2 + 0];
+        int32_t r = src[i * 2 + 1];
+        int32_t al = (l < 0) ? -l : l;
+        int32_t ar = (r < 0) ? -r : r;
+        if (al > s_peak_master) s_peak_master = al;
+        if (ar > s_peak_master) s_peak_master = ar;
+        g_mix4ch[i * 4 + 0] = l;
+        g_mix4ch[i * 4 + 1] = r;
+        /* Mirror master into the cue pair only while the engine has not
+         * produced a cue mix yet, and only if asked: on a real controller the
+         * CUE buttons are what should decide what the headphones hear. */
+        if (!s_has_hp_audio && (g_cue_mirror || g_real_ch == 2)) {
+            g_mix4ch[i * 4 + 2] = l;
+            g_mix4ch[i * 4 + 3] = r;
+        }
+    }
+
+    g_write_count++;
+
+    /* Build the hardware buffer */
+    if (g_real_ch == 4) {
+        /* DDJ-FLX4: 1/2 = MASTER out, 3/4 = HEADPHONES out */
+        memcpy(g_out, g_mix4ch, (size_t)size * 4 * sizeof(int32_t));
+    } else {
+        /* stereo sink (HDMI): master, or the cue mix when it has audio and the
+         * operator asked for cue-on-stereo */
+        for (snd_pcm_uframes_t i = 0; i < size; i++) {
+            int use_cue = (g_cue_on_2ch && s_has_hp_audio);
+            g_out[i * 2 + 0] = g_mix4ch[i * 4 + (use_cue ? 2 : 0)];
+            g_out[i * 2 + 1] = g_mix4ch[i * 4 + (use_cue ? 3 : 1)];
+        }
+    }
+
+    /* startup mute + fade-in over every output channel */
+    startup_env_init();
+    {
+        unsigned long long t0   = g_startup_frames_done;
+        unsigned long long mute = (unsigned long long)g_startup_mute_frames;
+        unsigned long long fade = (unsigned long long)g_startup_fade_frames;
+        g_startup_frames_done += size;
+        if (mute > 0 && t0 < mute + fade) {
+            if (!g_startup_logged_mute) {
+                g_startup_logged_mute = 1;
+                alog("audioshim: startup mute active: %llu+%llu frames\n", mute, fade);
+            }
+            for (snd_pcm_uframes_t i = 0; i < size; i++) {
+                float g = startup_gain(t0 + i, mute, fade);
+                if (g >= 1.0f) continue;
+                for (int c = 0; c < g_real_ch; c++)
+                    g_out[i * g_real_ch + c] =
+                        (int32_t)((float)g_out[i * g_real_ch + c] * g);
+            }
+        }
+        if (!g_startup_logged_open && mute > 0 && g_startup_frames_done >= mute + fade) {
+            g_startup_logged_open = 1;
+            alog("audioshim: startup mute released after %llu frames\n",
+                 g_startup_frames_done);
+        }
+    }
+
+    snd_pcm_sframes_t written = 0;
+    if (g_real_playback && real_snd_pcm_writei) {
+        written = real_snd_pcm_writei(g_real_playback, g_out, size);
+        if (written < 0) {
+            if (real_snd_pcm_prepare)
+                real_snd_pcm_prepare(g_real_playback);
+            written = real_snd_pcm_writei(g_real_playback, g_out, size);
+        }
+    } else {
+        /* No hardware: pace the engine thread so the UI still runs */
+        usleep((useconds_t)(size * 1000000UL / (unsigned long)g_rate));
+    }
+
+    if ((g_write_count % 500) == 1) {
+        alog("audioshim: writei #%lu frames=%lu written=%ld ch=%d peak_m=%d peak_cue=%d\n",
+             g_write_count, size, (long)written, g_real_ch, s_peak_master, s_peak_hp);
+        s_peak_master = 0;
+        s_peak_hp = 0;
+    }
+
+    return size;
+}
+
+snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size)
+{
+    /* Clean silence for capture, so the mic path can never error out */
+    if (buffer && size > 0)
+        memset(buffer, 0, size * 8);
+    return size;
+}
+
+/* ---- control interface -------------------------------------------------
+ * rbp opens snd_ctl_open("hw:cs4344audiorev8") to enumerate the device.  That
+ * card does not exist; failing the call makes JUCE report rate 0 and the engine
+ * aborts, so fake success for the RX3 names and pass real ones through. */
+int snd_ctl_open(snd_ctl_t **ctl, const char *name, int mode)
+{
+    init_real_alsa();
+    alog("audioshim: snd_ctl_open(name='%s')\n", name ? name : "null");
+    if (real_snd_ctl_open && name && strncmp(name, "hw:cs4344", 9) != 0 &&
+        strstr(name, "esaics4344") == NULL) {
+        int err = real_snd_ctl_open(ctl, name, mode);
+        if (err == 0)
+            return 0;
+    }
+    if (ctl) *ctl = (snd_ctl_t *)0x12345;
+    return 0;
+}
+
+int snd_ctl_close(snd_ctl_t *ctl)
+{
+    init_real_alsa();
+    if (ctl != (snd_ctl_t *)0x12345 && real_snd_ctl_close)
+        return real_snd_ctl_close(ctl);
+    return 0;
+}
+
+int snd_ctl_pcm_info(snd_ctl_t *ctl, snd_pcm_info_t *info)
+{
+    return 0;
+}
+
+/* ---- scheduling stubs ---------------------------------------------------
+ * rbp asks for SCHED_FIFO and pins threads to CPUs that the RX3 had.  Left
+ * alone, its RT threads starve the UI.  Neutralise them; the Pi 5 has four
+ * A76 cores and the default scheduler copes fine. */
+int pthread_setaffinity_np(pthread_t thread, size_t cpusetsize, const void *cpuset)
+{
+    (void)thread; (void)cpusetsize; (void)cpuset;
+    return 0;
+}
+
+int sched_setaffinity(pid_t pid, size_t cpusetsize, const void *cpuset)
+{
+    (void)pid; (void)cpusetsize; (void)cpuset;
+    return 0;
+}
+
+int sched_setscheduler(pid_t pid, int policy, const void *param)
+{
+    (void)pid; (void)policy; (void)param;
+    return 0;
+}
+
+int pthread_setschedparam(pthread_t thread, int policy, const void *param)
+{
+    (void)thread; (void)policy; (void)param;
+    return 0;
+}
+
+int pthread_setschedprio(pthread_t thread, int prio)
+{
+    (void)thread; (void)prio;
+    return 0;
+}
+
+int pthread_attr_setschedpolicy(void *attr, int policy)
+{
+    (void)attr; (void)policy;
+    return 0;
+}
+
+int pthread_attr_setschedparam(void *attr, const void *param)
+{
+    (void)attr; (void)param;
+    return 0;
+}

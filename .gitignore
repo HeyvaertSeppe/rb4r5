@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build output (regenerate with launch.py build)
+work/
+build/
+*.o
+*.so
+*.log
+*.rej
+*.orig
+
+# Firmware, keys and vendor material: MUST NEVER be committed (see NOTICE.md)
+payload/
+PrimeBox/
+*.UPD
+*.upd
+*.iso
+*.key
+keys/
+rootfs.cramfs
+rbp
+rbp-*
+export.pdb
+*.pdb
+gui/
+
+# Local state
+*.bak
+*.rb4r5-tmp
+screen*.png
+fb*.raw

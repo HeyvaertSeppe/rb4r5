@@ -1,0 +1,85 @@
+{
+  "paths": {
+    "root": "/opt/rb4r5",
+    "chroot": "/opt/rb4r5/chroot",
+    "payload": "/opt/rb4r5/payload",
+    "work": "/opt/rb4r5/work",
+    "bin": "/usr/local/bin",
+    "logs": "/var/log/rb4r5",
+    "media": "/media/usb1/sda1"
+  },
+  "display": {
+    "fbdev": "/dev/fb0",
+    "ui_width": 1280,
+    "ui_height": 800,
+    "force_mode": null,
+    "hdmi_port": 0,
+    "rotate": "off",
+    "quiet_console": 2,
+    "blank_timeout": 0
+  },
+  "audio": {
+    "card": null,
+    "device": null,
+    "channels": null,
+    "rate": 44100,
+    "format": 6,
+    "plug": true,
+    "cue_mirror": false,
+    "cue_on_stereo": false,
+    "startup_mute_ms": 1500,
+    "startup_fade_ms": 300,
+    "fallback_hdmi": true
+  },
+  "controller": {
+    "enabled": true,
+    "name": "FLX4",
+    "jog_ppr": 1800,
+    "filter_init": true,
+    "map_file": "/etc/rb4r5/flx4-map.conf",
+    "verbose": false
+  },
+  "touch": {
+    "enabled": true,
+    "device": null,
+    "name": null,
+    "swap_xy": false,
+    "invert_x": false,
+    "invert_y": false,
+    "zones_file": "/etc/rb4r5/touch-zones.json",
+    "tap_ms": 400,
+    "tap_slop": 0.02,
+    "scroll_step": 0.035,
+    "jog_scale": 3.0,
+    "native": false,
+    "native_format": "fxy",
+    "verbose": false
+  },
+  "keyboard": {
+    "enabled": true,
+    "device": null,
+    "name": null
+  },
+  "usb": {
+    "enabled": true,
+    "poll": 1.0,
+    "confirm_tries": 18,
+    "confirm_interval": 5.0,
+    "require_usb": true
+  },
+  "player": {
+    "args": [
+      "-a"
+    ],
+    "restart": true,
+    "restart_delay": 5.0,
+    "max_restarts": 10,
+    "ulimit_procs": 1024,
+    "env": {}
+  },
+  "build": {
+    "primebox": "/opt/rb4r5/PrimeBox",
+    "neon": true,
+    "jobs": 0
+  }
+}

@@ -1,0 +1,206 @@
+{
+  "_comment": [
+    "rb4r5 touch zones.  rect = [x0, y0, x1, y1] as fractions of the",
+    "screen (0,0 = top left).  The first zone that contains the touch",
+    "wins, so put small zones before large ones.",
+    "Run 'sudo python3 launch.py calibrate' to see which zone you hit."
+  ],
+  "zones": [
+    {
+      "name": "source",
+      "rect": [
+        0.0,
+        0.0,
+        0.12,
+        0.09
+      ],
+      "type": "key",
+      "key": "source"
+    },
+    {
+      "name": "browse",
+      "rect": [
+        0.12,
+        0.0,
+        0.24,
+        0.09
+      ],
+      "type": "key",
+      "key": "browse"
+    },
+    {
+      "name": "menu",
+      "rect": [
+        0.24,
+        0.0,
+        0.36,
+        0.09
+      ],
+      "type": "key",
+      "key": "menu"
+    },
+    {
+      "name": "back",
+      "rect": [
+        0.36,
+        0.0,
+        0.48,
+        0.09
+      ],
+      "type": "key",
+      "key": "back"
+    },
+    {
+      "name": "info",
+      "rect": [
+        0.88,
+        0.0,
+        1.0,
+        0.09
+      ],
+      "type": "key",
+      "key": "info"
+    },
+    {
+      "name": "status-bar",
+      "rect": [
+        0.48,
+        0.0,
+        0.88,
+        0.09
+      ],
+      "type": "none"
+    },
+    {
+      "name": "list",
+      "rect": [
+        0.0,
+        0.09,
+        1.0,
+        0.7
+      ],
+      "type": "scroll",
+      "key": "selector",
+      "tap_key": "select",
+      "invert": false
+    },
+    {
+      "name": "deck1-scrub",
+      "rect": [
+        0.0,
+        0.7,
+        0.5,
+        0.82
+      ],
+      "type": "jog",
+      "ch": 1
+    },
+    {
+      "name": "deck2-scrub",
+      "rect": [
+        0.5,
+        0.7,
+        1.0,
+        0.82
+      ],
+      "type": "jog",
+      "ch": 2
+    },
+    {
+      "name": "load1",
+      "rect": [
+        0.0,
+        0.82,
+        0.125,
+        1.0
+      ],
+      "type": "key",
+      "key": "load",
+      "ch": 1
+    },
+    {
+      "name": "play1",
+      "rect": [
+        0.125,
+        0.82,
+        0.25,
+        1.0
+      ],
+      "type": "key",
+      "key": "play",
+      "ch": 1
+    },
+    {
+      "name": "cue1",
+      "rect": [
+        0.25,
+        0.82,
+        0.375,
+        1.0
+      ],
+      "type": "key",
+      "key": "cue",
+      "ch": 1
+    },
+    {
+      "name": "sync1",
+      "rect": [
+        0.375,
+        0.82,
+        0.5,
+        1.0
+      ],
+      "type": "key",
+      "key": "sync",
+      "ch": 1
+    },
+    {
+      "name": "sync2",
+      "rect": [
+        0.5,
+        0.82,
+        0.625,
+        1.0
+      ],
+      "type": "key",
+      "key": "sync",
+      "ch": 2
+    },
+    {
+      "name": "cue2",
+      "rect": [
+        0.625,
+        0.82,
+        0.75,
+        1.0
+      ],
+      "type": "key",
+      "key": "cue",
+      "ch": 2
+    },
+    {
+      "name": "play2",
+      "rect": [
+        0.75,
+        0.82,
+        0.875,
+        1.0
+      ],
+      "type": "key",
+      "key": "play",
+      "ch": 2
+    },
+    {
+      "name": "load2",
+      "rect": [
+        0.875,
+        0.82,
+        1.0,
+        1.0
+      ],
+      "type": "key",
+      "key": "load",
+      "ch": 2
+    }
+  ]
+}

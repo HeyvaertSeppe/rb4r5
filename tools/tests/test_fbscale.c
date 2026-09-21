@@ -105,12 +105,12 @@ test_classify( void )
      CHECK( rb4r5_classify( 8, 0,3, 3,3, 6,2 ) == RB_DST_UNKNOWN, "8bpp" );
 
      /* an unrecognised layout still draws, at the usual depth, and says so */
-     rb4r5_dst_init( &d, 32, 8,8, 16,8, 24,8, 64, 32, 256, 32, 16, 0 );
+     rb4r5_dst_init( &d, 32, 8,8, 16,8, 24,8, 64, 32, 256, 32, 16, 0 , 0);
      CHECK( d.guessed == 1, "odd 32bpp layout should be flagged" );
      CHECK( d.fmt == RB_DST_XRGB8888 && d.bpp == 4, "fallback fmt/bpp" );
 
      /* bytes per pixel follows the format, not the reported depth */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0 , 0);
      CHECK( d.bpp == 2 && d.fmt == RB_DST_RGB565, "16bpp -> 2 bytes" );
      CHECK( d.guessed == 0, "RGB565 is not a guess" );
 }
@@ -123,23 +123,23 @@ test_fit( void )
 
      printf("destination rectangle\n");
      /* fill: the whole panel, which is what "full screen" means here */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0 , 0);
      CHECK( d.x == 0 && d.y == 0 && d.w == 1920 && d.h == 1080,
             "fill 1920x1080: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
      /* aspect: 16:10 centred on a 16:9 panel, bars left and right */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 1 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 1 , 0);
      CHECK( d.w == 1728 && d.h == 1080 && d.x == 96 && d.y == 0,
             "aspect 1920x1080: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
      /* aspect: 16:10 on a 4:3 panel, bars top and bottom */
-     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1024, 768, 4096, 1280, 800, 1 );
+     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1024, 768, 4096, 1280, 800, 1 , 0);
      CHECK( d.w == 1024 && d.h == 640 && d.x == 0 && d.y == 64,
             "aspect 1024x768: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
      /* a line length too short for the mode clamps the width - a row must
       * never be allowed to run into the next one */
-     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1920, 1080, 3840, 1280, 800, 0 );
+     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1920, 1080, 3840, 1280, 800, 0 , 0);
      CHECK( d.fw == 960 && d.w == 960, "pitch clamp: fw=%d w=%d", d.fw, d.w );
 }
 
@@ -183,7 +183,7 @@ test_scale( int bits, int ro, int rl, int go, int gl, int bo, int bl,
             fw, fh, aspect ? "(aspect)" : "(fill)");
 
      rb4r5_dst_init( &d, bits, ro,rl, go,gl, bo,bl,
-                     fw, fh, fw * ((bits + 7) / 8), SW, SH, aspect );
+                     fw, fh, fw * ((bits + 7) / 8), SW, SH, aspect , 0);
      fbsize = (size_t)d.pitch * d.fh;
      fb = malloc( fbsize );
      memset( fb, 0xa5, fbsize );
@@ -269,13 +269,13 @@ test_known_colours( void )
      for (i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
           src[0] = src[1] = src[2] = src[3] = t[i].in;
 
-          rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 4, 2, 8, 2, 2, 0 );
+          rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 4, 2, 8, 2, 2, 0 , 0);
           memset( fb, 0, sizeof(fb) );
           rb4r5_scale565( (unsigned char *)src, 2, 2, 4, fb, &d );
           CHECK( *(unsigned short *)fb == t[i].rgb565,
                  "RGB565 0x%04x -> 0x%04x", t[i].in, *(unsigned short *)fb );
 
-          rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 4, 2, 16, 2, 2, 0 );
+          rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 4, 2, 16, 2, 2, 0 , 0);
           memset( fb, 0, sizeof(fb) );
           rb4r5_scale565( (unsigned char *)src, 2, 2, 4, fb, &d );
           CHECK( *(unsigned int *)fb == t[i].xrgb,
@@ -315,24 +315,203 @@ test_refuses_bad_geometry( void )
      printf("bad geometry\n");
      memset( src, 0xff, sizeof(src) );
 
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 , 0);
      d.w = 64;                            /* wider than the framebuffer */
      memset( fb, 0, sizeof(fb) );
      rb4r5_scale565( (unsigned char *)src, 8, 8, 16, fb, &d );
      CHECK( fb[0] == 0 && fb[63] == 0, "oversized rectangle must draw nothing" );
 
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 , 0);
      d.y = 8;                             /* starts past the last row */
      memset( fb, 0, sizeof(fb) );
      rb4r5_scale565( (unsigned char *)src, 8, 8, 16, fb, &d );
      CHECK( fb[0] == 0, "off-screen rectangle must draw nothing" );
 
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 , 0);
      memset( fb, 0, sizeof(fb) );
      rb4r5_scale565( NULL, 8, 8, 16, fb, &d );
      rb4r5_scale565( (unsigned char *)src, 0, 8, 16, fb, &d );
      rb4r5_scale565( (unsigned char *)src, 8, 8, 0, fb, &d );
      CHECK( fb[0] == 0, "null/empty source must draw nothing" );
+}
+
+/* ---- bilinear ---------------------------------------------------------- */
+
+/* The reference: the textbook bilinear sample, in floating point, with the
+ * same pixel-centre mapping.  The fixed point version has to land within a
+ * rounding step of it for every pixel, in every channel. */
+static void
+ref_bilinear( const unsigned short *src, int sw, int sh, int spitch,
+              int dw, int dh, int dx, int dy, double out[3] )
+{
+     double fx = (dx + 0.5) * (double)sw / dw - 0.5;
+     double fy = (dy + 0.5) * (double)sh / dh - 0.5;
+     int x0, y0, x1, y1, c;
+     double tx, ty;
+
+     if (fx < 0) fx = 0;
+     if (fy < 0) fy = 0;
+     x0 = (int)fx; y0 = (int)fy;
+     tx = fx - x0;  ty = fy - y0;
+     x1 = (x0 + 1 < sw) ? x0 + 1 : sw - 1;
+     y1 = (y0 + 1 < sh) ? y0 + 1 : sh - 1;
+
+     for (c = 0; c < 3; c++) {
+          double p[4];
+          int i;
+          const int xs[4] = { x0, x1, x0, x1 };
+          const int ys[4] = { y0, y0, y1, y1 };
+          for (i = 0; i < 4; i++) {
+               unsigned int v = ref_px( ((const unsigned short *)
+                    ((const char *)src + (size_t)ys[i] * spitch))[xs[i]], 0 );
+               p[i] = (double)((v >> (16 - 8 * c)) & 0xff);
+          }
+          out[c] = (p[0] * (1 - tx) + p[1] * tx) * (1 - ty) +
+                   (p[2] * (1 - tx) + p[3] * tx) * ty;
+     }
+}
+
+static void
+test_bilinear( void )
+{
+     int spitch = SW * 2;
+     unsigned short *src = make_source( spitch );
+     RB4R5Dst d;
+     unsigned char *fb;
+     int x, y, checked = 0, off = 0;
+     double worst = 0.0;
+
+     printf("bilinear: 1280x800 -> 1920x1080 against a floating point reference\n");
+     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1920, 1080, 1920 * 4,
+                     SW, SH, 0, 1 );
+     fb = malloc( (size_t)d.pitch * d.fh );
+     memset( fb, 0xa5, (size_t)d.pitch * d.fh );
+     rb4r5_scale565( (const unsigned char *)src, SW, SH, spitch, fb, &d );
+
+     for (y = 0; y < d.fh; y += 7) {
+          for (x = 0; x < d.fw; x += 13) {
+               unsigned int got = *(unsigned int *)(fb + (size_t)y * d.pitch
+                                                       + (size_t)x * 4);
+               double want[3];
+               int c;
+
+               ref_bilinear( src, SW, SH, spitch, d.w, d.h, x, y, want );
+               for (c = 0; c < 3; c++) {
+                    double have = (double)((got >> (16 - 8 * c)) & 0xff);
+                    double diff = have - want[c];
+                    if (diff < 0) diff = -diff;
+                    if (diff > worst) worst = diff;
+                    if (diff > 2.0 && off++ < 4)
+                         CHECK( 0, "(%d,%d) channel %d: got %.0f want %.2f",
+                                x, y, c, have, want[c] );
+               }
+               checked++;
+          }
+     }
+     CHECK( off == 0, "%d samples off by more than 2 (worst %.2f)", off, worst );
+     printf("  %d pixels sampled, worst channel error %.2f\n", checked, worst);
+
+     /* A flat colour must come out flat: no edge artefact, no clamping bug. */
+     for (y = 0; y < SH; y++) {
+          unsigned short *row = (unsigned short *)((char *)src + (size_t)y * spitch);
+          for (x = 0; x < SW; x++)
+               row[x] = 0x4a69;
+     }
+     memset( fb, 0xa5, (size_t)d.pitch * d.fh );
+     rb4r5_scale565( (const unsigned char *)src, SW, SH, spitch, fb, &d );
+     {
+          unsigned int want = ref_px( 0x4a69, 0 ), bad = 0;
+          for (y = 0; y < d.fh; y++)
+               for (x = 0; x < d.fw; x++)
+                    if (*(unsigned int *)(fb + (size_t)y * d.pitch +
+                                          (size_t)x * 4) != want)
+                         bad++;
+          CHECK( bad == 0, "a flat colour blurred into %u different pixels", bad );
+     }
+     free( fb );
+     free( src );
+}
+
+/* 1:1 has to be exact, not a half pixel blur - that is what the pixel centre
+ * mapping buys, and it is also how a 1280x800 panel gets a perfect copy. */
+static void
+test_bilinear_identity( void )
+{
+     int spitch = SW * 2;
+     unsigned short *src = make_source( spitch );
+     RB4R5Dst d;
+     unsigned char *fb;
+     int x, y, bad = 0;
+
+     printf("bilinear: a 1:1 scale is bit exact\n");
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, SW, SH, SW * 2,
+                     SW, SH, 0, 1 );
+     fb = malloc( (size_t)d.pitch * d.fh );
+     memset( fb, 0xa5, (size_t)d.pitch * d.fh );
+     rb4r5_scale565( (const unsigned char *)src, SW, SH, spitch, fb, &d );
+     for (y = 0; y < SH; y++)
+          for (x = 0; x < SW; x++)
+               if (*(unsigned short *)(fb + (size_t)y * d.pitch + (size_t)x * 2)
+                   != ((const unsigned short *)((char *)src + (size_t)y * spitch))[x])
+                    bad++;
+     CHECK( bad == 0, "%d pixels differ from the source at 1:1", bad );
+
+     /* the edges sample the edge pixels, never past them */
+     CHECK( *(unsigned short *)fb ==
+            ((const unsigned short *)src)[0], "top left pixel" );
+     free( fb );
+     free( src );
+}
+
+/* An upscaled gradient must stay monotonic and must actually gain
+ * intermediate values - that is the difference a filter makes. */
+static void
+test_bilinear_gradient( void )
+{
+     int spitch = 64 * 2;
+     unsigned short *src = calloc( 8, spitch );
+     RB4R5Dst d;
+     unsigned char *fb;
+     int x, y, steps_nearest = 0, steps_bilinear = 0, drops = 0;
+
+     printf("bilinear: a gradient stays monotonic and gains steps\n");
+     /* one single ramp across the whole row - a sawtooth would "go
+      * backwards" at every tooth and prove nothing */
+     for (y = 0; y < 8; y++) {
+          unsigned short *row = (unsigned short *)((char *)src + (size_t)y * spitch);
+          for (x = 0; x < 64; x++)
+               row[x] = (unsigned short)((x * 31 / 63) << 11);
+     }
+
+     for (int filter = 0; filter <= 1; filter++) {
+          unsigned int previous = 0, seen = 0;
+          rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 512, 64, 512 * 4,
+                          64, 8, 0, filter );
+          fb = malloc( (size_t)d.pitch * d.fh );
+          rb4r5_scale565( (const unsigned char *)src, 64, 8, spitch, fb, &d );
+          for (x = 0; x < d.fw; x++) {
+               unsigned int red = (*(unsigned int *)(fb + (size_t)32 * d.pitch
+                                                        + (size_t)x * 4)
+                                   >> 16) & 0xff;
+               if (x && red < previous)
+                    drops++;
+               if (x && red != previous)
+                    seen++;
+               previous = red;
+          }
+          if (filter)
+               steps_bilinear = (int)seen;
+          else
+               steps_nearest = (int)seen;
+          free( fb );
+     }
+     CHECK( drops == 0, "%d places where the gradient went backwards", drops );
+     CHECK( steps_bilinear > steps_nearest * 2,
+            "bilinear gave %d steps where nearest gave %d - it is not "
+            "interpolating", steps_bilinear, steps_nearest );
+     printf("  nearest: %d steps, bilinear: %d steps over the same ramp\n",
+            steps_nearest, steps_bilinear);
+     free( src );
 }
 
 int
@@ -350,6 +529,9 @@ main( void )
      test_fit();
      test_known_colours();
      test_refuses_bad_geometry();
+     test_bilinear_identity();
+     test_bilinear();
+     test_bilinear_gradient();
 
      /* the two ways a Pi 5 actually comes up */
      test_scale( 16, 11,5, 5,6, 0,5, 1920, 1080, 0, "rgb565-fill" );

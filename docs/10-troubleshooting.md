@@ -49,7 +49,10 @@ guessing.
 | The screen blanks after ten minutes | console blanking | `setup` adds `consoleblank=0`; check `cmdline.txt` |
 | **Half the UI spread across the panel, olive-yellow background, lavender panels, white text still white** | the module was built before the framebuffer's pixel format was read from the driver: 32-bit pixels written into a 16 bpp framebuffer ([04, F8](04-display.md)) | `git pull`, then `sudo python3 launch.py build` and `run`. Confirm with `launch.py fbtest` first: the eight colour bars must come out in the printed order |
 | Colours look wrong in some other way | the framebuffer's layout is not one the driver recognises, or the panel is BGR | `sudo python3 launch.py fbtest` — photograph it and compare with the printed bar order; `launch.py doctor` prints the bitfields |
-| The picture is stretched horizontally | the RX3 UI is 16:10 and the panel is 16:9; "full screen" stretches it | `launch.py config --set display.fit=aspect` keeps the shape and adds black bars |
+| The picture is stretched horizontally | `display.fit` is set to `fill` | the default is `aspect` (black bars, never distorted): `launch.py config --set display.fit=aspect` |
+| The picture is coarse, blocky, "low resolution" | nearest-neighbour scaling from 1280x800 | the default is now `bilinear`: `launch.py config --set display.scale=bilinear`, and check `doctor` says the driver "can interpolate" |
+| **`fbtest` looks right but the player does not** | the player is loading a display driver from an older build | `sudo python3 launch.py build --fast-directfb`. `doctor` prints which markers the installed module is missing, and `run` now refuses to start with a stale one |
+| `launch.py run` says the display driver is not the current build | exactly that | `sudo python3 launch.py build --fast-directfb`, or `run --force` to run it anyway |
 | The image is torn | a frame is published while the panel is scanning it out | harmless on the Pi's single-buffer fbdev emulation; `display.force_mode` can pin a lower refresh |
 
 ## The firmware will not unpack

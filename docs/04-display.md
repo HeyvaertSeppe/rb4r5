@@ -71,11 +71,10 @@ controller ignored a panned buffer, so the UI sat in buffer 1 while the screen
 showed black. The fix — convert into `framebuffer_base + 0` and leave the pan at
 zero — is also exactly right on the Pi, where fbdev emulation has one buffer.
 
-**F4 — scale to fill the screen.** Without scaling the 1280×800 layer landed in
+**F4 — scale onto the screen.** Without scaling the 1280×800 layer landed in
 the top-left corner of a 1920×1080 framebuffer with junk around it. The patch
-adds a nearest-neighbour 16.16 fixed-point scale that iterates over
-*destination* pixels, so every pixel is written every frame and nothing stale
-survives.
+scales by iterating over *destination* pixels, so every pixel of the picture
+is written every frame and nothing stale survives. How it scales is F9.
 
 **F5 — the loader details.** Two of them: a modern build of `fbdev.c` references
 `fcntl@GLIBC_2.28`, which glibc 2.13 cannot resolve, so `dlopen()` of the module
@@ -145,6 +144,72 @@ which is also compiled for armv7 with NEON and run under `qemu-arm-static` by
 `tools/tests/run-all.sh`, so the vectorised expander is checked against the
 reference for all 65536 RGB565 values in both channel orders.
 
+## F9 — aspect ratio and filtering
+
+Two separate decisions, both of which were wrong to begin with.
+
+**Shape.** The RX3's screen is 1280×800, i.e. 16:10. A 22″ monitor is 16:9.
+Stretching one onto the other makes everything 8% wide — noticeably so on the
+round jog displays and the text. The default is now `fit: aspect`: the frame
+is scaled to 1728×1080 and centred, with 96 px of black down each side, so
+**the UI is never distorted**. `fit: fill` brings the stretch back.
+
+**Filtering.** 1280→1728 is a factor of 1.35, and nearest neighbour at 1.35×
+duplicates about a third of the columns and rows and leaves the rest alone.
+On text and on the waveform's single-pixel lines that reads as a coarse,
+uneven, low-resolution picture — because it is one. The default is now
+`scale: bilinear`, which interpolates:
+
+| | nearest | bilinear |
+|---|---|---|
+| 1px lines at 8, 4, 2 px spacing | uneven — some doubled, some dropped | even, softened consistently |
+| a smooth ramp over 64 px | 31 distinct values | 248 distinct values |
+| accuracy vs a floating-point reference | n/a | worst channel error 1.9/255 |
+| cost per frame (1728×1080, measured on x86) | ~1 ms | ~9 ms |
+
+The cost is real but affordable: the publish path is not the bottleneck at the
+rate the player redraws. `scale: nearest` is there if a particular machine
+disagrees.
+
+Three details make the filtered path worth trusting:
+
+* **32.32 fixed point.** At 16.16 the truncated step `(1280<<16)/1920` loses
+  0.667 per pixel; by the right-hand edge of a 1920-wide panel that has
+  drifted far enough to pick visibly wrong weights — measured against a
+  floating-point reference it was out by up to 6.6/255 on a high-contrast
+  edge. A 64-bit accumulator costs an add-with-carry per pixel and takes that
+  under 1/255.
+* **Pixel centres, not corners.** `dst centre -> src centre` with the −0.5
+  offset, which is what makes a 1:1 scale a bit-exact copy rather than a
+  half-pixel blur, and makes the edges clamp instead of sampling past the
+  frame.
+* **The weights are precomputed per column**, so the inner loop has no 64-bit
+  arithmetic in it, and the vertical blend is NEON (16 bytes per iteration).
+
+Sharpest of all, if the monitor accepts it: run the panel at 1280×800
+(`force_mode: "1280x800@60"`). The scale becomes an exact 1:1 copy — the
+identity case is a unit test — and the monitor's own scaler does the
+enlarging.
+
+## Is the player even using this driver?
+
+A display driver left over from an older build is the one fault that looks
+like broken hardware, so it is checked rather than assumed. The built module
+carries two strings (`FBDev/rb4r5:` and `bilinear`); `chroot.module_report()`
+looks for them in the copy inside the chroot and compares its md5 with the one
+in the build directory. `launch.py doctor` prints the result:
+
+```
+usr/lib/directfb-1.4-6/systems/libdirectfb_fbdev.so: md5 6b1f…
+  yes  reads the framebuffer's pixel format instead of assuming it
+  yes  can interpolate when scaling (not just nearest neighbour)
+```
+
+and `launch.py run` refuses to start with an older one, naming the fix
+(`build --fast-directfb`) — `run --force` runs it anyway. A `build` where the
+DirectFB step failed now exits non-zero instead of printing a note among forty
+other lines, which is how a failed rebuild got missed.
+
 ## Configuration
 
 `/etc/rb4r5/config.json`:
@@ -156,7 +221,8 @@ reference for all 65536 RGB565 values in both channel orders.
   "force_mode": null,                   ← e.g. "1920x1080@60" to pin the mode
   "hdmi_port": 0,                       ← 0 = the HDMI next to USB-C
   "rotate": "off",
-  "fit": "fill",                        ← "aspect" to keep 16:10 with bars
+  "fit": "aspect",                      ← never distort; "fill" to stretch
+  "scale": "bilinear",                  ← "nearest" is faster and coarser
   "quiet_console": 2,
   "blank_timeout": 0
 }
@@ -171,18 +237,19 @@ reference for all 65536 RGB565 values in both channel orders.
   can overdraw DirectFB. Get the console back with
   `echo 1 | sudo tee /sys/class/vtconsole/vtcon1/bind`, or
   `launch.py stop --restore-console`.
-* `fit`: `fill` (default) stretches the RX3's 1280×800 over the whole panel —
-  that is what "full screen" means here, and on a 16:9 monitor it makes the UI
-  about 8% wider than the RX3's own 16:10 screen. `aspect` keeps the shape and
-  leaves black bars down the sides (1728×1080 on a 1080p panel). It reaches the
-  driver as `RB_FB_FIT`, so `RB_FB_FIT=aspect` also works for a one-off test.
-  Setting the monitor to 1280×800 instead (`force_mode: "1280x800@60"`) makes
-  the scale a 1:1 copy.
+* `fit`: `aspect` (default) keeps the RX3's 16:10 shape and centres it with
+  black bars — 1728×1080 with 96 px each side on a 1080p panel. `fill`
+  stretches it over the whole panel, which makes it 8% too wide. Reaches the
+  driver as `RB_FB_FIT`, so `RB_FB_FIT=fill` works for a one-off test.
+* `scale`: `bilinear` (default) interpolates; `nearest` duplicates pixels.
+  Reaches the driver as `RB_FB_SCALE`. See F9.
 
 ## Checking it
 
 ```sh
 PI# python3 launch.py fbtest            # test pattern: mode, format, colours
+PI# python3 launch.py fbtest --ui       # a frame through the driver's own scaler
+PI# python3 launch.py fbtest --ui --nearest    # ... to compare the filtering
 PI# python3 launch.py verify            # + does the frame fill the panel?
 PI# python3 launch.py doctor            # geometry, format, connectors, content
 PI# python3 launch.py fbdump /tmp/screen.png   # what is on screen, over SSH
@@ -190,6 +257,14 @@ PI# cat /sys/class/graphics/fb0/{name,virtual_size,bits_per_pixel,stride,pan}
 PI# RB_DFB_DEBUG=1 python3 launch.py run       # driver prints FLIP/UPDATE lines
 PI# head -20 /tmp/flipdbg.log
 ```
+
+**`fbtest --ui` answers "is the player getting this?".** It publishes a
+1280×800 frame through `rb4r5_scale565()` — the same header that is compiled
+into the module — using `src/host/fbpublish.c`. The frame is built out of the
+things that show scaling faults: single-pixel lines at 8, 4 and 2 px spacing, a
+1 px checkerboard, 2 px text-sized strokes, smooth ramps, and coloured corner
+blocks. If that picture is right and the player's is not, the player is
+loading an older module, which `doctor` will confirm.
 
 **`fbtest` first.** It writes a test pattern straight to `/dev/fb0` in the
 format the driver reports, which takes rbp, the chroot, the shims and DirectFB
@@ -224,5 +299,8 @@ Full table in [10-troubleshooting](10-troubleshooting.md); the short version:
 | UI in the top-left corner with junk around it | the scale path is missing (same cause) |
 | Half the UI stretched across the panel, olive background, lavender panels | F8: a module built before the pixel format was read from the driver. `launch.py build` again |
 | Colours right but red and blue swapped | the fb is BGR and the bitfields say otherwise — send the output of `launch.py fbtest` |
+| The UI is stretched wide | `display.fit` is `fill`; the default is `aspect` |
+| The UI looks coarse or blocky | `display.scale` is `nearest`, or the module predates F9 — `doctor` says which |
+| `fbtest` is right but the player is wrong | the player is loading an older module: `build --fast-directfb` |
 | Text or a login prompt flickering over the UI | `quiet_console` is 0, or `getty@tty1` got re-enabled |
 | A desktop is on the screen instead | the boot target went back to `graphical.target` |

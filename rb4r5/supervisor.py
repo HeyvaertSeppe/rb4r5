@@ -128,6 +128,20 @@ class Supervisor:
             util.warn(problem)
         chroot.require_ready(self.cfg)
 
+        # A display driver from an older build is the one fault that looks
+        # like broken hardware: wrong colours, a stretched or half-width
+        # picture.  Say so here rather than let it reach the panel.
+        report = chroot.module_report(self.cfg)
+        if report["present"] and (report["missing"] or report["stale"]) and strict:
+            for line in chroot.module_lines(self.cfg):
+                util.error(line)
+            raise util.Fail(
+                "the display driver in the chroot is not the current build.\n"
+                "    Colours and scaling will be wrong.  Rebuild and install "
+                "it:\n"
+                "        sudo python3 launch.py build --fast-directfb\n"
+                "    (or `launch.py run --force` to run it anyway)")
+
     def hold_console(self, release: bool = False) -> None:
         """Stop the tty1 login prompt while the player owns the screen.
 
@@ -278,8 +292,8 @@ class Supervisor:
             for note in display.restore_console():
                 util.info(note)
 
-    def run(self, foreground: bool = True) -> int:
-        self.preflight()
+    def run(self, foreground: bool = True, force: bool = False) -> int:
+        self.preflight(strict=not force)
         self.stop_stale()
         self.prepare_system()
         self.build_children()

@@ -80,6 +80,20 @@ def run(cfg, verbose: bool = False) -> int:
         for line in fbmod.describe(cfg.get("display.fbdev", "/dev/fb0"))[1:]:
             _row("", line.strip())
         _row("scaling", display.scale_note(cfg))
+        for line in chroot.module_lines(cfg):
+            _row("", line)
+        report = chroot.module_report(cfg)
+        if report["present"] and report["missing"]:
+            problems.append(
+                "the display driver in the chroot is from an older build "
+                "(it cannot " + "; cannot ".join(
+                    chroot.MODULE_MARKERS[name] for name in report["missing"])
+                + ") - run: sudo python3 launch.py build --fast-directfb")
+        elif report["stale"]:
+            problems.append(
+                "the display driver in the chroot is not the one that was "
+                "last built - run: sudo python3 launch.py build "
+                "--fast-directfb")
         nonzero = display.fb_nonzero(fb["dev"])
         _row("content", f"{nonzero} non-zero bytes in the first 400k"
                         + (" (something is drawn)" if nonzero > 1000 else " (blank)"))

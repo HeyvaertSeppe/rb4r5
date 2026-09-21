@@ -23,7 +23,7 @@ verified on hardware there.
 
 | Subsystem | How |
 |---|---|
-| **Display** | DirectFB 1.4 fbdev → `/dev/fb0` (the DRM fbdev emulation of `vc4-kms-v3d`). The RX3's 1280×800 RGB565 UI is converted and scaled to the panel's real mode (1920×1080 on a 22″ screen) inside the driver, with a NEON fast path. [docs/04](docs/04-display.md) |
+| **Display** | DirectFB 1.4 fbdev → `/dev/fb0` (the DRM fbdev emulation of `vc4-kms-v3d`). The RX3's 1280×800 RGB565 UI is resampled inside the driver to the panel's real mode — bilinear, aspect preserved (1728×1080 with black bars on a 22″ 1080p screen), into whatever pixel format the kernel gave the framebuffer, NEON where it helps. [docs/04](docs/04-display.md) |
 | **Audio** | `audioshim` maps the RX3's three virtual DAC devices onto the FLX4's 4-channel USB PCM: **master → ch 1/2**, **headphone cue → ch 3/4**. HDMI audio is the automatic fallback. [docs/05](docs/05-audio.md) |
 | **Controller** | `flx4-bridge` translates DDJ-FLX4 USB-MIDI into the engine's own `IKeyManager::sendKey` calls: transport, browse, load, 3-band EQ, trim, faders, crossfader, tempo, filter, jog (scratch and search), the 8 pads with automatic bank switching, and Beat FX. [docs/06](docs/06-controller.md) |
 | **Touchscreen** | `rbtouchd` maps screen regions onto engine controls — on-screen buttons, drag-to-scroll the browse list, drag-to-scrub each deck. Zones are a JSON file; `launch.py calibrate` shows what you are hitting. [docs/07](docs/07-touch.md) |
@@ -116,6 +116,7 @@ sudo python3 launch.py run         # run and supervise it
 sudo python3 launch.py doctor      # check every subsystem
 sudo python3 launch.py verify      # screenshot it, and walk every FLX4 control
 sudo python3 launch.py fbtest      # test pattern: is the panel and its format right?
+sudo python3 launch.py fbtest --ui # a frame through the driver's own scaler
 ```
 
 ## Seeing it work

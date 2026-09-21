@@ -25,7 +25,7 @@ from . import chroot, firmware, provision, util
 
 CROSS = "arm-linux-gnueabi-"
 SHIMS = ["memshim.so", "fbshim.so", "audioshim.so", "keyshim.so"]
-HOST_TOOLS = ["flx4-bridge", "rbkeyd", "fakekbd"]
+HOST_TOOLS = ["flx4-bridge", "rbkeyd", "fakekbd", "fbpublish"]
 
 
 def md5(path) -> str:
@@ -279,14 +279,26 @@ def all_steps(cfg, repo: Path, with_directfb: bool = True,
         except util.Fail as exc:
             notes.append(f"player NOT built: {exc}")
 
+    failed = []
     if with_directfb:
         util.step("DirectFB")
         try:
             notes += build_directfb(cfg, repo, fast=fast_dfb)
         except util.Fail as exc:
             notes.append(f"DirectFB NOT built: {exc}")
+            failed.append(f"the display driver did not build: {exc}")
 
     util.step("installing into the chroot")
     notes += chroot.install_runtime_bits(cfg, repo)
     notes.append(chroot.write_directfbrc(cfg))
+
+    # The build continues past a failed component so the rest still gets
+    # built, but it must not end quietly: a missing display driver leaves the
+    # previous one in place, and the player then looks broken in ways that
+    # have nothing to do with the player.
+    if failed:
+        raise util.Fail("\n    ".join(
+            ["the build did not complete:"] + failed +
+            ["everything else was built and installed; fix the above and "
+             "re-run `launch.py build`"]))
     return notes

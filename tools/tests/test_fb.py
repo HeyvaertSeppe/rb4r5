@@ -147,5 +147,17 @@ rebuilt = b"".join(raw[y * stride + 1:(y + 1) * stride]
                    for y in range(info["height"]))
 check(rebuilt == rgb, "the PNG holds exactly the pixels we passed in")
 
+print("\n== the stale-driver markers")
+# chroot.module_report() decides whether the player is loading the current
+# display driver by looking for these strings in the built .so.  If the patch
+# stops emitting one of them the check silently passes everything, so tie the
+# two together here.
+from rb4r5 import chroot                                     # noqa: E402
+patch = Path(__file__).resolve().parents[2] / "src/directfb/directfb-pi5.patch"
+text = patch.read_text()
+for marker in chroot.MODULE_MARKERS:
+    check(marker in text,
+          f"the driver still emits {marker!r} (module_report looks for it)")
+
 print("\n" + ("all fb tests passed" if not FAIL else f"{FAIL} FAILURES"))
 sys.exit(1 if FAIL else 0)

@@ -9,6 +9,7 @@ the daemons outside it exchange FIFO records.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -314,8 +315,10 @@ def player_env(cfg, audio_env: dict) -> dict:
     env = {
         "LD_PRELOAD": preload,
         "DFB_ROTATE": str(cfg.get("display.rotate", "off")),
-        # read by the patched fbdev driver: fill the panel or keep 16:10
-        "RB_FB_FIT": str(cfg.get("display.fit", "fill")),
+        # read by the patched fbdev driver: how to place and resample the
+        # 1280x800 frame on the panel (docs/04-display.md)
+        "RB_FB_FIT": str(cfg.get("display.fit", "aspect")),
+        "RB_FB_SCALE": str(cfg.get("display.scale", "bilinear")),
         "HOME": "/root",
         "TERM": "linux",
     }
@@ -330,3 +333,56 @@ def player_env(cfg, audio_env: dict) -> dict:
         })
     env.update({str(k): str(v) for k, v in (cfg.get("player.env") or {}).items()})
     return env
+
+
+# --------------------------------------------------------------------------
+# is the display driver in the chroot the one we built?
+# --------------------------------------------------------------------------
+FBDEV_MODULE = "usr/lib/directfb-1.4-6/systems/libdirectfb_fbdev.so"
+
+# Strings the current driver carries in its read-only data.  Cheap, exact
+# evidence of which build is installed - md5 alone cannot say *what* is
+# missing, and "I rebuilt it" and "the player is loading the rebuild" are not
+# the same claim.  The display faults this catches (a 32bpp write into a 16bpp
+# framebuffer, a nearest-neighbour stretch) look like hardware problems.
+MODULE_MARKERS = {
+    "FBDev/rb4r5:": "reads the framebuffer's pixel format instead of assuming it",
+    "bilinear":     "can interpolate when scaling (not just nearest neighbour)",
+}
+
+
+def module_report(cfg) -> dict:
+    """What display driver is installed, and is it the one we last built?"""
+    installed = cfg.chroot / FBDEV_MODULE
+    staged = cfg.work / "dfb/lib/directfb-1.4-6/systems/libdirectfb_fbdev.so"
+    out = {"installed": str(installed), "staged": str(staged),
+           "present": installed.exists(), "staged_present": staged.exists(),
+           "md5": "", "staged_md5": "", "missing": [], "current": False,
+           "stale": False}
+    if not out["present"]:
+        return out
+    data = installed.read_bytes()
+    out["md5"] = hashlib.md5(data).hexdigest()
+    out["missing"] = [name for name in MODULE_MARKERS
+                      if name.encode() not in data]
+    out["current"] = not out["missing"]
+    if out["staged_present"]:
+        out["staged_md5"] = hashlib.md5(staged.read_bytes()).hexdigest()
+        out["stale"] = out["staged_md5"] != out["md5"]
+    return out
+
+
+def module_lines(cfg) -> list[str]:
+    report = module_report(cfg)
+    if not report["present"]:
+        return [f"MISSING {report['installed']} - the player has no display "
+                f"driver (run: launch.py build)"]
+    lines = [f"{FBDEV_MODULE}: md5 {report['md5']}"]
+    for name, what in MODULE_MARKERS.items():
+        lines.append(f"  {'yes' if name not in report['missing'] else 'NO '}"
+                     f"  {what}")
+    if report["stale"]:
+        lines.append(f"  the build at {report['staged']} is a DIFFERENT binary "
+                     f"(md5 {report['staged_md5']}) - the install step did not "
+                     f"run: launch.py build --fast-directfb")
+    return lines

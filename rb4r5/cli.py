@@ -114,7 +114,7 @@ def cmd_build(args, cfg) -> int:
 def cmd_run(args, cfg) -> int:
     util.require_root("running the player")
     sup = supervisor.Supervisor(cfg, REPO)
-    return sup.run(foreground=not args.detach)
+    return sup.run(foreground=not args.detach, force=args.force)
 
 
 def cmd_auto(args, cfg) -> int:
@@ -319,10 +319,34 @@ def cmd_fbtest(args, cfg) -> int:
         print(line)
     print()
 
+    if args.ui:
+        # Push a 1280x800 frame through the driver's own publish path, built
+        # from the same header the module is.  If this looks right and the
+        # player does not, the player is loading an older module.
+        tool = cfg.bindir / "fbpublish"
+        if not tool.exists():
+            tool = cfg.work / "host/fbpublish"
+        if not tool.exists():
+            raise util.Fail("fbpublish is not built yet - run: "
+                            "sudo python3 launch.py build")
+        argv = [str(tool), "-d", fbdev, "-t", str(int(args.seconds))]
+        argv += ["-s"] if args.fill else ["-a"]
+        if args.nearest:
+            argv += ["-n"]
+        if args.frame:
+            argv += ["-f", args.frame]
+        if args.keep:
+            argv += ["-k"]
+        print("the frame goes through the driver's own scaler "
+              "(src/directfb/rb4r5_scale.h):")
+        return util.run(argv, capture=False, timeout=args.seconds + 60).returncode
+
+    aspect = args.aspect or (not args.fill and
+                             str(cfg.get("display.fit", "aspect")) == "aspect")
     pattern = fb.test_pattern(info,
                               cfg.get("display.ui_width", 1280),
                               cfg.get("display.ui_height", 800),
-                              aspect=args.aspect)
+                              aspect=aspect)
     with open(fbdev, "wb") as handle:
         handle.write(pattern)
     print("\n".join(fb.legend(info)))
@@ -477,6 +501,9 @@ def build_parser() -> argparse.ArgumentParser:
     build_cmd.set_defaults(func=cmd_build)
 
     run = sub.add_parser("run", help="run the player full screen and supervise it")
+    run.add_argument("--force", action="store_true",
+                     help="run even if a check fails (a stale display "
+                          "driver, an unprepared platform)")
     run.add_argument("--detach", action="store_true")
     run.set_defaults(func=cmd_run)
 
@@ -524,13 +551,24 @@ def build_parser() -> argparse.ArgumentParser:
     fbt.add_argument("--seconds", type=float, default=30,
                      help="how long to hold the pattern (default 30)")
     fbt.add_argument("--aspect", action="store_true",
-                     help="mark where the UI goes with RB_FB_FIT=aspect")
+                     help="mark where the UI goes with display.fit=aspect "
+                          "(the default)")
+    fbt.add_argument("--fill", action="store_true",
+                     help="mark it for display.fit=fill instead")
     fbt.add_argument("--png", metavar="PATH",
                      help="also save the pattern as a PNG to compare against")
     fbt.add_argument("--keep", action="store_true",
                      help="leave the pattern on screen afterwards")
     fbt.add_argument("--force", action="store_true",
                      help="write to the framebuffer even while the player runs")
+    fbt.add_argument("--ui", action="store_true",
+                     help="instead of the colour bars, put a 1280x800 frame "
+                          "through the driver's own scaler - the picture the "
+                          "player should be getting")
+    fbt.add_argument("--nearest", action="store_true",
+                     help="with --ui: nearest neighbour, to see the difference")
+    fbt.add_argument("--frame", metavar="RAW",
+                     help="with --ui: a raw 1280x800 RGB565 frame to publish")
     fbt.set_defaults(func=cmd_fbtest)
 
     cal = sub.add_parser("calibrate", help="show which zone each touch hits")

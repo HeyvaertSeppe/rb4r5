@@ -130,6 +130,21 @@ class Supervisor:
             util.warn(problem)
         chroot.require_ready(self.cfg)
 
+        loadable, bad = chroot.shims_loadable(self.cfg)
+        if not loadable:
+            for line in chroot.shim_lines(self.cfg):
+                util.error("shim " + line)
+            message = (
+                f"the player cannot preload {', '.join(bad)}.\n"
+                "    ld.so says so once, into the player's log, and then runs "
+                "it WITHOUT\n    the shim - so the engine talks straight to "
+                "hardware it was never\n    meant to see, and what comes back "
+                "is a crash that looks like\n    anything but a missing file."
+                "\n    Rebuild them:  sudo python3 launch.py build")
+            if strict:
+                raise util.Fail(message)
+            util.warn(message)
+
         # A display driver from an older build is the one fault that looks
         # like broken hardware: wrong colours, a stretched or half-width
         # picture.  Say so here rather than let it reach the panel.
@@ -516,6 +531,11 @@ class Supervisor:
                   f"restarting in {child.delay:.0f}s")
 
         tail = self.log_tail(child, lines=14)
+        if any("cannot be preloaded" in line for line in tail):
+            util.error("ld.so could not preload the shims (the lines below "
+                       "say which).  The player is running without them, "
+                       "which is why it died - it is not a fault in the "
+                       "player.  Rebuild: sudo python3 launch.py build")
         if tail:
             util.warn(f"the last of {child.log}:")
             for line in tail:

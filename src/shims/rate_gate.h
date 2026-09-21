@@ -19,6 +19,7 @@
 #ifndef RB4R5_RATE_GATE_H
 #define RB4R5_RATE_GATE_H
 
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -41,10 +42,16 @@ struct pace {
 #define RB4R5_PACE_MIN_US     1000LL
 
 #ifndef RB4R5_PACE_NOW
+/* The raw syscall, not clock_gettime(): on the glibc 2.13 this runs against,
+ * clock_gettime lives in librt, so calling it records a NEEDED librt.so.1 on
+ * the shim.  A shim that needs a library the rootfs does not have cannot be
+ * preloaded at all - ld.so says "cannot be preloaded ... ignored" and the
+ * player runs with no shim, which is far worse than having no clock. */
 static long long rb4r5_now_us(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
     return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
 }
 # define RB4R5_PACE_NOW()      rb4r5_now_us()

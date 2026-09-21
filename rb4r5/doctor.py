@@ -69,6 +69,16 @@ def run(cfg, verbose: bool = False) -> int:
     if not arm_ok:
         problems.append(f"the player cannot be executed: {arm_why}")
 
+    for line in chroot.shim_lines(cfg):
+        _row("shim", line)
+    loadable, bad = chroot.shims_loadable(cfg)
+    if not loadable:
+        problems.append(
+            f"the player cannot preload {', '.join(bad)} - ld.so will say so "
+            f"once in rbp.log and then run the player WITHOUT the shim, which "
+            f"leaves the engine talking to hardware it was never meant to "
+            f"see.  Rebuild: sudo python3 launch.py build")
+
     _section("display")
     fb = display.fb_info(cfg.get("display.fbdev", "/dev/fb0"))
     _row("framebuffer", f"{fb['dev']} "

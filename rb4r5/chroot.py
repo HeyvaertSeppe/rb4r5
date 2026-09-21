@@ -402,3 +402,72 @@ def module_lines(cfg) -> list[str]:
                      f"(md5 {report['staged_md5']}) - the install step did not "
                      f"run: launch.py build --fast-directfb")
     return lines
+
+
+# --------------------------------------------------------------------------
+# can the player actually load its shims?
+# --------------------------------------------------------------------------
+SHIM_NAMES = ["memshim.so", "fbshim.so", "audioshim.so", "keyshim.so"]
+
+
+def shim_report(cfg) -> list[dict]:
+    """Whether each shim is there, is ARM, and can resolve what it needs.
+
+    The whole port rests on these four being preloaded into the player.  When
+    one is not, ld.so says so once - into the player's log, where nobody is
+    looking - and then runs the player WITHOUT it.  The engine then talks
+    straight to hardware it was never meant to see, and what comes back is a
+    crash with no obvious connection to a missing file.
+    """
+    from . import build                                  # local: cycle-free
+
+    root = cfg.chroot
+    search = [root / "lib", root / "usr/lib"]
+    out = []
+    for name in SHIM_NAMES:
+        path = root / "usr/lib" / name
+        entry = {"name": name, "path": str(path), "present": path.exists(),
+                 "size": 0, "arm": False, "needed": [], "missing": [],
+                 "ok": False}
+        if not entry["present"]:
+            out.append(entry)
+            continue
+        entry["size"] = path.stat().st_size
+        blob = path.read_bytes()[:20]
+        # ELF, 32-bit, little endian, e_machine 40 = ARM
+        entry["arm"] = (blob[:4] == b"\x7fELF" and len(blob) >= 20 and
+                        blob[4] == 1 and blob[18] == 40)
+        entry["needed"] = build.needed_libs(path)
+        entry["missing"] = [lib for lib in entry["needed"]
+                            if not any((place / lib).exists()
+                                       for place in search)]
+        entry["ok"] = (entry["present"] and entry["arm"] and entry["size"] > 0
+                       and not entry["missing"])
+        out.append(entry)
+    return out
+
+
+def shim_lines(cfg) -> list[str]:
+    lines = []
+    for entry in shim_report(cfg):
+        if not entry["present"]:
+            lines.append(f"{entry['name']:14} MISSING from "
+                         f"{entry['path']} (run: launch.py build)")
+            continue
+        state = "ok " if entry["ok"] else "NO "
+        detail = f"{entry['size']} bytes"
+        if not entry["arm"]:
+            detail += ", NOT a 32-bit ARM shared object"
+        if entry["missing"]:
+            detail += f", needs {', '.join(entry['missing'])} which the "
+            detail += "chroot does not have"
+        elif entry["needed"]:
+            detail += f", needs {', '.join(entry['needed'])}"
+        lines.append(f"{state}{entry['name']:14} {detail}")
+    return lines
+
+
+def shims_loadable(cfg) -> tuple[bool, list[str]]:
+    report = shim_report(cfg)
+    bad = [entry for entry in report if not entry["ok"]]
+    return (not bad), [entry["name"] for entry in bad]

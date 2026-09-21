@@ -152,6 +152,56 @@ def build_shims(cfg, repo: Path) -> list[str]:
             raise util.Fail(f"{name} did not build")
         notes.append(f"{name} md5 {md5(built)}")
     notes += check_abi(out)
+    notes += check_needed(out, root)
+    return notes
+
+
+def needed_libs(so: Path) -> list[str]:
+    """The shared libraries an ELF says it needs."""
+    objdump = CROSS + "objdump"
+    if not util.have(objdump):
+        return []
+    out = []
+    for line in util.out([objdump, "-p", str(so)]).splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "NEEDED":
+            out.append(parts[1])
+    return out
+
+
+def check_needed(directory: Path, root: Path) -> list[str]:
+    """Every library a shim needs has to exist in the chroot.
+
+    If one does not, ld.so cannot preload the shim - it prints
+
+        object '/usr/lib/audioshim.so' from LD_PRELOAD cannot be preloaded
+        (cannot open shared object file): ignored
+
+    and carries on WITHOUT it.  The player then talks to the real hardware
+    it was never meant to see, which is not a subtle failure but is a silent
+    one: nothing in the build says anything is wrong.  So the build says it.
+    """
+    notes = []
+    problems = []
+    search = [root / "lib", root / "usr/lib"]
+    for so in sorted(directory.glob("*.so")):
+        libs = needed_libs(so)
+        missing = [lib for lib in libs
+                   if not any((place / lib).exists() for place in search)]
+        notes.append(f"{so.name} needs {', '.join(libs) or 'nothing'}"
+                     + (f"  MISSING: {', '.join(missing)}" if missing else ""))
+        if missing:
+            problems.append(f"{so.name} needs {', '.join(missing)}, which "
+                            f"{'is' if len(missing) == 1 else 'are'} not in "
+                            f"the chroot")
+    if problems:
+        raise util.Fail(
+            "a shim needs a library the RX3 rootfs does not have:\n    " +
+            "\n    ".join(problems) +
+            "\n  ld.so cannot preload a shim like that: it says so once and "
+            "runs the\n  player without it, which leaves the engine talking "
+            "to real hardware.\n  Either link without that dependency, or "
+            "put the library in the chroot.")
     return notes
 
 

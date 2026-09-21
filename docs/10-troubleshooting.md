@@ -99,6 +99,48 @@ guessing.
 |---|---|---|
 | `'const struct input_event' has no member named 'time'` | DirectFB 1.4 predates the kernel 4.16 change that removes that member when the build asks for a 64-bit `time_t` | fixed in `directfb-pi5.patch`: it uses the `input_event_sec`/`input_event_usec` macros the kernel headers define for exactly this. `git pull`, then `build` |
 
+## The shims are not being preloaded
+
+```
+ERROR: ld.so: object '/usr/lib/audioshim.so' from LD_PRELOAD cannot be
+preloaded (cannot open shared object file): ignored.
+```
+
+**This is the worst failure in the port**, because ld.so says it once, into
+the player's own log, and then carries on *without* the shim. The player then
+talks straight to hardware it was never meant to see — and what comes back
+looks like anything but a missing file. The one that started this:
+
+```
+rbp: mask_inline.h:282: snd_mask_value: Assertion `!snd_mask_empty(mask)' failed.
+```
+
+That is alsa-lib aborting because the engine asked a real sound card for
+parameters only the RX3's own hardware has. It could only ask because
+`audioshim.so` was not there to answer for it.
+
+Three things now stand between that and you:
+
+* **`launch.py build` checks every library each shim needs against the
+  chroot** and fails if one is missing. A shim that needs `librt.so.1` when
+  the RX3 rootfs has no `librt.so.1` cannot be preloaded, and that is a build
+  error, not a runtime surprise.
+* **`launch.py doctor` reports each shim**: present, 32-bit ARM, and what it
+  needs — with `NO` against any that could not load.
+* **`launch.py run` refuses to start** when one cannot be preloaded, rather
+  than crash-looping; and if it sees `cannot be preloaded` in the log of a
+  child that died, it says that is the cause.
+
+```
+  shim  ok memshim.so     18104 bytes, needs libc.so.6, libdl.so.2
+  shim  NO audioshim.so   22440 bytes, needs librt.so.1 which the chroot does not have
+```
+
+If a shim needs something the rootfs lacks, the fix is to stop needing it —
+the shims use raw syscalls rather than library calls for exactly this reason
+(`clock_gettime` lives in `librt` on glibc 2.13, so the shims call
+`SYS_clock_gettime` directly).
+
 ## The player keeps dying
 
 `rbp exited (-6); restarting in 5s` is a number, so the supervisor now prints

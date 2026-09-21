@@ -660,13 +660,12 @@ static void publish_levels(int32_t left, int32_t right, int32_t phones)
 {
     static long long s_last_ms = 0;
     static unsigned long s_seq = 0;
-    struct timespec ts;
     long long now;
     int fd;
     int32_t record[5];
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    now = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    /* rb4r5_now_us() goes through the raw syscall: see rate_gate.h */
+    now = rb4r5_now_us() / 1000LL;
     if (now - s_last_ms < 50)
         return;
     s_last_ms = now;

@@ -104,8 +104,73 @@ with tempfile.TemporaryDirectory() as tmp:
     check("undo keeps root= in cmdline",
           "root=PARTUUID=abc" in (boot / "cmdline.txt").read_text(), True)
 
+print("\n== the shims are checked before the player is started")
+import tempfile                                               # noqa: E402
+from rb4r5 import build as buildmod                           # noqa: E402
+from rb4r5 import chroot as chrootmod                          # noqa: E402
+
+# a minimal 32-bit ARM ELF header: 0x7fELF, class 1, little endian, machine 40
+ARM_ELF = bytearray(64)
+ARM_ELF[0:4] = b"\x7fELF"
+ARM_ELF[4] = 1          # 32-bit
+ARM_ELF[5] = 1          # little endian
+ARM_ELF[16] = 3         # ET_DYN
+ARM_ELF[18] = 40        # EM_ARM
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "usr/lib").mkdir(parents=True)
+    (root / "lib").mkdir()
+    (root / "lib/libc.so.6").write_bytes(b"x")
+
+    cfg = config.load("/nonexistent-shim.json")
+    cfg.set("paths.chroot", str(root))
+
+    needed = {}
+    buildmod.needed_libs = lambda so: needed.get(Path(so).name, [])
+
+    for name in chrootmod.SHIM_NAMES:
+        (root / "usr/lib" / name).write_bytes(bytes(ARM_ELF))
+    needed.update({name: ["libc.so.6"] for name in chrootmod.SHIM_NAMES})
+
+    ok, bad = chrootmod.shims_loadable(cfg)
+    check("all four present and resolvable", (ok, bad), (True, []))
+
+    # one needing a library the chroot does not have
+    needed["audioshim.so"] = ["libc.so.6", "librt.so.1"]
+    ok, bad = chrootmod.shims_loadable(cfg)
+    check("a missing dependency is caught", (ok, bad), (False, ["audioshim.so"]))
+    check("and it is named in the report",
+          any("librt.so.1" in line and "audioshim" in line
+              for line in chrootmod.shim_lines(cfg)), True)
+    needed["audioshim.so"] = ["libc.so.6"]
+
+    # one that is not an ARM object at all
+    (root / "usr/lib/fbshim.so").write_bytes(b"#!/bin/sh\necho no\n")
+    ok, bad = chrootmod.shims_loadable(cfg)
+    check("a non-ARM file is caught", (ok, bad), (False, ["fbshim.so"]))
+    check("and says so",
+          any("NOT a 32-bit ARM" in line for line in chrootmod.shim_lines(cfg)),
+          True)
+    (root / "usr/lib/fbshim.so").write_bytes(bytes(ARM_ELF))
+
+    # one missing entirely
+    (root / "usr/lib/keyshim.so").unlink()
+    ok, bad = chrootmod.shims_loadable(cfg)
+    check("a missing shim is caught", (ok, bad), (False, ["keyshim.so"]))
+    check("and says where it should be",
+          any("MISSING" in line and "keyshim" in line
+              for line in chrootmod.shim_lines(cfg)), True)
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")
     sys.exit(1)
 print("all provisioning edit checks passed")
+
+
+# ------------------------------------------------- the shims must be loadable
+# The whole port rests on four .so files being preloaded into the player.  If
+# one is not, ld.so says so once into the player's log and runs it WITHOUT the
+# shim - the engine then talks to real hardware and dies in a way that looks
+# like anything but a missing file.  So it is checked, before the player runs.

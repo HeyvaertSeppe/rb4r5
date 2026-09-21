@@ -33,6 +33,7 @@ the input devices do not.
 | **Audio** | one HDMI stereo PCM, everything folded into it, no cue, `hw:0,0` hard-coded in C | the FLX4's 4-channel PCM: master → 1/2, cue → 3/4; device, channels, rate and format are discovered in Python and passed in the environment; HDMI is the automatic fallback |
 | **Controller** | DDJ-400 bridge, 736 lines, fixed map | DDJ-FLX4 bridge from the current Mixxx FLX4 mapping: different shift notes, per-mode pad note bases, 14-bit filter knobs, Beat FX on two channels, a runtime-loadable map file for the rest, and sysex-safe MIDI parsing |
 | **Touch** | none (the Chromebit had no touchscreen; `memshim` answered "no touch") | a full touch daemon: zones, drag-to-scroll, drag-to-scrub, calibration; plus the optional native record path |
+| **Firmware** | a documented manual procedure: Rust `cargo build` for the decryptor, `7z` for the ISO, and a privileged Docker container running `fusecram` for the root filesystem | one prompt: pick the `.UPD`.  The decryptor is reimplemented in Python (one ECB pass plus an XOR instead of 135k CBC objects), the key is discovered and *validated* rather than asked for, the ISO is loop-mounted (or `bsdtar`/`7z`), and the cramfs is read by rb4r5's own reader - which the Pi needs, because its kernel has no `CONFIG_CRAMFS` and Debian no longer ships `cramfsprogs` |
 | **Init / launcher** | four shell scripts and four systemd units | one Python launcher and one service; the shell logic (`start-rb.sh`, `fix-dev.sh`, `usb-watch.sh`, `usb-probe.sh`, `quiet-console.sh`) became `supervisor.py`, `chroot.py`, `usbwatch.py`, `probe.py`, `display.py` |
 | **Provisioning** | manual, documented | `setup` does it, idempotently and reversibly (`config.txt`, `cmdline.txt`, boot target, `getty@tty1`, sysctl, udev, service) |
 | **Display** | RK3288 VOP quirks: would not present a panned buffer, needed the pan pinned at 0 | the Pi's fbdev emulation has one buffer, so the same "always buffer 0" code is simply correct; the RK3288 pixel-clock investigation is gone |
@@ -64,6 +65,18 @@ and were:
   count, jog speed sign and the stop on release, long-press suppression, extra
   fingers being ignored, axis flips. 18 checks in
   `tools/tests/test_touch_gestures.py`.
+* **The firmware pipeline, end to end.**  A synthetic `.UPD` was built with the
+  documented scheme (encrypted by `openssl`, i.e. an independent
+  implementation), and rb4r5's decryption was checked to be byte-for-byte
+  identical to a block-by-block CBC reference - including the per-sector IV and
+  the ECB+XOR shortcut.  Then the whole `prepare()` path was run on it: key
+  discovery among decoys, the ISO signature check, `gui.tar.gz`, a real cramfs
+  root filesystem (symlinks and modes included), the key being remembered, and
+  a second run being a no-op.  A wrong key is refused before anything is
+  written.
+* **The cramfs reader**, against an image built byte by byte in the test:
+  multi-block files, empty files, symlinks, nested directories, permissions,
+  and a corrupt image being reported rather than half-extracted.
 * **The ALSA discovery and device choice**, against captured `/proc/asound`
   content for a real FLX4 (4 ch, S24_3LE, 44100): it picks the 4-channel plughw
   device, keeps S24_LE for the shim, notes that alsa-lib will convert, and falls

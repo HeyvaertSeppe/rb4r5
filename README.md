@@ -40,6 +40,8 @@ listed as such:
 | | State |
 |---|---|
 | Launcher, supervisor, config, diagnostics | ✅ run and exercised (`tools/tests/`) |
+| Firmware decryption (`.UPD` → ISO) | ✅ byte-for-byte against an independent AES implementation |
+| Firmware unpacking (cramfs rootfs, gui, key discovery) | ✅ end-to-end on a synthetic firmware image |
 | FLX4 MIDI → engine translation | ✅ end-to-end tested with synthetic MIDI (`tools/flx4-selftest.sh`) |
 | Touch gestures → engine controls | ✅ 18 offline checks over synthetic evdev frames |
 | Boot-config edits (`config.txt`, `cmdline.txt`) | ✅ idempotent + reversible, tested on fixtures |
@@ -55,11 +57,30 @@ changed, what was kept, and what to check first on hardware.
 
 ## What you must supply
 
+One file: the **XDJ-RX3 firmware update** (`.UPD`) you downloaded. On the first
+run the launcher shows you every `.UPD` it can find and asks which one — after
+that it decrypts it, unpacks the ISO, the fonts and the soft-float root
+filesystem, patches the player and builds everything, by itself.
+
+```
+Select your XDJ-RX3 firmware file
+=================================
+
+   1) /home/pi/Downloads/XDJ-RX3.UPD                  69.2 MB  2026-09-21 09:16
+   2) /media/pi/USB-STICK/firmware/XDJ-RX3_v120.UPD   69.2 MB  2026-09-18 10:16
+
+   p) type a path      q) cancel
+
+Select the firmware file [1]:
+```
+
+The firmware key (`aes256.key`, published by AlphaTheta in their own GPL source
+distribution) is found automatically if it is anywhere sensible — next to the
+`.UPD` is easiest — and you are only asked for it if it is not.
+
 This repository contains **no Pioneer/AlphaTheta firmware, no `rbp` binary, no
-decryption key and no music database**. You extract those from firmware you own,
-with the tooling in the [PrimeBox](https://github.com/erhan-/PrimeBox) project —
-[docs/03-payload.md](docs/03-payload.md) walks through it. See
-[NOTICE.md](NOTICE.md).
+decryption key and no music database**; see
+[docs/03-payload.md](docs/03-payload.md) and [NOTICE.md](NOTICE.md).
 
 ## Hardware
 
@@ -74,22 +95,22 @@ with the tooling in the [PrimeBox](https://github.com/erhan-/PrimeBox) project �
 
 ```sh
 git clone https://github.com/HeyvaertSeppe/rb4r5 && cd rb4r5
-
-# 1. provision the Pi (packages, KMS, console handover, boot service)
-sudo python3 launch.py setup
-
-# 2. put your extracted firmware in /opt/rb4r5/payload  (docs/03-payload.md)
-
-# 3. build the runtime: shims, DirectFB, daemons, patched player
-sudo python3 launch.py build
-
-# 4. run it (and check it)
-sudo python3 launch.py run
-sudo python3 launch.py doctor
+sudo python3 launch.py
 ```
 
-Or just `sudo python3 launch.py`, which does whichever of those steps are still
-needed and then runs the player.
+That is the whole thing: it provisions the Pi, asks which `.UPD` to use,
+unpacks and builds everything, and starts the player full screen. It also
+installs a boot service, so from then on the Pi comes up as a player by itself.
+
+The individual steps exist too, if you would rather watch them one at a time:
+
+```sh
+sudo python3 launch.py setup       # packages, KMS, console handover, service
+sudo python3 launch.py firmware    # pick the .UPD; decrypt and unpack it
+sudo python3 launch.py build       # shims, DirectFB, daemons, patched player
+sudo python3 launch.py run         # run and supervise it
+sudo python3 launch.py doctor      # check every subsystem
+```
 
 ## Layout
 

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import (audio, chroot, config, display, inputs, platform5, probe,
-               supervisor, usbwatch, util, zones)
+from . import (audio, chroot, config, display, firmware, inputs, platform5,
+               probe, supervisor, usbwatch, util, zones)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -31,6 +31,20 @@ def run(cfg, verbose: bool = False) -> int:
         _row(label, value)
     for problem in platform5.check(strict=False):
         (warnings if problem.startswith("note:") else problems).append(problem)
+
+    _section("firmware payload")
+    state_fw = firmware.status(cfg)
+    for line in firmware.describe(cfg):
+        print(f"  {line}")
+    if not firmware.ready(cfg):
+        problems.append("no firmware payload: run `sudo python3 launch.py "
+                        "firmware` and pick your .UPD file (docs/03-payload.md)")
+    elif state_fw["release"] and "1.20" not in state_fw["release"]:
+        warnings.append(f"firmware {state_fw['release']}: the published patch "
+                        "sets were derived from v1.20")
+    primebox = Path(cfg.get("build.primebox"))
+    _row("primebox", f"{primebox} "
+                     f"{'present' if (primebox / 'tools/patch-rbp/rbp_patch.py').exists() else 'absent (fetched on build)'}")
 
     _section("runtime (the soft-float XDJ-RX3 chroot)")
     state = chroot.status(cfg)

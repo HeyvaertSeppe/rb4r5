@@ -14,7 +14,8 @@ sudo python3 launch.py            # do whatever is missing, then run
 |---|---|
 | *(none)* / `auto` | Provision if this is a first run, build if the runtime is incomplete, then run and supervise. |
 | `setup` | Provision only: packages, `config.txt`/`cmdline.txt`, console handover, sysctl, udev, the boot service, default config files. `--no-service` skips enabling the service; `--undo` reverts everything; `-y` does not ask. |
-| `payload` | Assemble `<chroot>` from your extracted firmware. `--force` overwrites. |
+| `firmware` | Pick your `.UPD` (a menu of everything it can find) and turn it into a ready payload: decrypt, unpack the ISO, the fonts and the rootfs. `--upd FILE` and `--key FILE` skip the questions, `--show` just reports, `--force` redoes it, `--no-ask` never prompts. |
+| `payload` | Assemble `<chroot>` from the unpacked firmware (runs `firmware` first if needed). `--force` overwrites. |
 | `build` | Host daemons, LD_PRELOAD shims, the patched player, DirectFB, then install into the chroot. `--no-directfb`, `--no-player`, `--fast-directfb`. |
 | `run` | Prepare the screen and the chroot, start everything, supervise it. `--detach` starts and returns. |
 | `stop` | Stop the player and its daemons, release the bind mounts. `--restore-console` gives the text console back. |
@@ -125,6 +126,9 @@ the chroot and the host.
 
 ```sh
 $ tools/tests/run-all.sh                       # everything below, in one go
+$ python3 tools/tests/test_firmware_decrypt.py # .UPD decryption vs openssl
+$ python3 tools/tests/test_firmware_pipeline.py# .UPD -> complete payload
+$ python3 tools/tests/test_cramfs.py           # the cramfs reader
 $ python3 tools/tests/test_audio_parse.py      # ALSA parsing and device choice
 $ python3 tools/tests/test_touch_gestures.py   # gestures -> engine controls
 $ python3 tools/tests/test_provision_edits.py  # boot-config edits are safe

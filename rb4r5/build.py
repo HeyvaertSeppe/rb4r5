@@ -21,7 +21,7 @@ import os
 import shutil
 from pathlib import Path
 
-from . import chroot, provision, util
+from . import chroot, firmware, provision, util
 
 CROSS = "arm-linux-gnueabi-"
 SHIMS = ["memshim.so", "fbshim.so", "audioshim.so", "keyshim.so"]
@@ -49,6 +49,49 @@ def require_cross() -> None:
         "    sudo apt-get install gcc-arm-linux-gnueabi libc6-dev-armel-cross\n"
         "It must be the *gnueabi* (soft-float) toolchain, not gnueabihf: the "
         "XDJ-RX3 userland is soft-float EABI5.")
+
+
+PRIMEBOX_URL = "https://github.com/erhan-/PrimeBox"
+
+
+def ensure_primebox(cfg, allow_clone: bool = True) -> Path:
+    """Make sure the PrimeBox tooling is present, cloning it if it is not.
+
+    PrimeBox carries two things rb4r5 deliberately does not duplicate: the
+    player's patch set (rbp_patch.py) and the DirectFB base diff.  Both are
+    source, both are MIT/LGPL, and it is a small public repository - so the
+    launcher fetches it rather than making you do it by hand.
+    """
+    path = Path(cfg.get("build.primebox"))
+    patcher = path / "tools/patch-rbp/rbp_patch.py"
+    if patcher.exists():
+        return path
+    if path.exists() and any(path.iterdir()) and not (path / ".git").exists():
+        raise util.Fail(f"{path} exists but is not a PrimeBox checkout")
+    if not allow_clone:
+        raise util.Fail(f"PrimeBox is not at {path}")
+    if not util.have("git"):
+        raise util.Fail("git is needed to fetch the PrimeBox tooling "
+                        "(sudo apt-get install git)")
+    util.step(f"fetching the PrimeBox tooling into {path}")
+    util.info("it carries the player's patch set and the DirectFB base diff")
+    if path.exists() and (path / ".git").exists():
+        util.run(["git", "-C", str(path), "pull", "--ff-only"], check=False,
+                 timeout=600)
+    else:
+        util.ensure_dir(path.parent)
+        proc = util.run(["git", "clone", "--depth", "1", PRIMEBOX_URL, str(path)],
+                        check=False, timeout=900, capture=True)
+        if proc.returncode != 0:
+            raise util.Fail(
+                f"could not clone {PRIMEBOX_URL} into {path}:\n"
+                f"{(proc.stdout or '').strip()[:400]}\n"
+                f"Clone it yourself (any machine with network will do) and copy "
+                f"it there, or set build.primebox to where it already is.")
+    if not patcher.exists():
+        raise util.Fail(f"{patcher} is still missing after fetching PrimeBox")
+    util.ok(f"PrimeBox ready at {path}")
+    return path
 
 
 def jobs(cfg) -> int:
@@ -138,7 +181,7 @@ def check_abi(directory: Path) -> list[str]:
 def build_directfb(cfg, repo: Path, fast: bool = False) -> list[str]:
     """Build the patched DirectFB 1.4.16 stack (or just the fbdev module)."""
     require_cross()
-    primebox = Path(cfg.get("build.primebox"))
+    primebox = ensure_primebox(cfg) if not fast else Path(cfg.get("build.primebox"))
     script = repo / ("src/directfb/rebuild-fbdev.sh" if fast
                      else "src/directfb/build-directfb.sh")
     env = {
@@ -173,7 +216,7 @@ def build_directfb(cfg, repo: Path, fast: bool = False) -> list[str]:
 
 def build_player(cfg, repo: Path) -> list[str]:
     """stock rbp -> PrimeBox patch set -> our crash guards -> work/rbp-pi5."""
-    primebox = Path(cfg.get("build.primebox"))
+    primebox = ensure_primebox(cfg)
     patcher = primebox / "tools/patch-rbp/rbp_patch.py"
     stock = cfg.payload / "XDJRX3/pdj/rbp"
     if not stock.exists():
@@ -217,6 +260,10 @@ def all_steps(cfg, repo: Path, with_directfb: bool = True,
 
     util.step("host daemons")
     notes += build_host_tools(cfg, repo)
+
+    if not firmware.ready(cfg):
+        util.step("unpacking the firmware payload")
+        notes += firmware.prepare(cfg)
 
     if not (cfg.chroot / "lib").is_dir():
         util.step("assembling the chroot from the payload")

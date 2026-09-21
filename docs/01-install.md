@@ -47,14 +47,22 @@ Reboot if it says a desktop is still running.
 
 ## 4. Supply the firmware
 
-rb4r5 ships no Pioneer material. Follow
-[03-payload.md](03-payload.md) to produce:
+Put the XDJ-RX3 `.UPD` you downloaded anywhere on the Pi (your home directory, a
+USB stick, `scp` it over) and:
 
+```sh
+PI$ sudo python3 launch.py firmware
 ```
-/opt/rb4r5/payload/XDJRX3-rootfs/     the RX3's soft-float userland
-/opt/rb4r5/payload/XDJRX3/            the ISO tree (pdj/rbp, gui/, lib/, usr/)
-/opt/rb4r5/PrimeBox/                  a PrimeBox checkout (patch tooling)
-```
+
+It lists every `.UPD` it can find, you pick one, and it decrypts and unpacks
+everything else — the player, the fonts, the soft-float root filesystem. The
+firmware key is found automatically wherever it sensibly lives; put it next to
+the `.UPD` and you will never be asked. Details, and where the key comes from:
+[03-payload.md](03-payload.md).
+
+rb4r5 ships no Pioneer material, and the build also needs the PrimeBox tooling
+(the player's patch set and the DirectFB base diff) — it is cloned into
+`/opt/rb4r5/PrimeBox` automatically on the first build.
 
 ## 5. Build
 
@@ -66,6 +74,7 @@ On a Pi 5 this takes roughly:
 
 | Step | Time |
 |---|---|
+| decrypting and unpacking the firmware | under a minute |
 | host daemons (`flx4-bridge`, `rbkeyd`, `fakekbd`) | seconds |
 | assembling the chroot from the payload | 1–2 min |
 | the four LD_PRELOAD shims | seconds |

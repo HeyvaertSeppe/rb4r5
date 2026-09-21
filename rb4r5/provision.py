@@ -23,7 +23,9 @@ END = "# <<< rb4r5 <<<"
 
 # Runtime packages; the build needs more (see build.py).
 PACKAGES_RUNTIME = ["alsa-utils", "coreutils", "util-linux", "psmisc",
-                    "exfatprogs", "dosfstools"]
+                    "exfatprogs", "dosfstools",
+                    # firmware unpacking: AES for the .UPD, bsdtar for the ISO
+                    "python3-cryptography", "libarchive-tools", "git"]
 PACKAGES_BUILD = ["build-essential", "gcc-arm-linux-gnueabi",
                   "libc6-dev-armel-cross", "autoconf", "automake", "libtool",
                   "libtool-bin", "patchelf", "pkg-config", "git", "patch"]

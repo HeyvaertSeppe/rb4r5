@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 from . import (__version__, audio, build, chroot, config, display, doctor,
-               keys, platform5, probe, provision, supervisor, touchd, usbwatch,
-               util, zones)
+               firmware, keys, platform5, probe, provision, supervisor, touchd,
+               usbwatch, util, zones)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -59,8 +59,24 @@ def cmd_setup(args, cfg) -> int:
     return 0
 
 
+def cmd_firmware(args, cfg) -> int:
+    util.require_root("unpacking the firmware")
+    if args.show:
+        for line in firmware.describe(cfg):
+            print(line)
+        return 0 if firmware.ready(cfg) else 1
+    _print_notes(firmware.prepare(cfg, upd=args.upd, key=args.key,
+                                  force=args.force, ask=not args.no_ask))
+    util.ok("the firmware payload is ready")
+    print()
+    print("Next:  sudo python3 launch.py build     (then it runs)")
+    return 0
+
+
 def cmd_payload(args, cfg) -> int:
     util.require_root("assembling the runtime")
+    if not firmware.ready(cfg):
+        _print_notes(firmware.prepare(cfg))
     util.step(f"assembling {cfg.chroot} from {cfg.payload}")
     _print_notes(chroot.assemble(cfg, force=args.force))
     _print_notes(chroot.make_stubs(cfg))
@@ -107,17 +123,15 @@ def cmd_auto(args, cfg) -> int:
 
     state = chroot.status(cfg)
     if not state["ready"]:
-        if not (cfg.payload / "XDJRX3-rootfs").is_dir():
-            util.error("the runtime is not built and there is no firmware "
-                       f"payload in {cfg.payload}")
+        if not firmware.ready(cfg):
+            util.step("first run: the player's runtime has not been unpacked yet")
             print()
-            print("rb4r5 ships no Pioneer firmware.  Extract your own XDJ-RX3 "
-                  "firmware as described in docs/03-payload.md so that")
-            print(f"    {cfg.payload}/XDJRX3-rootfs/   and")
-            print(f"    {cfg.payload}/XDJRX3/")
-            print("exist, then run this again.")
-            return 1
-        util.step("the runtime is incomplete: building it")
+            print("rb4r5 ships no Pioneer firmware, so point it at the .UPD "
+                  "update file you downloaded;")
+            print("everything after that - decrypting, unpacking, patching, "
+                  "building - is automatic.")
+            _print_notes(firmware.prepare(cfg))
+        util.step("building the runtime")
         _print_notes(build.all_steps(cfg, REPO))
 
     return supervisor.Supervisor(cfg, REPO).run(foreground=not args.detach)
@@ -326,8 +340,22 @@ def build_parser() -> argparse.ArgumentParser:
                        help="do not ask for confirmation")
     setup.set_defaults(func=cmd_setup)
 
-    payload = sub.add_parser("payload", help="assemble the chroot from your "
-                                             "extracted firmware")
+    fw = sub.add_parser("firmware", help="pick your .UPD and unpack it into a "
+                                        "ready payload")
+    fw.add_argument("--upd", metavar="FILE",
+                    help="the firmware file (skips the prompt)")
+    fw.add_argument("--key", metavar="FILE",
+                    help="the aes256.key (normally found automatically)")
+    fw.add_argument("--force", action="store_true",
+                    help="unpack again even if it was done before")
+    fw.add_argument("--no-ask", action="store_true",
+                    help="never prompt; fail instead")
+    fw.add_argument("--show", action="store_true",
+                    help="just report what is unpacked already")
+    fw.set_defaults(func=cmd_firmware)
+
+    payload = sub.add_parser("payload", help="assemble the chroot from the "
+                                             "unpacked firmware")
     payload.add_argument("--force", action="store_true",
                          help="overwrite an existing runtime")
     payload.set_defaults(func=cmd_payload)

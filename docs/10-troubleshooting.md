@@ -23,6 +23,21 @@ is organised by what you are seeing.
 | The screen blanks after ten minutes | console blanking | `setup` adds `consoleblank=0`; check `cmdline.txt` |
 | Colours look wrong / the image is torn | the framebuffer is not 16 or 32 bpp | `launch.py doctor` prints the geometry; pin a mode with `display.force_mode` |
 
+## The firmware will not unpack
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The menu lists no `.UPD` files | it is somewhere the scan does not reach (it looks in `~`, `/home`, `/media`, `/mnt`, `/root`, `/tmp`, `/srv`, `/boot/firmware` and the payload dir, three levels deep) | press `p` and type the path, or `--upd /path/to/XDJ-RX3.UPD` |
+| Your file is listed as "does not look right" | the body is not 512-byte aligned plus a 16-byte trailer | it is probably not an XDJ-RX3 `.UPD` — a partial download does this too |
+| `no working firmware key found` | no `aes256.key` anywhere it looked, or the one it found is for something else | get it from AlphaTheta's GPL source distribution ([03-payload](03-payload.md)) and drop it next to the `.UPD` |
+| `decryption produced something that is not an ISO image` | wrong key, or a corrupt download | check the `.UPD` size (v1.20 is 69,171,216 bytes) |
+| `no AES implementation available` | no `python3-cryptography` and no `openssl` | `sudo apt-get install python3-cryptography` |
+| `cannot unpack the ISO on this machine` | not root, and no `bsdtar`/`7z` | run it with `sudo`, or `sudo apt-get install libarchive-tools` |
+| `rootfs.cramfs is not in this ISO` | not XDJ-RX3 firmware | check what you downloaded |
+| `not a cramfs image` / a block "does not decompress" | truncated or corrupt firmware | re-download and re-run with `--force` |
+| It asks about the key every time | the payload directory is not writable, so the key was not remembered | check `/opt/rb4r5/payload` |
+| `could not clone …/PrimeBox` | the Pi has no network | clone it elsewhere and `launch.py config --set build.primebox=/path/to/PrimeBox` |
+
 ## The player will not start
 
 | Symptom | Cause | Fix |

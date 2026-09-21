@@ -75,21 +75,32 @@ key = firmware.derive_key(KEY_TEXT)
 
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
+    # The real XDJ-RX3 ISO ships the player and the fonts as tarballs inside
+    # images/ - there is no pdj/ or gui/ directory in the image itself.
     iso_src = tmp / "iso-contents"
     (iso_src / "images").mkdir(parents=True)
-    (iso_src / "pdj").mkdir(parents=True)
 
-    # the firmware's own pieces
     (iso_src / "images/rootfs.cramfs").write_bytes(_cramfs_fixture.build(ROOTFS))
     (iso_src / "images/release.txt").write_text("1.20\n")
-    (iso_src / "pdj/rbp").write_bytes(b"\x7fELF" + b"fake player" * 500)
+
+    PLAYER = b"\x7fELF" + b"fake player" * 500
+    def write_tar(path, contents):
+        with tarfile.open(path, "w:gz") as tar:
+            for name, payload in contents.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                info.mode = 0o755
+                tar.addfile(info, io.BytesIO(payload))
+
+    write_tar(iso_src / "images/pdj.tar.gz",
+              {"pdj/rbp": PLAYER, "pdj/kill_daemon": b"\x7fELFhelper"})
+    write_tar(iso_src / "images/gui.tar.gz", GUI_FILES)
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         for name, payload in GUI_FILES.items():
             info = tarfile.TarInfo(name)
             info.size = len(payload)
             tar.addfile(info, io.BytesIO(payload))
-    (iso_src / "images/gui.tar.gz").write_bytes(buffer.getvalue())
 
     # a "firmware image": anything, as long as the ISO signature is at sector 64
     plain = bytearray(os.urandom(200 * SECTOR))
@@ -118,7 +129,10 @@ with tempfile.TemporaryDirectory() as tmp:
 
     payload = Path(cfg.get("paths.payload"))
     check("prepare() reports ready", firmware.ready(cfg))
-    check("the player was unpacked", (payload / "XDJRX3/pdj/rbp").exists())
+    check("the player came out of images/pdj.tar.gz",
+          (payload / "XDJRX3/pdj/rbp").read_bytes(), PLAYER)
+    check("and what sits beside it came too",
+          (payload / "XDJRX3/pdj/kill_daemon").exists())
     check("the ISO was kept", (payload / "XDJRX3.iso").exists())
     check("the decrypted ISO is the plaintext",
           (payload / "XDJRX3.iso").read_bytes(), plain)

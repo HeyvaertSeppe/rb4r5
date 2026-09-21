@@ -121,6 +121,64 @@ with tempfile.TemporaryDirectory() as tmp:
     check("find_file returns None when there is nothing",
           firmware.find_file(tree, ("nothing-here",)), None)
 
+    # ---------------------------------------------------------------------
+    # 7. the real XDJ-RX3 layout: the player and the fonts are tarballs in
+    #    images/, not directories.  This is the exact shape that produced
+    #    "the player (pdj/rbp) is not in this ISO".
+    # ---------------------------------------------------------------------
+    import io
+    import tarfile
+
+    def make_tar(path: Path, contents: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(path, "w:gz") as tar:
+            for name, payload in contents.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                info.mode = 0o755
+                tar.addfile(info, io.BytesIO(payload))
+
+    # (a) the tarball carries its own pdj/ directory
+    tree = tmp / "real-wrapped"
+    (tree / "images").mkdir(parents=True)
+    make_tar(tree / "images/pdj.tar.gz",
+             {"pdj/rbp": b"PLAYER", "pdj/kill_daemon": b"HELPER"})
+    make_tar(tree / "images/gui.tar.gz",
+             {"pset/fontdata/f.bin": b"FONT", "imagedata/i.bin": b"IMG"})
+    note = firmware.extract_player_tar(tree)
+    check("pdj.tar.gz is unpacked", (tree / "pdj/rbp").read_bytes(), b"PLAYER")
+    check("what sits beside the player comes too",
+          (tree / "pdj/kill_daemon").exists())
+    check("and it notices the archive's own directory",
+          "carried its own directory" in note)
+    firmware.extract_gui(tree)
+    check("gui.tar.gz still lands in gui/",
+          (tree / "gui/pset/fontdata/f.bin").read_bytes(), b"FONT")
+
+    # (b) the tarball has no top directory: a bare rbp
+    tree = tmp / "real-bare"
+    (tree / "images").mkdir(parents=True)
+    make_tar(tree / "images/pdj.tar.gz", {"rbp": b"PLAYER", "edb": b"DB"})
+    firmware.extract_player_tar(tree)
+    check("a bare rbp lands in pdj/ anyway",
+          (tree / "pdj/rbp").read_bytes(), b"PLAYER")
+    check("and so does its neighbour", (tree / "pdj/edb").exists())
+
+    # (c) gui.tar.gz that carries its own gui/ must not become gui/gui/
+    tree = tmp / "gui-wrapped"
+    (tree / "images").mkdir(parents=True)
+    make_tar(tree / "images/gui.tar.gz", {"gui/pset/f.bin": b"FONT"})
+    firmware.extract_gui(tree)
+    check("a wrapped gui.tar.gz does not nest",
+          (tree / "gui/pset/f.bin").read_bytes(), b"FONT")
+    check("and gui/gui/ was not created", (tree / "gui/gui").exists(), False)
+
+    # (d) no tarball at all: say so, do not crash
+    tree = tmp / "no-tars"
+    (tree / "images").mkdir(parents=True)
+    check("a missing pdj.tar.gz is reported",
+          "not found" in firmware.extract_player_tar(tree))
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

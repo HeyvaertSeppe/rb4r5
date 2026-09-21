@@ -44,7 +44,7 @@ guessing.
 | `no AES implementation available` | no `python3-cryptography` and no `openssl` | `sudo apt-get install python3-cryptography` |
 | `cannot unpack the ISO on this machine` | not root, and no `bsdtar`/`7z` | run it with `sudo`, or `sudo apt-get install libarchive-tools` |
 | `rootfs.cramfs is not in this ISO` | not XDJ-RX3 firmware, or an extraction that produced nothing | the message now lists what the ISO *did* contain — compare it with docs/03 |
-| `the player (pdj/rbp) is not in this ISO` | the ISO extracted without Rock Ridge names, so everything came out as `PDJ/RBP;1` | fixed automatically since the layout-normalising step: `git pull`, then `sudo python3 launch.py firmware --force`. The message also prints the tree and where it found a file called `rbp` |
+| `the player (pdj/rbp) is not in this ISO` | the player lives inside `images/pdj.tar.gz`, which an older version never opened; or the ISO extracted without Rock Ridge names (`PDJ/RBP;1`) | both are handled now: `git pull`, then `sudo python3 launch.py firmware --force`. The message also prints the tree and where it found a file called `rbp` |
 | The payload looks complete but the build cannot find libraries | an upper-cased tree that was not normalised (an old version) | `sudo python3 launch.py firmware --force` re-extracts and normalises |
 | `not a cramfs image` / a block "does not decompress" | truncated or corrupt firmware | re-download and re-run with `--force` |
 | It asks about the key every time | the payload directory is not writable, so the key was not remembered | check `/opt/rb4r5/payload` |

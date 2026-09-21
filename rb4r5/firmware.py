@@ -1098,20 +1098,51 @@ def tree_summary(iso_tree: Path, limit: int = 24) -> list[str]:
     return lines or ["  (the extracted ISO is empty)"]
 
 
-def extract_gui(iso_tree: Path, dest: Path) -> str:
-    """gui.tar.gz holds the fonts and images - the UI will not start without it."""
-    archive = iso_tree / "images/gui.tar.gz"
-    if not archive.exists():
-        found = find_file(iso_tree, ("gui.tar.gz", "gui.tgz"))
-        if not found:
-            return "gui.tar.gz not found in the ISO (fonts will be missing)"
-        archive = found
-    util.step(f"unpacking {archive.name} -> {dest}")
-    util.ensure_dir(dest)
-    with tarfile.open(archive, "r:gz") as tar:
+def extract_payload_tar(iso_tree: Path, name: str, names, subdir: str) -> str:
+    """Unpack one of the firmware's payload tarballs into the ISO tree.
+
+    The XDJ-RX3 image does not ship `pdj/` and `gui/` as directories - it ships
+    them as `images/pdj.tar.gz` and `images/gui.tar.gz`.  (That is what made
+    "the player (pdj/rbp) is not in this ISO" happen on a good firmware image:
+    the player was inside a tarball nobody had opened.)
+
+    An archive may or may not carry its own top-level directory, so both are
+    handled: `pdj/rbp` inside the tar lands at `<iso>/pdj/rbp`, and a bare
+    `rbp` lands there too.
+    """
+    archive = None
+    for candidate in names:
+        direct = iso_tree / "images" / candidate
+        if direct.exists():
+            archive = direct
+            break
+    if archive is None:
+        archive = find_file(iso_tree, names)
+    if archive is None:
+        return f"{name} not found in the ISO"
+
+    with tarfile.open(archive) as tar:
         members = tar.getmembers()
+        tops = {Path(m.name).parts[0] for m in members if m.name not in (".", "./")}
+        wrapped = tops == {subdir}
+        dest = iso_tree if wrapped else iso_tree / subdir
+        util.step(f"unpacking {archive.name} -> {dest}")
+        util.ensure_dir(dest)
         _safe_extract(tar, members, dest)
-    return f"{len(members)} entries"
+    return (f"{archive.name}: {len(members)} entries -> "
+            f"{subdir}/{' (the archive carried its own directory)' if wrapped else ''}")
+
+
+def extract_gui(iso_tree: Path, dest: Path | None = None) -> str:
+    """gui.tar.gz holds the fonts and images - the UI will not start without it."""
+    return extract_payload_tar(iso_tree, "gui.tar.gz",
+                               ("gui.tar.gz", "gui.tgz"), "gui")
+
+
+def extract_player_tar(iso_tree: Path) -> str:
+    """pdj.tar.gz holds the player itself (rbp) and what it sits beside."""
+    return extract_payload_tar(iso_tree, "pdj.tar.gz",
+                               ("pdj.tar.gz", "pdj.tgz"), "pdj")
 
 
 def _safe_extract(tar: tarfile.TarFile, members, dest: Path) -> None:
@@ -1237,7 +1268,8 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
             util.warn(f"this is firmware {release}; every published patch set "
                       "was derived from v1.20, so the player may not patch")
 
-    notes.append(f"gui assets: {extract_gui(iso_tree, iso_tree / 'gui')}")
+    notes.append(f"gui assets: {extract_gui(iso_tree)}")
+    notes.append(f"player payload: {extract_player_tar(iso_tree)}")
 
     rootfs = payload / "XDJRX3-rootfs"
     if force and rootfs.exists():

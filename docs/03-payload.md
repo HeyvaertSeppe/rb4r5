@@ -69,12 +69,17 @@ deliberately does *not* outrank the firmware the port was built for.
 
 ```
 XDJ-RX3.UPD  ──decrypt──▶ XDJRX3.iso ──unpack──▶ XDJRX3/
-  (69 MB, AES-256-CBC)                             ├── pdj/rbp        the player
-                                                   ├── lib/  usr/     ISO libraries
-                                                   ├── gui/           fonts + images
+  (69 MB, AES-256-CBC)                             ├── lib/  usr/     ISO libraries
                                                    └── images/
-                                      ──unpack──▶ XDJRX3-rootfs/      the soft-float
-                                                                      userland
+                                                       ├── pdj.tar.gz ─┐
+                                                       ├── gui.tar.gz ─┤
+                                                       └── rootfs.cramfs
+                                                                       │
+                       the three payloads inside are unpacked in turn: ┘
+                                                 XDJRX3/pdj/rbp     the player
+                                                 XDJRX3/gui/        fonts + images
+                                                 XDJRX3-rootfs/     the soft-float
+                                                                    userland
 ```
 
 | Step | How |
@@ -83,7 +88,8 @@ XDJ-RX3.UPD  ──decrypt──▶ XDJRX3.iso ──unpack──▶ XDJRX3/
 | **Verify** | The ISO 9660 signature `CD001` must appear at sector 64. A wrong key cannot fake that, so a bad key is caught before anything is written. |
 | **Unpack the ISO** | A loop mount when running as root (keeps Rock Ridge symlinks and modes), otherwise `bsdtar`, otherwise `7z`. |
 | **Normalise the layout** | An ISO9660 image without Rock Ridge extracts as `PDJ/RBP;1` rather than `pdj/rbp`, and some extractors add a wrapper directory. The version suffixes are stripped, a wholly upper-cased tree is lower-cased (the player's loader wants `libc.so.6`, not `LIBC.SO.6`), a wrapper directory is flattened, and the player, the root filesystem image and the gui archive are located case-insensitively wherever they ended up — including inside the root filesystem, if the ISO tree has no copy. |
-| **Unpack `gui.tar.gz`** | Python's `tarfile`. Without these fonts the UI does not start. |
+| **Unpack `images/pdj.tar.gz`** | The player is not a loose file in the image — `pdj/` is shipped as a tarball, and `rbp` is inside it, along with what sits beside it on the real device. |
+| **Unpack `images/gui.tar.gz`** | The same for `gui/`: fonts, psets and image data. Without them the UI does not start. |
 | **Unpack `rootfs.cramfs`** | rb4r5's own cramfs reader ([`rb4r5/cramfs.py`](../rb4r5/cramfs.py)). The Pi's kernel is built **without** `CONFIG_CRAMFS` and Debian no longer ships `cramfsprogs`, so neither mounting nor `cramfsck` is available — PrimeBox's tutorial needs a privileged Docker container here, and rb4r5 does not. |
 
 Everything lands under `/opt/rb4r5/payload` and is skipped on later runs;

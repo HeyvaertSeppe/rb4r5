@@ -148,12 +148,15 @@ def assemble(cfg, payload: Path | None = None, force: bool = False) -> list[str]
             util.ensure_dir(dst)
             util.run(["cp", "-a", f"{src}/.", str(dst)], timeout=1800)
             notes.append(f"overlaid {sub}/ from the ISO tree")
-        rbp = isotree / "pdj" / "rbp"
-        if rbp.exists() and not (root / "root/pdj/rbp").exists():
+        pdj = isotree / "pdj"
+        if pdj.is_dir():
+            # the whole directory, not just the binary: whatever the firmware's
+            # pdj.tar.gz holds sits beside the player on the real device
             util.ensure_dir(root / "root/pdj")
-            shutil.copy2(rbp, root / "root/pdj/rbp")
-            notes.append("copied the stock rbp (build it to patch it: "
-                         "launch.py build)")
+            util.run(["cp", "-a", f"{pdj}/.", str(root / "root/pdj")],
+                     timeout=600)
+            notes.append("copied pdj/ (the stock player and what sits beside "
+                         "it; `launch.py build` patches the binary)")
 
     # busybox shell, so `chroot ... /bin/sh` works for diagnostics
     if (root / "bin/busybox").exists() and not (root / "bin/sh").exists():

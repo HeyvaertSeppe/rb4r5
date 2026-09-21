@@ -71,6 +71,17 @@ guessing.
 | It asks about the key every time | the payload directory is not writable, so the key was not remembered | check `/opt/rb4r5/payload` |
 | `could not clone …/PrimeBox` | the Pi has no network | clone it elsewhere and `launch.py config --set build.primebox=/path/to/PrimeBox` |
 
+## The build fails
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `core/CoreSlave.h: No such file or directory` | the DirectFB git tree ships `*.flux`, not the sources generated from them; `fluxcomp` was missing | fixed: the build now builds fluxcomp itself. `git pull`, then `sudo python3 launch.py build` |
+| `cannot clone …/flux` | no network | clone it on another machine into `/opt/rb4r5/work/flux` and re-run |
+| `fluxcomp did not build` | no C++ compiler or autotools | `sudo apt install build-essential autoconf automake libtool` |
+| `the soft-float cross compiler is missing` | wrong toolchain installed | `sudo apt install gcc-arm-linux-gnueabi libc6-dev-armel-cross` — *gnueabi*, not gnueabihf |
+| `<shim>.so references GLIBC_2.x` and the build stops | the shims were linked against the host glibc, not the RX3 one | the chroot is the sysroot; re-run `launch.py payload` then `build` |
+| `DirectFB NOT built: command failed` | the underlying error is above it, and in full in `/opt/rb4r5/work/dfb-build/make.log` | read that log; the first `error:` line is the real one |
+
 ## The player will not start
 
 | Symptom | Cause | Fix |

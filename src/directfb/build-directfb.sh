@@ -39,6 +39,8 @@ NEON=${NEON:-1}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 CROSS=${CROSS:-arm-linux-gnueabi-}
 DFBURL=${DFBURL:-https://github.com/deniskropp/DirectFB.git}
+FLUXSRC=${FLUXSRC:-$(dirname "$BUILD")/flux}
+FLUXURL=${FLUXURL:-https://github.com/deniskropp/flux.git}
 BUILDTRIPLET=${BUILDTRIPLET:-$(cc -dumpmachine)}
 
 die() { echo "build-directfb: $*" >&2; exit 1; }
@@ -85,6 +87,53 @@ fi
 sed -i 's@^.*fopen("/tmp/dfbdig9.log".*$@/* rb4r5: debug log removed */@' \
     systems/fbdev/fbdev_surface_pool.c 2>/dev/null || true
 printf 'int dfb_fbdev_compat_shim(void){return 0;}\n' > systems/fbdev/compat_shim.c
+
+# ---------------------------------------------------------------------------
+# The git tree ships *.flux, not the C and H files fluxcomp generates from
+# them - the 1.4.16 release tarball shipped those pre-generated, git does not.
+# Without this step the build dies with:
+#     CoreSlave_real.c:31:10: fatal error: core/CoreSlave.h: No such file
+# and configure never warns, because it does not check for fluxcomp at all.
+# ---------------------------------------------------------------------------
+echo "== 2b. fluxcomp (generates CoreSlave.h and friends from *.flux)"
+if command -v fluxcomp >/dev/null 2>&1; then
+    echo "    using the fluxcomp already installed"
+elif [ -x "$FLUXSRC/src/fluxcomp" ]; then
+    echo "    using $FLUXSRC/src/fluxcomp"
+    PATH="$FLUXSRC/src:$PATH"; export PATH
+else
+    echo "    building it from $FLUXURL"
+    rm -rf "$FLUXSRC"
+    git clone -q --depth 1 "$FLUXURL" "$FLUXSRC" || \
+        die "cannot clone $FLUXURL - fluxcomp is needed to generate the
+    DirectFB core sources.  Clone it on a machine with network, copy it to
+    $FLUXSRC, and re-run."
+    ( cd "$FLUXSRC" && \
+      { [ -x ./configure ] || ./autogen.sh >autogen.log 2>&1 || true; } && \
+      ./configure >configure.log 2>&1 && \
+      make -j"$JOBS" >make.log 2>&1 ) || \
+        die "fluxcomp did not build (see $FLUXSRC/make.log).  It needs a C++
+    compiler and autotools: apt install build-essential autoconf automake libtool"
+    [ -x "$FLUXSRC/src/fluxcomp" ] || die "no fluxcomp binary at $FLUXSRC/src"
+    PATH="$FLUXSRC/src:$PATH"; export PATH
+fi
+
+echo "== 2c. generating the core sources"
+for dir_args in "src/core:-c -i --include-prefix=core" "src/media:-c -i --no-direct"; do
+    dir=${dir_args%%:*}
+    args=${dir_args#*:}
+    [ -d "$BUILD/$dir" ] || continue
+    ( cd "$BUILD/$dir" || exit 0
+      for f in *.flux; do
+          [ -e "$f" ] || continue          # no flux sources here
+          # shellcheck disable=SC2086
+          fluxcomp $args "$f" || exit 1
+      done ) || die "fluxcomp failed in $dir"
+done
+[ -f "$BUILD/src/core/CoreSlave.h" ] || \
+    die "the core sources were not generated (no src/core/CoreSlave.h).
+    fluxcomp ran but produced nothing - check $FLUXSRC/make.log"
+echo "    generated $(ls "$BUILD"/src/core/Core*.h 2>/dev/null | wc -l) headers"
 
 echo "== 3. configure"
 export CC=${CROSS}gcc CXX=${CROSS}g++

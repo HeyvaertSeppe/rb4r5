@@ -51,15 +51,17 @@
  };
  
  /******************************************************************************/
-@@ -410,7 +440,10 @@
+@@ -410,7 +440,12 @@
       }
  
       /* should be closed automatically in children upon exec(...) */
 -     if (fcntl( dfb_fbdev->fd, F_SETFD, FD_CLOEXEC ) < 0)
 +     /* rb4r5: use the raw syscall - glibc 2.28+ versions fcntl(), but the
 +      * RX3 chroot ships glibc 2.13 (only fcntl@GLIBC_2.4).  A versioned
-+      * GLIBC_2.28 reference makes dlopen() of this module fail. */
-+     if (syscall( SYS_fcntl64, dfb_fbdev->fd, F_SETFD, FD_CLOEXEC ) < 0)
++      * GLIBC_2.28 reference makes dlopen() of this module fail.  SYS_fcntl
++      * (not SYS_fcntl64) because F_SETFD involves no file offsets, and it is
++      * the one number that exists on every target. */
++     if (syscall( SYS_fcntl, dfb_fbdev->fd, F_SETFD, FD_CLOEXEC ) < 0)
       {
            D_PERROR( "Fusion/Init: Setting FD_CLOEXEC flag failed!\n" );
            goto error;

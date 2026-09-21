@@ -82,6 +82,16 @@ and were:
   physical controller and the engine itself.  It also checks the pad bank is
   switched before the first pad of a mode, and that 14-bit controls arrive as
   10-bit values with the right op.
+* **The DirectFB build, for real.** The three patch layers (PrimeBox's diff,
+  `directfb-pi5.patch`, the NEON patch) were applied to an actual checkout of
+  the `directfb-1.4` branch — all three apply with `-F3` — the core sources
+  were generated with fluxcomp, and the whole stack compiled to
+  `libdirectfb-1.4.so` and a patched `libdirectfb_fbdev.so`.  That was a
+  native (x86-64) build, so the *cross* compile against the RX3 sysroot is
+  still unrun; but every source-level problem in the recipe is now shaken out,
+  including one of my own: the inherited `SYS_fcntl64` only exists on 32-bit
+  targets, and `F_SETFD` needs no 64-bit variant, so it is plain `SYS_fcntl`
+  now.
 * **The full-screen probe**, against synthetic framebuffers: a filled frame
   passes, and a top-left-corner frame (the classic missing-scale symptom), a
   letterboxed one and a black screen are all caught.

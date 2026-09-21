@@ -174,5 +174,15 @@ for marker in chroot.MODULE_MARKERS:
     check(marker in text,
           f"the driver still emits {marker!r} (module_report looks for it)")
 
+# The fast rebuild path must re-apply the patch before compiling: without
+# that it recompiles whatever source the tree already holds and produces the
+# previous binary, which then installs over the good one.
+script = (Path(__file__).resolve().parents[2]
+          / "src/directfb/rebuild-fbdev.sh").read_text()
+check("git checkout --" in script and "directfb-pi5.patch" in script,
+      "rebuild-fbdev.sh restores and re-applies the patch")
+check("strings" in script and "FBDev/rb4r5:" in script,
+      "rebuild-fbdev.sh refuses to stage a module without the markers")
+
 print("\n" + ("all fb tests passed" if not FAIL else f"{FAIL} FAILURES"))
 sys.exit(1 if FAIL else 0)

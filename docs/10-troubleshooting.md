@@ -90,6 +90,8 @@ guessing.
 | `the soft-float cross compiler is missing` | wrong toolchain installed | `sudo apt install gcc-arm-linux-gnueabi libc6-dev-armel-cross` — *gnueabi*, not gnueabihf |
 | `<shim>.so references GLIBC_2.x` and the build stops | the shims were linked against the host glibc, not the RX3 one | the chroot is the sysroot; re-run `launch.py payload` then `build` |
 | `DirectFB NOT built: command failed` | the underlying error is above it, and in full in `/opt/rb4r5/work/dfb-build/make.log` | read that log; the first `error:` line is the real one |
+| `build --fast-directfb` succeeds but the md5 does not change, and `doctor` still says the driver is old | the build tree still held the previous `directfb-pi5.patch`; recompiling it reproduces the same binary | fixed: the fast rebuild restores the patched files from git and re-applies both patches first, and refuses to stage a module that does not carry the current publish path |
+| `was built, but from an older source tree` | the tree cannot be brought up to date in place | `sudo rm -rf /opt/rb4r5/work/dfb-build` and `sudo python3 launch.py build` (the full build, ~15 min) |
 
 ## The build fails, part two
 

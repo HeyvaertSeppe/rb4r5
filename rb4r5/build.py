@@ -211,7 +211,23 @@ def build_directfb(cfg, repo: Path, fast: bool = False) -> list[str]:
     module = cfg.work / "dfb/lib/directfb-1.4-6/systems/libdirectfb_fbdev.so"
     if not module.exists():
         raise util.Fail(f"{module} was not produced - see the build output")
-    return [f"libdirectfb_fbdev.so md5 {md5(module)}"]
+
+    # A module that builds but is missing the current publish path is worse
+    # than one that fails to build: it installs cleanly over a good one and
+    # the player quietly keeps drawing the way it did before.  This happens
+    # when the build tree still holds an older directfb-pi5.patch, which is
+    # why rebuild-fbdev.sh re-applies it - check the result either way.
+    data = module.read_bytes()
+    missing = [name for name in chroot.MODULE_MARKERS
+               if name.encode() not in data]
+    if missing:
+        raise util.Fail(
+            f"{module.name} was built, but from an older source tree: it "
+            f"cannot " + "; cannot ".join(chroot.MODULE_MARKERS[name]
+                                          for name in missing) + ".\n"
+            f"    Delete {cfg.work / 'dfb-build'} and run a full build:\n"
+            f"        sudo python3 launch.py build")
+    return [f"libdirectfb_fbdev.so md5 {md5(module)} (current publish path)"]
 
 
 def build_player(cfg, repo: Path) -> list[str]:

@@ -233,6 +233,15 @@ and `launch.py run` refuses to start with an older one, naming the fix
 DirectFB step failed now exits non-zero instead of printing a note among forty
 other lines, which is how a failed rebuild got missed.
 
+The rebuild itself was the next thing to get wrong. `--fast-directfb` runs
+`rebuild-fbdev.sh`, which used to recompile the existing build tree — and that
+tree still held whichever version of `directfb-pi5.patch` was current when it
+was first created. Recompiling it reproduced the same binary, **md5 and all**,
+which then installed over the good one. It now restores the four files the
+patch owns from git, re-applies PrimeBox's diff and ours, and checks the
+linked module actually contains the marker strings before staging it. A build
+that cannot produce a current module now fails and says to delete the tree.
+
 ## Configuration
 
 `/etc/rb4r5/config.json`:

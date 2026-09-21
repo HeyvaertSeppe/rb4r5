@@ -84,6 +84,7 @@ DEFAULTS: dict = {
         # The engine picks its output once, at startup.  If the controller is
         # plugged in later, restart so master + cue move onto it.
         "restart_on_controller": True,
+        "controller_settle": 2.5,        # wait this long after it appears
         "startup_mute_ms": 1500,         # kill the engine's power-on transient
         "startup_fade_ms": 300,
         "fallback_hdmi": True,           # use HDMI audio when no controller
@@ -102,6 +103,11 @@ DEFAULTS: dict = {
         # wheel.  Measure it: `launch.py jogtest`.  Getting this wrong makes
         # the wheel feel dead and the position run away.
         "jog_ticks_per_rev": 1800,
+        # The rim bends, the plate scratches.  bend_scale is how much gentler
+        # the rim is than the plate (0.25 = a quarter as far).
+        "jog_bend_scale": 0.25,
+        "jog_emit_ms": 10,               # one speed per this many ms
+        "leds": True,                    # light the controller's buttons
         "jog_touch_timeout_ms": 4000,    # let a stuck plate-touch go
         "midi_device": None,             # /dev/snd/midiC*D*, null = auto
         "filter_init": True,             # select FILTER as the colour FX type

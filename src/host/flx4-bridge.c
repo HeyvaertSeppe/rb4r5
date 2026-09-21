@@ -49,6 +49,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <poll.h>
 #include <time.h>
@@ -146,6 +147,8 @@ static float jog_ppr = 1800.0f;    /* engine units per revolution         */
 static float jog_tpr = 1800.0f;    /* FLX4 messages per revolution        */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 static int   jog_touch_timeout_ms = 4000;  /* 0 = never let a touch go     */
+static int   jog_emit_ms = 10;     /* one speed per this many ms          */
+static float jog_bend_scale = 0.25f;   /* the rim, relative to the plate  */
 static int   jog_reverse = 0;      /* the platter turns the other way     */
 static float jog_scale = 1.0f;     /* how hard a turn pushes the engine   */
 
@@ -339,12 +342,24 @@ static void build_cc14(void)
 }
 
 /* ---------------- jog wheels ---------------- */
+/* What the wheel is being asked to do.  The RX3 decides between scratching
+ * and bending from whether the PLATE is held, and the FLX4 reports the plate
+ * and the rim on different CCs - so the difference is knowable here, and has
+ * to be, because a rim nudge that scratches is the difference between
+ * "nudge it back into time" and "the track jumps". */
+#define JOG_SCRATCH  0
+#define JOG_BEND     1
+#define JOG_SEARCH   2
+
 struct jog {
     int midi_ch;
     int send_ch;
     float vpos;            /* platter angle in engine units, 0 .. jog_ppr */
     int moving;
     int touched;           /* the plate is held (note 0x36)               */
+    int auto_touch;        /* ... and we are the ones saying so           */
+    int pending;           /* ticks accumulated since the last emit       */
+    int mode;              /* JOG_*                                        */
     long long last_ms;
     long long last_emit_ms;
     long long touch_ms;    /* when the touch arrived, for the stuck guard */
@@ -366,7 +381,26 @@ static struct jog *jog_for(int midi_ch)
     return NULL;
 }
 
-static void jog_delta(int midi_ch, int delta)
+static void jog_touch_set(struct jog *s, int on, int automatic)
+{
+    if (s->touched == on)
+        return;
+    s->touched = on;
+    s->auto_touch = on ? automatic : 0;
+    s->touch_ms = now_ms();
+    send_ctrl(K_JOG_TOUCH, on ? OP_PRESS : OP_RELEASE, s->send_ch, 0, 0.0f, 0);
+    if (opt_verbose)
+        logmsg("  jog deck%d: plate %s%s\n", s->send_ch,
+               on ? "held" : "let go", automatic ? " (from the wheel)" : "");
+}
+
+/* Only accumulate here.  Working out a speed from the gap between two MIDI
+ * messages makes it jump about - the messages arrive in bursts, so the gap is
+ * sometimes a millisecond and sometimes twenty, and the speed swings by the
+ * same factor even though the wheel is turning steadily.  That is the
+ * "momentum" that comes and goes.  jog_tick() turns the accumulated ticks
+ * into one speed at a fixed rate instead. */
+static void jog_delta(int midi_ch, int delta, int mode)
 {
     struct jog *s = jog_for(midi_ch);
     if (!s || delta == 0)
@@ -374,33 +408,51 @@ static void jog_delta(int midi_ch, int delta)
     if (jog_reverse)
         delta = -delta;
 
-    long long t = now_ms();
-    float dt = (float)(t - s->last_ms) / 1000.0f;
-    s->last_ms = t;
-    if (dt < 0.0005f)
-        dt = 0.0005f;
+    s->pending += delta;
+    s->mode = mode;
+    s->last_ms = now_ms();
 
-    /* the wheel's own resolution turns messages into revolutions ... */
-    float revs = (float)delta / (jog_tpr > 0.5f ? jog_tpr : 1800.0f);
+    /* The engine tells scratching from bending by whether the plate is held.
+     * If the plate's own note never arrives - and on some units it does not -
+     * moving the plate says so on its behalf, and moving the rim takes it
+     * back. */
+    if (mode == JOG_SCRATCH || mode == JOG_SEARCH) {
+        if (!s->touched)
+            jog_touch_set(s, 1, 1);
+    }
+    else if (s->auto_touch) {
+        jog_touch_set(s, 0, 1);
+    }
+}
 
-    /* ... the engine's resolution turns revolutions into a platter angle,
-     * which must stay inside one revolution: handing it a number that keeps
-     * growing is what makes the track jump. */
+static void jog_emit(struct jog *s, long long t)
+{
+    float dt = (float)(t - s->last_emit_ms) / 1000.0f;
+    float revs, speed;
+
+    if (dt < 0.001f)
+        dt = 0.001f;
+    revs = (float)s->pending / (jog_tpr > 0.5f ? jog_tpr : 1800.0f);
+    s->pending = 0;
+    s->last_emit_ms = t;
+    s->moving = 1;
+
     s->vpos += revs * jog_ppr;
     while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
     while (s->vpos < 0.0f)     s->vpos += jog_ppr;
 
-    float speed = revs / dt * jog_scale;
+    speed = revs / dt * jog_scale;
+    if (s->mode == JOG_BEND)
+        speed *= jog_bend_scale;     /* the rim nudges, it does not scratch */
     if (speed > 8.0f) speed = 8.0f;
     if (speed < -8.0f) speed = -8.0f;
-    s->moving = 1;
-    s->last_emit_ms = t;
 
     send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, speed, (int)s->vpos);
     if (opt_verbose)
-        logmsg("  jog deck%d delta=%d speed=%.2f rev/s pos=%d%s\n",
-               s->send_ch, delta, (double)speed, (int)s->vpos,
-               s->touched ? " (touched)" : "");
+        logmsg("  jog deck%d %s speed=%.3f rev/s pos=%d%s\n", s->send_ch,
+               s->mode == JOG_BEND ? "bend " :
+               s->mode == JOG_SEARCH ? "search" : "scratch",
+               (double)speed, (int)s->vpos, s->touched ? " (held)" : "");
 }
 
 /* A jog that stops sending must be told to stop, or the engine keeps nudging. */
@@ -409,6 +461,11 @@ static void jog_tick(void)
     long long t = now_ms();
     for (int i = 0; i < 2; i++) {
         struct jog *s = &jogs[i];
+
+        /* one speed per interval, however the messages arrived */
+        if (s->pending != 0 && t - s->last_emit_ms >= jog_emit_ms)
+            jog_emit(s, t);
+
         if (!s->moving)
             continue;
         /* A plate reported as touched but not moving for a long time is
@@ -418,11 +475,10 @@ static void jog_tick(void)
         if (s->touched && jog_touch_timeout_ms > 0 &&
             t - s->touch_ms > jog_touch_timeout_ms &&
             t - s->last_ms > jog_touch_timeout_ms) {
-            s->touched = 0;
-            send_ctrl(K_JOG_TOUCH, OP_RELEASE, s->send_ch, 0, 0.0f, 0);
             if (opt_verbose)
                 logmsg("  jog deck%d: releasing a touch held %lldms with no "
                        "movement\n", s->send_ch, t - s->touch_ms);
+            jog_touch_set(s, 0, 0);
         }
         if (t - s->last_emit_ms < jog_idle_ms)
             continue;
@@ -539,8 +595,12 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_DECK2, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler -> slip loop" },
 
     /* ---- BEAT FX (ch 5, and ch 6 when the FX is assigned to CH2) ---- */
-    { MC_FX1, 0x63, K_BFXTYPE,  CH_GLOBAL, "BEAT FX select" },
-    { MC_FX1, 0x64, K_OVERLAY_FX, CH_GLOBAL, "SHIFT+BEAT FX select (picker)" },
+    /* Pressing FX SELECT opens the picker, because that is what pressing it
+     * is FOR: the FLX4 has no screen, so cycling the effect blind is the
+     * thing the picker exists to replace.  SHIFT+FX SELECT still cycles it
+     * the old way for anyone who wants that. */
+    { MC_FX1, 0x63, K_OVERLAY_FX, CH_GLOBAL, "BEAT FX select (picker)" },
+    { MC_FX1, 0x64, K_BFXTYPE,  CH_GLOBAL, "SHIFT+BEAT FX select (cycle)" },
     { MC_FX1, 0x4A, K_BEATPREV, CH_GLOBAL, "BEAT <" },
     { MC_FX1, 0x4B, K_BEATNEXT, CH_GLOBAL, "BEAT >" },
     { MC_FX1, 0x47, K_BFX,      CH_GLOBAL, "BEAT FX on/off" },
@@ -661,13 +721,68 @@ static int handle_fxch(int ch, int note)
 /* One line into the overlay daemon's command fifo.  Never blocks and never
  * matters if nothing is listening: the picker is a convenience, and the
  * controller must not stall because a daemon is not running. */
+/* ---------------- LEDs ----------------
+ * Pioneer controllers light a button by being sent the note that button
+ * sends, with velocity 0x7f for on and 0x00 for off.  So lighting is mostly
+ * echoing: press CUE, CUE lights.  That is not the same as mirroring the
+ * player - the player's own LED state goes down the panel link, which this
+ * port does not decode yet (docs/13-panel-link.md) - but it is the difference
+ * between a controller that responds and one that looks dead. */
+static int  midi_fd = -1;
+static int  opt_leds = 1;
+
+static void midi_send3(int status, int d1, int d2)
+{
+    unsigned char msg[3];
+    if (midi_fd < 0 || !opt_leds)
+        return;
+    msg[0] = (unsigned char)status;
+    msg[1] = (unsigned char)(d1 & 0x7f);
+    msg[2] = (unsigned char)(d2 & 0x7f);
+    if (write(midi_fd, msg, sizeof(msg)) < 0 && opt_verbose)
+        logmsg("  (led write failed: %s)\n", strerror(errno));
+}
+
+static void led_set(int ch, int note, int on)
+{
+    midi_send3(0x90 | (ch & 0x0f), note, on ? 0x7f : 0x00);
+}
+
+/* A short sweep at startup: every note we know how to light, on and then off.
+ * It says "a host is here" to the controller, and it tells the operator at a
+ * glance whether the output path works at all. */
+static void led_hello(void)
+{
+    int shown = 0;
+    if (midi_fd < 0 || !opt_leds)
+        return;
+    for (int i = 0; i < nmap_n; i++) {
+        if (!notemap[i].key || notemap[i].key == K_OVERLAY_FX)
+            continue;
+        led_set(notemap[i].ch, notemap[i].note, 1);
+        shown++;
+    }
+    usleep(250000);
+    for (int i = 0; i < nmap_n; i++) {
+        if (!notemap[i].key || notemap[i].key == K_OVERLAY_FX)
+            continue;
+        led_set(notemap[i].ch, notemap[i].note, 0);
+    }
+    logmsg("flx4-bridge: lamp test over %d button(s)%s\n", shown,
+           midi_fd < 0 ? " (no output device)" : "");
+}
+
 static void overlay_command(const char *word)
 {
+    static int complained = 0;
     int fd = open(opt_overlay, O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
-        if (opt_verbose)
-            logmsg("  (no overlay daemon on %s: %s)\n", opt_overlay,
-                   strerror(errno));
+        /* Say this once even without -v: a button that appears to do nothing
+         * is exactly the case where the log has to explain itself. */
+        if (!complained++ || opt_verbose)
+            logmsg("flx4: cannot reach the overlay daemon on %s (%s) - the "
+                   "effect picker will not open.  Is rboverlay running?\n",
+                   opt_overlay, strerror(errno));
         return;
     }
     if (write(fd, word, strlen(word)) < 0 || write(fd, "\n", 1) < 0) {
@@ -699,15 +814,14 @@ static void handle_note(int ch, int note, int on)
         if (notemap[i].ch != ch || notemap[i].note != note || !notemap[i].key)
             continue;
         if (notemap[i].key == K_JOG_TOUCH) {
-            /* Remember it as well as forwarding it.  A touch that never
-             * arrives at its note-off leaves the engine in scratch mode for
-             * good, and then every nudge of the wheel seeks the track
-             * instead of bending it - which is what "the music skips" looks
-             * like from the outside. */
+            /* The plate's own note, which beats anything the wheel movement
+             * inferred.  A touch that never gets its note-off would leave the
+             * deck scratching for good, so jog_tick() gives up on one that
+             * has been held without moving. */
             struct jog *s = jog_for(ch);
             if (s) {
-                s->touched = on;
-                s->touch_ms = now_ms();
+                jog_touch_set(s, on, 0);
+                return;
             }
         }
         if (notemap[i].key == K_OVERLAY_FX) {
@@ -722,6 +836,7 @@ static void handle_note(int ch, int note, int on)
         if (sch == 0)
             sch = (ch == MC_DECK1) ? 1 : 2;
         send_ctrl(notemap[i].key, on ? OP_PRESS : OP_RELEASE, sch, 0, 0.0f, 0);
+        led_set(ch, note, on);          /* light what was pressed */
         if (opt_verbose)
             logmsg("  %s -> 0x%04x %s ch%d\n", notemap[i].name,
                    notemap[i].key, on ? "press" : "release", sch);
@@ -750,11 +865,20 @@ static void handle_cc(int ch, int cc, int val)
         return;
     }
 
-    /* jog wheels: 0x21 side, 0x22 platter (vinyl), 0x23 platter (non-vinyl),
-     * 0x29 SHIFT+platter (search).  All relative. */
+    /* The jog wheel reports where it was touched, and that decides what the
+     * turn means:
+     *   0x21 the rim   -> bend: a nudge, the deck keeps playing
+     *   0x22 the plate -> scratch, when the deck is in vinyl mode
+     *   0x23 the plate in non-vinyl mode -> also a bend
+     *   0x29 SHIFT+plate -> search through the track
+     * Treating them all the same is why the wheel behaved identically
+     * whether or not the plate was held. */
     if ((ch == MC_DECK1 || ch == MC_DECK2) &&
         (cc == 0x21 || cc == 0x22 || cc == 0x23 || cc == 0x29)) {
-        jog_delta(ch, (val >= 64) ? val - 128 : val);
+        int delta = (val >= 64) ? val - 128 : val;
+        int mode = (cc == 0x22) ? JOG_SCRATCH
+                 : (cc == 0x29) ? JOG_SEARCH : JOG_BEND;
+        jog_delta(ch, delta, mode);
         return;
     }
 
@@ -824,7 +948,7 @@ static char *find_midi_node(int card)
 static int open_midi(void)
 {
     if (midi_dev)
-        return open(midi_dev, O_RDONLY | O_NONBLOCK);
+        return open(midi_dev, O_RDWR | O_NONBLOCK);
 
     int card = find_controller_card();
     if (card < 0)
@@ -835,7 +959,16 @@ static int open_midi(void)
         return -1;
     }
     logmsg("flx4: using %s (ALSA card %d)\n", node, card);
-    return open(node, O_RDONLY | O_NONBLOCK);
+    /* O_RDWR, not O_RDONLY: the same node carries the LEDs back to the
+     * controller, and without writing to it every light stays dark and the
+     * unit goes on blinking as though no host had claimed it. */
+    {
+        int fd = open(node, O_RDWR | O_NONBLOCK);
+        if (fd < 0 && errno == EACCES)
+            fd = open(node, O_RDONLY | O_NONBLOCK);   /* read-only is better
+                                                         than nothing */
+        return fd;
+    }
 }
 
 static void list_map(void)
@@ -868,7 +1001,7 @@ int main(int argc, char **argv)
 
     /* -l is handled after the whole option list, so `-l -m map.conf` and
      * `-m map.conf -l` behave the same. */
-    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:RF")) != -1) {
+    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:RLF")) != -1) {
         switch (opt) {
         case 'v': opt_verbose = 1; break;
         case 's': opt_sniff = 1; opt_verbose = 1; break;
@@ -880,13 +1013,17 @@ int main(int argc, char **argv)
         case 'S': jog_scale = (float)atof(optarg); break;
         case 'T': jog_tpr = (float)atof(optarg); break;
         case 'H': jog_touch_timeout_ms = atoi(optarg); break;
+        case 'B': jog_bend_scale = (float)atof(optarg); break;
+        case 'E': jog_emit_ms = atoi(optarg); break;
         case 'O': opt_overlay = optarg; break;
+        case 'L': opt_leds = 0; break;
         case 'F': opt_filter_init = 1; break;
         case 'l': opt_list = 1; break;
         default:
             fprintf(stderr, "usage: %s [-v] [-s] [-l] [-d dev] [-f fifo] "
                             "[-m mapfile] [-J engine_ppr] [-T flx4_ticks_per_rev] "
-                            "[-S jog_scale] [-R] [-H touch_timeout_ms] "
+                            "[-S jog_scale] [-B bend_scale] [-E emit_ms] "
+                            "[-R] [-L] [-H touch_timeout_ms] "
                             "[-O overlayfifo] [-F]\n", argv[0]);
             return 2;
         }
@@ -942,6 +1079,25 @@ static void run_device(int fd)
 {
     unsigned char buf[512];
     int status = 0, d1 = 0, need = 0, in_sysex = 0;
+
+    /* Only ever light a real MIDI node.  A rawmidi device is a character
+     * device and writes go out to the controller; anything else - a fifo in
+     * a test, a regular file - sends them straight back at us as input, where
+     * they parse as button presses nobody made. */
+    {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) {
+            midi_fd = fd;
+        }
+        else {
+            midi_fd = -1;
+            if (opt_leds)
+                logmsg("flx4: %s is not a MIDI character device, so the LEDs "
+                       "are off (input still works)\n",
+                       midi_dev ? midi_dev : "the device");
+        }
+    }
+    led_hello();
 
     for (;;) {
         struct pollfd pfd;

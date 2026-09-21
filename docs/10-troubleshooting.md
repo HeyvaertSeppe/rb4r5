@@ -99,6 +99,17 @@ guessing.
 |---|---|---|
 | `'const struct input_event' has no member named 'time'` | DirectFB 1.4 predates the kernel 4.16 change that removes that member when the build asks for a 64-bit `time_t` | fixed in `directfb-pi5.patch`: it uses the `input_event_sec`/`input_event_usec` macros the kernel headers define for exactly this. `git pull`, then `build` |
 
+## Sound and the controller
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| **The music plays far too fast and there is no sound** | the output device stopped accepting audio, and the engine's transport is clocked by the write that is failing - so it free-runs at CPU speed | fixed: a failed write now paces the engine in software, so the deck runs at the right speed even with no output, and says so in `rbp.log`. Check that log for "the output device stopped accepting audio" |
+| The FLX4 is plugged in but the sound stays on HDMI | the engine opens its PCM once, at startup | the supervisor now restarts the player when a controller appears, at any time. `audio.restart_on_controller=false` disables it |
+| The FLX4's lights never come on | the bridge opened the MIDI node read-only | fixed - and there is a lamp test at startup so you can see the output path work |
+| The FLX4 blinks as though nothing is connected | it has no audio stream and no MIDI output from a host | both of the above; if it still blinks once sound is going through, say so |
+| The picker only flashes on screen | the player's next frame painted over it | fixed: the driver holds off while `/tmp/rb-overlay.modal` exists |
+| FX SELECT does not open the picker | it is bound to note 0x63 on MIDI channel 5; your unit may differ | `sudo python3 launch.py sniff`, press it, and bind what it prints ([06-controller](06-controller.md)) |
+
 ## The player will not start
 
 | Symptom | Cause | Fix |

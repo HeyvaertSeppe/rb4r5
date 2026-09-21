@@ -222,7 +222,11 @@ class Supervisor:
                         "-T", str(cfg.get("controller.jog_ticks_per_rev", 1800)),
                         "-S", str(cfg.get("controller.jog_scale", 1.0)),
                         "-H", str(cfg.get("controller.jog_touch_timeout_ms", 4000)),
+                        "-B", str(cfg.get("controller.jog_bend_scale", 0.25)),
+                        "-E", str(cfg.get("controller.jog_emit_ms", 10)),
                         "-O", overlay.CMD_FIFO]
+                if not cfg.get("controller.leds", True):
+                    argv.append("-L")
                 if cfg.get("controller.jog_reverse"):
                     argv.append("-R")
                 if cfg.get("controller.filter_init", True):
@@ -295,35 +299,47 @@ class Supervisor:
             elif child.name == "rbp":
                 time.sleep(1.0)
 
-    # -- the controller appearing after we started -------------------------
+    # -- the controller being plugged in, at any time ----------------------
     def watch_for_controller(self) -> None:
-        """Notice the FLX4 being plugged in, and take it into use.
+        """Take the FLX4 into use whenever it appears, however late.
 
-        The engine opens its PCM once, at startup, so the audio device is
-        decided before the player draws its first frame.  Plug the controller
-        in a minute later and nothing moves: the sound stays on HDMI and the
-        controller looks like it was never detected.  There is no way to hand
-        a running engine a different card, so the honest fix is to start
-        again, which takes a few seconds and is what the user was about to do
-        by hand anyway.
+        The engine opens its PCM once, at startup, and there is no way to hand
+        a running engine a different card.  So plugging the controller in
+        after the player is up leaves the sound on HDMI, the controller
+        unrecognised, and its lights dark - and it stays that way however long
+        you wait.
+
+        This watches the card list and restarts the player when the
+        controller appears, which is the only thing that actually moves the
+        audio onto it.  It watches the whole time, not just at startup, so
+        unplugging and plugging back in works too.
         """
         if not self.cfg.get("audio.restart_on_controller", True):
             return
         fragment = str(self.cfg.get("controller.name", "FLX4"))
-        if audio.find_controller(fragment):
-            return                      # it was already there at startup
 
         def watch():
+            present = audio.find_controller(fragment) is not None
+            settle = float(self.cfg.get("audio.controller_settle", 2.5))
             while not self.stopping:
                 time.sleep(2.0)
-                card = audio.find_controller(fragment)
-                if not card or self.stopping:
+                if self.stopping:
+                    return
+                now = audio.find_controller(fragment)
+                if (now is not None) == present:
                     continue
-                util.warn(f"the controller appeared ({card['name']}) after "
-                          "the player had already chosen its audio device - "
+                present = now is not None
+                if not present:
+                    util.warn("the controller was unplugged - the player is "
+                              "still running; plug it back in and it will be "
+                              "picked up")
+                    continue
+                util.warn(f"the controller appeared ({now['name']}) after the "
+                          "player had already chosen its audio device - "
                           "restarting so master and cue go to it")
-                time.sleep(1.5)         # let the card's PCMs settle
-                self.restart_everything()
+                time.sleep(settle)          # let its PCMs and MIDI node settle
+                if not self.stopping:
+                    self.restart_everything()
                 return
 
         threading.Thread(target=watch, daemon=True).start()

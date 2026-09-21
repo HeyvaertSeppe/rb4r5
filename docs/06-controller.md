@@ -252,3 +252,69 @@ of the wheel seeks the track instead of bending it — which is what "the music
 skips" looks like. The FLX4 sends the touch on one note and the shifted touch
 on another, so a missed note-off is possible; `controller.jog_touch_timeout_ms`
 (4 s) releases a touch that has been held with no movement at all.
+
+## The rim bends, the plate scratches
+
+The FLX4 reports *where* the wheel was touched, on different CCs, and that is
+what decides what a turn means:
+
+| CC | where | what it should do |
+|---|---|---|
+| `0x21` | the rim | **bend** — a nudge, the deck keeps playing |
+| `0x22` | the plate, vinyl mode | **scratch** |
+| `0x23` | the plate, non-vinyl mode | bend |
+| `0x29` | SHIFT + plate | search through the track |
+
+All four used to be treated the same, which is why the wheel behaved
+identically whether or not the plate was held. Now a bend is scaled down by
+`controller.jog_bend_scale` (0.25 — a quarter as far as the plate) and does
+not claim the plate is held; a scratch does.
+
+**The plate-touch note matters more than it looks.** The engine tells
+scratching from bending by whether the plate is held, so if that note never
+arrives every nudge seeks the track instead of bending it. The bridge now
+says the plate is held on the wheel's behalf when the plate CC moves, and
+takes it back when the rim does — so the distinction works even if the note
+is missing. `launch.py jogtest` reports whether your unit sends it.
+
+## Why the speed used to come and go
+
+The speed was worked out from the gap between two MIDI messages. Those arrive
+in bursts, so the gap is sometimes a millisecond and sometimes twenty, and the
+speed swung by the same factor while the wheel turned perfectly steadily —
+which feels like momentum appearing and disappearing.
+
+Ticks are now accumulated and turned into one speed at a fixed rate
+(`controller.jog_emit_ms`, 10 ms). Same wheel, same turn, same number.
+
+## The LEDs
+
+Pioneer controllers light a button by being sent the note that button sends,
+with velocity `0x7f` for on and `0x00` for off. So the bridge opens the MIDI
+node **read-write** now — it was read-only, which is why nothing on the
+controller ever lit — echoes every button it handles, and runs a lamp test at
+startup so you can see at a glance whether the output path works.
+
+That is not the same as mirroring the player. The player's own LED state goes
+down the panel link, which is not decoded yet
+([13-panel-link](13-panel-link.md)) — so what lights is what *you* pressed,
+not what the RX3 thinks. `controller.leds=false` turns it off.
+
+The bridge only ever writes to a real MIDI character device. A FIFO or a file
+would send the bytes straight back as input, where they would parse as button
+presses nobody made.
+
+## Finding a button's note
+
+```sh
+sudo python3 launch.py sniff        # press the control; its note is printed
+```
+
+Then bind it in `/etc/rb4r5/flx4-map.conf` — for example to move the effect
+picker onto a different button:
+
+```
+note ch5 0x63 0xf001 global   FX select opens the picker
+```
+
+`0xf001` is not an engine key: it is the launcher's effect picker.

@@ -58,7 +58,9 @@ MIDI = {
     "pad 8":                [0x97, 0x07, 0x7F],
     "pad mode BEAT LOOP":   [0x90, 0x6D, 0x7F],
     "pad mode BEAT JUMP":   [0x90, 0x20, 0x7F],
-    "BEAT FX select":       [0x94, 0x63, 0x7F],
+    # FX SELECT itself opens the launcher's effect picker; the engine's own
+    # blind cycling moved to SHIFT+FX SELECT (note 0x64).
+    "BEAT FX select":       [0x94, 0x64, 0x7F],
     "BEAT FX on/off":       [0x94, 0x47, 0x7F],
     "BEAT FX depth":        [0xB4, 0x02, 0x40],
     "BEAT < / >":           [0x94, 0x4B, 0x7F],
@@ -125,8 +127,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
     threading.Thread(target=fake_keyshim, daemon=True).start()
 
+    overlay_fifo = tmp / "overlay.fifo"
+    os.mkfifo(overlay_fifo)
     proc = subprocess.Popen([str(bridge), "-d", str(midi_fifo),
-                             "-f", str(ctrl_fifo)],
+                             "-f", str(ctrl_fifo),
+                             "-O", str(overlay_fifo)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.5)
     midi = os.open(midi_fifo, os.O_WRONLY)
@@ -150,6 +155,35 @@ with tempfile.TemporaryDirectory() as tmp:
             failures.append(name)
             print(f"FAIL {name:<22} -> nothing matching {needles} ({why})")
 
+    # FX SELECT is the one button that does NOT go to the engine: it opens the
+    # launcher's picker instead, which the FLX4 has no other way to reach.
+    picker = []
+    def read_picker():
+        try:
+            fd = os.open(overlay_fifo, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        for _ in range(40):
+            try:
+                blob = os.read(fd, 64)
+                if blob:
+                    picker.append(blob)
+            except (BlockingIOError, OSError):
+                pass
+            time.sleep(0.05)
+        os.close(fd)
+    watcher = threading.Thread(target=read_picker, daemon=True)
+    watcher.start()
+    time.sleep(0.2)
+    os.write(midi, bytes([0x94, 0x63, 0x7F]))     # FX SELECT press
+    time.sleep(0.5)
+    os.write(midi, bytes([0x94, 0x63, 0x00]))     # and release
+    watcher.join(timeout=3)
+    check("FX SELECT asks the launcher to open the effect picker",
+          b"fx" in b"".join(picker))
+    check("and does not send the engine a blind FX-type step",
+          engine_log.read_text().count("key=0000448b") == 1)
+
     os.close(midi)
     stop.set()
     proc.terminate()
@@ -167,6 +201,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the tempo slider arrives as a value op",
           "key=00004109\n         op=5" in text)
     check("the jog carries a rotate op", "key=00004305\n         op=4" in text)
+
 
 print()
 if failures:

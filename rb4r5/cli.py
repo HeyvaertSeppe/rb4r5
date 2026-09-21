@@ -311,6 +311,26 @@ def cmd_subucom(args, cfg) -> int:
     return subucom.run(cfg, capture=args.capture)
 
 
+def cmd_sniff(args, cfg) -> int:
+    """Print what the controller sends, so a button can be identified.
+
+    Press the thing you want to map; the note or CC it sends is printed.  Put
+    that in /etc/rb4r5/flx4-map.conf to bind it - for instance to move the
+    effect picker onto a different button:
+
+        note ch5 0x63 0xf001 global   FX select opens the picker
+    """
+    util.require_root("reading the controller's MIDI")
+    bridge = cfg.bindir / "flx4-bridge"
+    if not bridge.exists():
+        raise util.Fail(f"{bridge} is not installed (run: launch.py build)")
+    argv = [str(bridge), "-s"]
+    if args.device:
+        argv += ["-d", args.device]
+    print("press the control you want to identify (Ctrl-C to stop)\n")
+    return util.run(argv, capture=False, check=False).returncode
+
+
 def cmd_jogtest(args, cfg) -> int:
     """Measure the FLX4's jog wheel: ticks per revolution and direction."""
     util.require_root("reading the controller's MIDI")
@@ -602,6 +622,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="the same view over a capture file")
     panel.add_argument("--seconds", type=float, default=30.0)
     panel.set_defaults(func=cmd_subucom)
+
+    sniff = sub.add_parser("sniff", help="print what the controller sends, to "
+                                        "identify a button")
+    sniff.add_argument("-d", "--device", help="/dev/snd/midiC*D*")
+    sniff.set_defaults(func=cmd_sniff)
 
     jog = sub.add_parser("jogtest", help="measure the jog wheel: ticks per "
                                         "revolution and which way it counts")

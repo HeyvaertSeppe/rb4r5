@@ -11,7 +11,7 @@
  #ifdef USE_SYSFS
  # include <sysfs/libsysfs.h>
  #endif
-@@ -120,103 +124,88 @@
+@@ -120,103 +124,135 @@
  extern FBDev *dfb_fbdev;   /* defined further below */
  
  /*
@@ -45,6 +45,57 @@
 -     g = (g << 2) | (g >> 4);
 -     b = (b << 3) | (b >> 2);
 -     return 0xff000000 | (r << 16) | (g << 8) | b;
++/* The launcher draws its effect picker and its boot splash straight into the
++ * framebuffer.  Anything it draws there is gone on our very next frame unless
++ * we stop - which is what "the picker only flashes" looks like.  While the
++ * flag file exists the screen is the launcher's; /tmp is bind-mounted into
++ * the chroot, so both sides see the same path.
++ *
++ * The frame counter keeps going either way, and is written out so the
++ * launcher can tell "the player is drawing" from "the player is stuck" while
++ * its splash is covering the evidence. */
++#define RB4R5_MODAL_PATH  "/tmp/rb-overlay.modal"
++#define RB4R5_TICK_PATH   "/tmp/rb-frames.dat"
++
++static unsigned int rb4r5_frames = 0;
++
++static int
++rb4r5_modal_now( void )
++{
++     static int cached = 0;
++
++     /* every fourth frame: ~7 checks a second at 30fps, which is well inside
++      * a touch's own latency and costs nothing measurable */
++     if ((rb4r5_frames & 3) == 0)
++          cached = (access( RB4R5_MODAL_PATH, F_OK ) == 0);
++     return cached;
+ }
+ 
+ static void
+-fbdev_rotate_primary( unsigned char *src, int sw, int sh, int spitch,
+-                      unsigned char *dst, int fw, int fh, int fpitch,
+-                      int deg )
++rb4r5_publish_tick( void )
+ {
+-     FBDevShared *shared = dfb_fbdev->shared;
++     static int fd = -1;
++     char line[32];
++     int len;
++
++     if ((rb4r5_frames & 7) != 0)
++          return;
++     if (fd < 0) {
++          fd = open( RB4R5_TICK_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666 );
++          if (fd < 0)
++               return;
++     }
++     len = snprintf( line, sizeof(line), "%u\n", rb4r5_frames );
++     if (lseek( fd, 0, SEEK_SET ) == 0 && write( fd, line, (size_t)len ) < 0) {
++          close( fd );
++          fd = -1;
++     }
++}
++
 +static void
 +rb4r5_dst_for_fb( RB4R5Dst *d, FBDevShared *shared, int sw, int sh )
 +{
@@ -60,35 +111,31 @@
 +                     shared->rot_fw, shared->rot_fh, shared->rot_fpitch,
 +                     sw, sh, shared->rot_top, shared->rot_fit,
 +                     shared->rot_filter );
- }
- 
- static void
--fbdev_rotate_primary( unsigned char *src, int sw, int sh, int spitch,
--                      unsigned char *dst, int fw, int fh, int fpitch,
--                      int deg )
++}
++
++static void
 +fbdev_publish_frame( const unsigned char *src, int sw, int sh, int spitch,
 +                     unsigned char *dst, const RB4R5Dst *d, int deg )
- {
--     FBDevShared *shared = dfb_fbdev->shared;
++{
 +     FBDevShared   *shared  = dfb_fbdev->shared;
       unsigned char *scratch = shared->rot_scratch;
 -     unsigned int   x, y;
       int src_bpp = (shared->rot_src_bpp >= 2) ? shared->rot_src_bpp : 4;
 +     int x, y;
-+
+ 
+-     if (!scratch || !src || !dst)
 +     if (!src || !dst || sw <= 0 || sh <= 0 || spitch <= 0)
-+          return;
-+
+           return;
+ 
+-     /* copy the whole logical buffer to scratch first (safe in-place) */
 +     if (deg == 0 && src_bpp == 2) {
 +          rb4r5_scale565( src, sw, sh, spitch, dst, d );
 +          return;
 +     }
- 
--     if (!scratch || !src || !dst)
++
 +     if (!scratch)
-           return;
- 
--     /* copy the whole logical buffer to scratch first (safe in-place) */
++          return;
++
 +     /* copy the whole logical buffer to scratch first (safe in place) */
       memcpy( scratch, src, (size_t)sh * spitch );
  
@@ -177,7 +224,7 @@
       }
  }
  
-@@ -275,6 +264,14 @@
+@@ -275,6 +311,14 @@
                                          DFBSurfaceFlipFlags         flags,
                                          CoreSurfaceBufferLock      *lock );
  
@@ -192,7 +239,7 @@
  
  static DisplayLayerFuncs primaryLayerFuncs = {
       .LayerDataSize      = primaryLayerDataSize,
-@@ -288,6 +285,7 @@
+@@ -288,6 +332,7 @@
       .SetRegion          = primarySetRegion,
       .RemoveRegion       = primaryRemoveRegion,
       .FlipRegion         = primaryFlipRegion,
@@ -200,7 +247,7 @@
  };
  
  /******************************************************************************/
-@@ -410,7 +408,12 @@
+@@ -410,7 +455,12 @@
       }
  
       /* should be closed automatically in children upon exec(...) */
@@ -214,7 +261,7 @@
       {
            D_PERROR( "Fusion/Init: Setting FD_CLOEXEC flag failed!\n" );
            goto error;
-@@ -565,7 +568,6 @@
+@@ -565,7 +615,6 @@
  
       dfb_fbdev->core   = core;
       dfb_fbdev->shared = shared;
@@ -222,7 +269,7 @@
  
       page_size = direct_pagesize();
  
-@@ -620,7 +622,6 @@
+@@ -620,7 +669,6 @@
                      "Could not disable console acceleration!\n" );
            goto error;
       }
@@ -230,7 +277,7 @@
  
       dfb_fbdev_var_to_mode( &shared->current_var,
                              &shared->current_mode );
-@@ -630,18 +631,25 @@
+@@ -630,18 +678,25 @@
        * The actual geometry comes from the layer region config at flip time,
        * here we only remember the physical fb geometry. */
       shared->rot_deg    = 0;
@@ -263,7 +310,7 @@
  
                 /* read the REAL fb geometry via raw syscall (bypasses the
                  * LD_PRELOAD shim that lies to rbp about the logical size) */
-@@ -668,7 +676,55 @@
+@@ -668,7 +723,55 @@
                      else
                           shared->rot_fpitch = shared->fix.line_length;
                 }
@@ -320,7 +367,7 @@
  
                 /* logical layer geometry (shimmed): orig_var carries the
                  * logical xres/yres/bpp that rbp believes in. */
-@@ -689,7 +745,7 @@
+@@ -689,7 +792,7 @@
                      D_INFO( "FBDev/Rotate: rotation %d enabled (fb %dx%d)\n",
                              shared->rot_deg, shared->rot_fw, shared->rot_fh );
                 else {
@@ -329,7 +376,7 @@
                      if (shared->rot_scratch) { free(shared->rot_scratch); shared->rot_scratch = NULL; }
                      if (shared->rot_surface) { free(shared->rot_surface); shared->rot_surface = NULL; }
                 }
-@@ -1624,19 +1680,18 @@
+@@ -1624,19 +1727,18 @@
                 }
  
                 ret = dfb_fbdev_set_mode( mode, surface, config->source.x,
@@ -356,7 +403,7 @@
                 }
                 else
                      yofs = lock->offset / lock->pitch + config->source.y;
-@@ -1667,6 +1722,76 @@
+@@ -1667,6 +1769,81 @@
       return DFB_OK;
  }
  
@@ -378,6 +425,11 @@
 +
 +     if (!shared->rot_enable || !shared->rot_surface)
 +          return DFB_OK;
++
++     rb4r5_frames++;
++     rb4r5_publish_tick();
++     if (rb4r5_modal_now())
++          return DFB_OK;           /* the launcher owns the screen just now */
 +
 +     rb4r5_dst_for_fb( &d, shared, sw, sh );
 +
@@ -433,7 +485,7 @@
  static DFBResult
  primaryFlipRegion( CoreLayer             *layer,
                     void                  *driver_data,
-@@ -1685,34 +1810,18 @@
+@@ -1685,34 +1862,18 @@
           !dfb_config->pollvsync_after)
            dfb_screen_wait_vsync( dfb_screens_at(DSCID_PRIMARY) );
  
@@ -480,7 +532,7 @@
            if (ret)
                 return ret;
       }
-@@ -1775,7 +1884,7 @@
+@@ -1775,7 +1936,7 @@
  
       var = &shared->current_var;
  
@@ -489,7 +541,7 @@
            var = &shared->real_var;   /* PATCH: use the REAL fb geometry (the
                                          LD_PRELOAD shim may lie to rbp) */
  
-@@ -2156,7 +2265,7 @@
+@@ -2156,7 +2317,7 @@
                 var.blue           = real.blue;
                 var.transp         = real.transp;
                 var.grayscale      = real.grayscale;

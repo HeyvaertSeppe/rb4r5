@@ -36,6 +36,8 @@ from . import canvas, config, fb, font, inputs, keys, util, zones
 CMD_FIFO = "/tmp/rb-overlay.fifo"
 STATE_FILE = "/tmp/rb-overlay.state"
 LEVELS_FILE = "/tmp/rb-levels.dat"      # written by audioshim, 5 x int32
+MODAL_FILE = "/tmp/rb-overlay.modal"    # while this exists the player holds off
+FRAMES_FILE = "/tmp/rb-frames.dat"      # the driver's frame counter
 
 # --- colours, near enough to the RX3's own panel ---------------------------
 BG          = (10, 11, 14)
@@ -380,6 +382,30 @@ class Overlay:
         return meter
 
     # -- state shared with the touch daemon --------------------------------
+    def hold_screen(self, mine: bool) -> None:
+        """Tell the display driver to stop publishing (or start again).
+
+        Without this the player's next frame paints straight over whatever
+        was drawn - a picker that appears and vanishes inside 30ms, which
+        reads as "the button only flashes the layout".
+        """
+        try:
+            if mine:
+                Path(MODAL_FILE).write_text("1")
+                os.chmod(MODAL_FILE, 0o666)
+            elif Path(MODAL_FILE).exists():
+                Path(MODAL_FILE).unlink()
+        except OSError as exc:
+            util.warn(f"overlay: cannot set {MODAL_FILE} ({exc}); the player "
+                      "will draw over the overlay")
+
+    def frame_count(self) -> int:
+        """How many frames the player's driver has published."""
+        try:
+            return int(Path(FRAMES_FILE).read_text().strip() or 0)
+        except (OSError, ValueError):
+            return -1
+
     def write_state(self) -> None:
         """touchd reads this: while a modal is up the UI must not be touched."""
         state = {
@@ -433,6 +459,7 @@ class OverlayDaemon:
         self.fifo = None
         self.dirty = True
         self.splash_started = 0.0
+        self.splash_frames = -1
         self.splash_sample = b""
         self.splash_min = float(cfg.get("overlay.splash_min_seconds", 2.0))
         self.splash_max = float(cfg.get("overlay.splash_max_seconds", 75.0))
@@ -540,6 +567,7 @@ class OverlayDaemon:
 
     def open_picker(self) -> None:
         self.overlay.mode = "picker"
+        self.overlay.hold_screen(True)
         self.overlay.write_state()
         self.overlay.draw_picker()
         for button in self.overlay.buttons:
@@ -549,6 +577,7 @@ class OverlayDaemon:
 
     def close_picker(self) -> None:
         self.overlay.mode = "none"
+        self.overlay.hold_screen(False)
         self.overlay.write_state()
         for button in self.overlay.buttons:
             if button.action == "fx":
@@ -561,7 +590,9 @@ class OverlayDaemon:
     def splash(self, progress: float, message: str = "") -> None:
         if self.overlay.mode != "splash":
             self.splash_started = time.monotonic()
+            self.splash_frames = self.overlay.frame_count()
         self.overlay.mode = "splash"
+        self.overlay.hold_screen(True)
         self.overlay.write_state()
         self.overlay.draw_splash(progress, message)
         # take the fingerprint AFTER drawing: these are the splash's own
@@ -623,7 +654,21 @@ class OverlayDaemon:
                       "taking the splash down anyway")
             self.end_splash()
             return
-        now = self.sample_frame()
+        frames = self.overlay.frame_count()
+        if frames >= 0:
+            # The driver counts the frames it publishes - and the ones it
+            # holds back while this splash is up - so this says "the player
+            # is drawing" without the splash having to get out of the way to
+            # find out.
+            if self.splash_frames < 0:
+                self.splash_frames = frames
+            elif frames - self.splash_frames >= 8:
+                util.info(f"overlay: the player is drawing "
+                          f"({frames - self.splash_frames} frames) after "
+                          f"{waited:.0f}s")
+                self.end_splash()
+            return
+        now = self.sample_frame()          # no driver counter: watch the pixels
         if now and self.splash_sample and now != self.splash_sample:
             util.info(f"overlay: the player drew its first frame after "
                       f"{waited:.0f}s")
@@ -632,6 +677,7 @@ class OverlayDaemon:
     def end_splash(self) -> None:
         if self.overlay.mode == "splash":
             self.overlay.mode = "none"
+            self.overlay.hold_screen(False)
             self.overlay.write_state()
             self.dirty = True
 
@@ -763,7 +809,13 @@ class OverlayDaemon:
 
 
 def run(cfg) -> int:
-    return OverlayDaemon(cfg).run()
+    daemon = OverlayDaemon(cfg)
+    try:
+        return daemon.run()
+    finally:
+        # a flag file left behind would leave the panel frozen on whatever
+        # was last drawn, which is far worse than no overlay at all
+        daemon.overlay.hold_screen(False)
 
 
 def command(text: str) -> bool:

@@ -234,6 +234,10 @@ static void init_real_alsa(void)
 static int32_t g_mix4ch[MAX_FRAMES * 4];    /* RX3 master L/R + cue L/R   */
 static int32_t g_out[MAX_FRAMES * 4];       /* what goes to the hardware  */
 static unsigned long g_write_count = 0;
+/* Set once the device has refused audio for good: from then on the engine is
+ * paced in software rather than left to spin. */
+static int g_pcm_dead = 0;
+static int g_pcm_fails = 0;
 
 /* The chroot bind-mounts the host /tmp, so the launcher outside can read it. */
 #ifndef RB_LEVELS_PATH
@@ -735,16 +739,51 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     snd_pcm_sframes_t written = 0;
-    if (g_real_playback && real_snd_pcm_writei) {
-        written = real_snd_pcm_writei(g_real_playback, g_out, size);
-        if (written < 0) {
-            if (real_snd_pcm_prepare)
-                real_snd_pcm_prepare(g_real_playback);
-            written = real_snd_pcm_writei(g_real_playback, g_out, size);
+    if (g_real_playback && real_snd_pcm_writei && !g_pcm_dead) {
+        snd_pcm_uframes_t done = 0;
+
+        /* Write the whole period.  A short write is normal when the device
+         * buffer is nearly full; treating one as "done" loses those frames
+         * and, worse, returns to the engine early - and the engine's
+         * transport is clocked by this call, so returning early is what makes
+         * the music run fast. */
+        while (done < size) {
+            written = real_snd_pcm_writei(g_real_playback,
+                                          g_out + done * g_real_ch,
+                                          size - done);
+            if (written > 0) {
+                done += (snd_pcm_uframes_t)written;
+                g_pcm_fails = 0;
+                continue;
+            }
+            if (written == -EPIPE || written == -EINTR) {
+                if (real_snd_pcm_prepare)
+                    real_snd_pcm_prepare(g_real_playback);
+                if (++g_pcm_fails < 32)
+                    continue;              /* an underrun: recover and go on */
+            }
+            /* Anything else - or too many underruns in a row - means this
+             * device is not taking audio.  Stop pretending it is. */
+            if (!g_pcm_dead) {
+                g_pcm_dead = 1;
+                alog("audioshim: the output device stopped accepting audio "
+                     "(%s after %lu writes); pacing the engine in software "
+                     "instead, so the deck still runs at the right speed - "
+                     "but there will be no sound until this is fixed\n",
+                     strerror((int)-written), g_write_count);
+            }
+            break;
         }
-    } else {
-        /* No hardware: pace the engine thread so the UI still runs */
-        usleep((useconds_t)(size * 1000000UL / (unsigned long)g_rate));
+    }
+
+    if (!g_real_playback || !real_snd_pcm_writei || g_pcm_dead) {
+        /* No usable hardware: pace the engine thread ourselves.  Without this
+         * snd_pcm_writei returns instantly, the engine's transport is clocked
+         * by it, and the track races through at whatever speed the CPU
+         * manages - which is exactly what "the music plays way too fast"
+         * looks like, with no sound to go with it. */
+        unsigned int rate = g_rate ? g_rate : 44100;
+        usleep((useconds_t)((unsigned long long)size * 1000000ULL / rate));
     }
 
     /* Publish the master level ~20x a second.  The launcher draws the meter

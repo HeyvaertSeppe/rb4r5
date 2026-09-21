@@ -9,6 +9,27 @@ PI# python3 launch.py doctor
 It checks every subsystem and prints the fix for anything it finds. What follows
 is organised by what you are seeing.
 
+## Black screen, and you want your Pi back
+
+```sh
+# on the Pi: Ctrl+Alt+F2 gives a login prompt, or SSH in from another machine
+sudo python3 launch.py recover      # desktop + login prompt back
+sudo reboot
+```
+
+`recover` stops the player, releases the framebuffer, restores
+`graphical.target` and the tty1 login, and leaves everything under
+`/opt/rb4r5` alone, so the runtime you built is still there
+(`launch.py run` starts it again). `--disable-service` also stops it starting
+at boot; `--all` additionally reverts the boot-config changes.
+
+A black screen right after `setup` + reboot, with the player not yet built, was
+a bug in `setup` itself (it disabled the tty1 login and switched the boot
+target before there was anything to display). Since that fix `setup` leaves the
+desktop alone: the player's supervisor *stops* the tty1 login while it runs and
+starts it again afterwards, so the console always comes back when the player is
+not running. `setup --console` opts into the permanent console-only boot.
+
 ## Nothing on the screen
 
 First: `sudo python3 launch.py verify` samples the framebuffer and saves a

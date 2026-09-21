@@ -13,12 +13,13 @@ sudo python3 launch.py            # do whatever is missing, then run
 | Command | What it does |
 |---|---|
 | *(none)* / `auto` | Provision if this is a first run, build if the runtime is incomplete, then run and supervise. |
-| `setup` | Provision only: packages, `config.txt`/`cmdline.txt`, console handover, sysctl, udev, the boot service, default config files. `--no-service` skips enabling the service; `--undo` reverts everything; `-y` does not ask. |
+| `setup` | Provision only: packages, `config.txt`/`cmdline.txt`, quieting, sysctl, udev, the boot service, default config files. It deliberately leaves the desktop and the tty1 login in place; `--console` makes the console-only boot permanent. `--no-service` skips enabling the service; `--undo` reverts everything; `-y` does not ask. |
 | `firmware` | Get the XDJ-RX3 firmware and turn it into a ready payload: download it from AlphaTheta (or use a local copy), decrypt, unpack the ISO, the fonts and the rootfs. `--upd FILE` uses your own file or zip, `--key FILE` names the key, `--offline` never touches the network, `--ask` shows a file picker, `--show` just reports, `--force` redoes it. |
 | `payload` | Assemble `<chroot>` from the unpacked firmware (runs `firmware` first if needed). `--force` overwrites. |
 | `build` | Host daemons, LD_PRELOAD shims, the patched player, DirectFB, then install into the chroot. `--no-directfb`, `--no-player`, `--fast-directfb`. |
 | `run` | Prepare the screen and the chroot, start everything, supervise it. `--detach` starts and returns. |
 | `stop` | Stop the player and its daemons, release the bind mounts. `--restore-console` gives the text console back. |
+| `recover` | Black screen? Give the desktop and the tty1 login back, stop the player, release the framebuffer. `--disable-service` also stops it starting at boot, `--all` reverts the boot-config edits. Nothing under `/opt/rb4r5` is touched. |
 | `status` | What is running, plus whether the framebuffer has content. |
 | `doctor` | Check every subsystem and print what is wrong and how to fix it. `-v` adds the zone list. Exit 1 if anything is broken. |
 | `verify` | Prove it works on this machine: screenshot the player, check it fills the screen, check audio is running through the FLX4, then walk **every** FLX4 control and report which ones reached the engine. `--quick` does seven instead of 33, `--timeout` sets the wait per control, `--no-controller` / `--no-touch` skip a section. |

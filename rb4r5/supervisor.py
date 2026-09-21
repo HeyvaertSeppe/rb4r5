@@ -128,8 +128,27 @@ class Supervisor:
             util.warn(problem)
         chroot.require_ready(self.cfg)
 
+    def hold_console(self, release: bool = False) -> None:
+        """Stop the tty1 login prompt while the player owns the screen.
+
+        Stopped, not disabled: if the player is not running - including after
+        a reboot with a half-built runtime - the console comes back by itself.
+        """
+        if not util.have("systemctl"):
+            return
+        if release:
+            util.run(["systemctl", "start", "getty@tty1.service"], check=False)
+            return
+        proc = util.run(["systemctl", "is-active", "getty@tty1.service"],
+                        check=False)
+        if "active" in (proc.stdout or ""):
+            util.run(["systemctl", "stop", "getty@tty1.service"], check=False)
+            util.info("stopped the tty1 login prompt for the player's sake "
+                      "(it returns when the player stops)")
+
     def prepare_system(self) -> None:
         util.step("preparing the screen and the runtime")
+        self.hold_console()
         for note in display.quiet_console(int(self.cfg.get("display.quiet_console", 2))):
             util.info(note)
         for note in chroot.make_stubs(self.cfg):
@@ -254,6 +273,7 @@ class Supervisor:
         self.stop_all()
         for note in chroot.umount_binds(self.cfg):
             util.info(note)
+        self.hold_console(release=True)
         if restore_console:
             for note in display.restore_console():
                 util.info(note)

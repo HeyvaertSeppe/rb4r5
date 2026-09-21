@@ -45,8 +45,13 @@ def cmd_setup(args, cfg) -> int:
             if reply not in ("y", "yes"):
                 return 1
     _print_notes(provision.all_steps(cfg, REPO,
-                                     enable_service=not args.no_service))
+                                     enable_service=not args.no_service,
+                                     take_over=args.console))
     util.ok("setup done")
+    print()
+    print("If the screen ever goes black and you want the desktop back:")
+    print("    press Ctrl+Alt+F2 for a login prompt, or SSH in, then")
+    print("    sudo python3 launch.py recover")
     print()
     print("Next steps:")
     print(f"  1. put your extracted XDJ-RX3 firmware in {cfg.payload}")
@@ -158,6 +163,36 @@ def cmd_stop(args, cfg) -> int:
     if args.restore_console:
         _print_notes(display.restore_console())
     util.ok("stopped")
+    return 0
+
+
+def cmd_recover(args, cfg) -> int:
+    """Give the machine back: desktop, login prompt, console.
+
+    For the moment when the screen is black and you just want a working Pi.
+    """
+    util.require_root("recover")
+    util.step("handing the screen back to the desktop")
+    sup = supervisor.Supervisor(cfg, REPO)
+    if util.have("systemctl"):
+        util.run(["systemctl", "stop", "rb4r5.service"], check=False)
+        if args.disable_service:
+            util.run(["systemctl", "disable", "rb4r5.service"], check=False)
+            util.info("rb4r5.service disabled - it will not start at boot")
+    sup.stop_stale()
+    _print_notes(chroot.umount_binds(cfg))
+    _print_notes(display.restore_console())
+    _print_notes(provision.console_mode(undo=True))
+    if args.all:
+        _print_notes(provision.all_steps(cfg, REPO, undo=True))
+        util.info("the boot config changes were reverted too")
+    util.ok("done - reboot to land in the desktop")
+    print()
+    print("  sudo reboot")
+    print()
+    print("Nothing under /opt/rb4r5 was touched, so the runtime you built is")
+    print("still there.  Start the player again with:")
+    print("    sudo python3 launch.py run")
     return 0
 
 
@@ -360,6 +395,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="do not enable the boot service")
     setup.add_argument("--undo", action="store_true",
                        help="revert every system change rb4r5 made")
+    setup.add_argument("--console", action="store_true",
+                       help="also make the boot target console-only now "
+                            "(by default the desktop is left alone until the "
+                            "player actually runs)")
     setup.add_argument("-y", "--yes", action="store_true",
                        help="do not ask for confirmation")
     setup.set_defaults(func=cmd_setup)
@@ -405,6 +444,14 @@ def build_parser() -> argparse.ArgumentParser:
     stop.set_defaults(func=cmd_stop)
 
     sub.add_parser("status", help="what is running").set_defaults(func=cmd_status)
+
+    rec = sub.add_parser("recover", help="black screen? give the desktop and "
+                                         "the login prompt back")
+    rec.add_argument("--disable-service", action="store_true",
+                     help="also stop rb4r5 starting at boot")
+    rec.add_argument("--all", action="store_true",
+                     help="also revert the boot-config changes")
+    rec.set_defaults(func=cmd_recover)
 
     doc = sub.add_parser("doctor", help="check every subsystem and say what is "
                                         "wrong")

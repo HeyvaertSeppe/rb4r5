@@ -37,13 +37,18 @@ This is idempotent and every change it makes is reversible
 * makes sure the KMS driver is enabled in `config.txt`, so `/dev/fb0` exists,
 * quiets the console: `loglevel=3`, `consoleblank=0`, `logo.nologo`,
   `kernel.printk`, systemd's `[ OK ]` lines,
-* **switches the boot target to `multi-user.target` and disables `getty@tty1`**
-  — a compositor or a login prompt would own (or paint over) the framebuffer,
+* leaves the desktop and the tty1 login **alone** — the player's supervisor
+  stops the login prompt while it runs and starts it again afterwards, so you
+  never end up with a machine you cannot get into. `setup --console` makes the
+  console-only boot permanent once you are happy it all works,
 * installs the udev rules and the `rb4r5.service` boot service,
 * writes `/etc/rb4r5/config.json`, `/etc/rb4r5/touch-zones.json` and
   `/etc/rb4r5/flx4-map.conf` if they are not there yet.
 
 Reboot if it says a desktop is still running.
+
+If a screen ever goes black and you just want the Pi back: `Ctrl+Alt+F2` for a
+login prompt (or SSH in), then `sudo python3 launch.py recover`.
 
 ## 4. The firmware
 

@@ -131,6 +131,53 @@ with tempfile.TemporaryDirectory() as tmp:
           chroot.elf_note(shim), "not an ELF file at all")
 
 
+    # --- the environment must be set inside the chroot, not around it -----
+    #
+    # `chroot` is a HOST binary.  LD_PRELOAD in its environment is read by the
+    # HOST's loader, before chroot() happens, so it chases in-chroot paths on
+    # the host, fails, and logs a preload error for every shim - which reads
+    # exactly like the shims having failed, while they load fine a moment
+    # later.  That cost a long detour once; it gets a test.
+    envroot = tmp / "envroot"
+    (envroot / "usr/bin").mkdir(parents=True)
+    (envroot / "usr/bin/env").write_bytes(b"\x7fELF")
+
+    cmd, around = chroot.chroot_cmd(
+        envroot, ["/lib/ld-linux.so.3", "/root/pdj/rbp"],
+        {"LD_PRELOAD": "/usr/lib/memshim.so", "HOME": "/root"})
+    check("nothing is left to set around the host process", around, {})
+    check("the env runs inside the chroot", cmd[:3],
+          ["chroot", str(envroot), "/usr/bin/env"])
+    check("every variable is passed as an argument, after the chroot",
+          cmd[3:5], ["LD_PRELOAD=/usr/lib/memshim.so", "HOME=/root"])
+    check("the program still comes last",
+          cmd[-2:], ["/lib/ld-linux.so.3", "/root/pdj/rbp"])
+    check("LD_PRELOAD is never left where the host loader reads it",
+          any(part.startswith("LD_PRELOAD=") for part in cmd[:2]), False)
+
+    check("no env means no env binary in the way",
+          chroot.chroot_cmd(envroot, ["/bin/sh"]),
+          (["chroot", str(envroot), "/bin/sh"], {}))
+
+    # a runtime without /usr/bin/env still has to start
+    bare = tmp / "bare"
+    bare.mkdir()
+    fallback, around = chroot.chroot_cmd(bare, ["/bin/sh"], {"HOME": "/root"})
+    check("without /usr/bin/env it falls back rather than failing",
+          fallback, ["chroot", str(bare), "/bin/sh"])
+    check("and hands the environment back so it is not silently dropped",
+          around, {"HOME": "/root"})
+
+    # and the supervisor must actually use it
+    sup = (REPO / "rb4r5/supervisor.py").read_text()
+    check("the supervisor builds the player command with it",
+          "chroot.chroot_cmd(" in sup and "rbp_argv" in sup, True)
+    check("and gives the host process only what could not go inside",
+          "env=rbp_around" in sup, True)
+    check("and no longer hands it the player environment directly",
+          "env=player_env" in sup, False)
+
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

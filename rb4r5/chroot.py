@@ -117,6 +117,45 @@ def _walk(root: Path, path: str) -> tuple[Path, list[str]]:
     return here, hops
 
 
+def chroot_cmd(root, argv: list[str],
+               env: dict | None = None) -> tuple[list[str], dict]:
+    """Run argv inside the chroot, with env applied INSIDE it, not around it.
+
+    `chroot` is a host binary.  Anything put in its environment is read by the
+    HOST's dynamic loader first, before chroot() has happened - so a
+    LD_PRELOAD naming /usr/lib/memshim.so makes the host loader look for that
+    path on the host, where it is a 32-bit ARM object that is not there at
+    all.  It then prints
+
+        ERROR: ld.so: object '/usr/lib/memshim.so' from LD_PRELOAD cannot be
+        preloaded (cannot open shared object file): ignored.
+
+    and carries on.  chroot() then happens, the RX3's own loader runs, and it
+    preloads the shim perfectly well - but that error is already in the log,
+    where it reads exactly like the shims having failed, for every shim, every
+    single start.
+
+    So the variables go after the chroot, as arguments to the runtime's own
+    `env`, and the host process never sees them.
+
+    Returns the command and whatever environment still has to be set AROUND
+    it - empty when the variables went inside, which is the normal case.
+    """
+    cmd = ["chroot", str(root)]
+    if not env:
+        return cmd + argv, {}
+    if not inside(root, "usr/bin/env").exists():
+        util.warn("the runtime has no /usr/bin/env, so the player's "
+                  "environment has to be set around chroot instead of inside "
+                  "it.  ld.so will report a failed preload for each shim; "
+                  "those come from the host loader and are not real - "
+                  "`launch.py shimtest` will show the shims loading.")
+        return cmd + argv, dict(env)
+    cmd.append("/usr/bin/env")
+    cmd += [f"{key}={value}" for key, value in env.items()]
+    return cmd + argv, {}
+
+
 def status(cfg) -> dict:
     """What is present, what is missing, what is mounted."""
     root = cfg.chroot
@@ -631,8 +670,13 @@ def shim_probe(cfg) -> list[str]:
         return lines
 
     def ask(preload):
-        proc = util.run(["chroot", str(root), loader, target[0]] + target[1],
-                        check=False, timeout=15, env={"LD_PRELOAD": preload})
+        # LD_PRELOAD must be set INSIDE the chroot.  Setting it around the
+        # host `chroot` binary makes the HOST loader try to preload an
+        # in-chroot path first, and fail, and say so - which is the very
+        # message this is here to explain.
+        argv, around = chroot_cmd(root, [loader, target[0]] + target[1],
+                                  {"LD_PRELOAD": preload})
+        proc = util.run(argv, check=False, timeout=15, env=around or None)
         blob = (proc.stdout or "")
         refused = [ln for ln in blob.splitlines() if "cannot be preloaded" in ln]
         if refused:
@@ -677,10 +721,10 @@ def shim_probe(cfg) -> list[str]:
                  "   <- by name, no path")
 
     # ld.so's own account of what it looked for.
-    proc = util.run(["chroot", str(root), loader, target[0]] + target[1],
-                    check=False, timeout=15,
-                    env={"LD_PRELOAD": "/usr/lib/memshim.so",
-                         "LD_DEBUG": "libs,files"})
+    argv, around = chroot_cmd(root, [loader, target[0]] + target[1],
+                              {"LD_PRELOAD": "/usr/lib/memshim.so",
+                               "LD_DEBUG": "libs,files"})
+    proc = util.run(argv, check=False, timeout=15, env=around or None)
     blob = (proc.stdout or "")
     wanted = [ln.strip() for ln in blob.splitlines()
               if "memshim" in ln or "preload" in ln]

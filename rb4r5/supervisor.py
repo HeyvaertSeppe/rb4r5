@@ -214,19 +214,24 @@ class Supervisor:
         for stale in ("/tmp/guard_LocalDBServer", "/tmp/req_LocalDBServer"):
             Path(stale).unlink(missing_ok=True)
         if (cfg.chroot / "usr/bin/edb_streamd").exists():
+            streamd, _ = chroot.chroot_cmd(
+                root, ["/lib/ld-linux.so.3", "/usr/bin/edb_streamd"])
             self.children.append(Child(
-                "edb_streamd",
-                ["chroot", root, "/lib/ld-linux.so.3", "/usr/bin/edb_streamd"],
+                "edb_streamd", streamd,
                 logs / "edb_streamd.log", env={}, restart=True, delay=5.0))
         else:
             util.warn("edb_streamd is not in the runtime: a rekordbox database "
                       "cannot be imported (folder browsing still works)")
 
         args = [str(a) for a in (cfg.get("player.args") or ["-a"])]
+        # player_env goes INSIDE the chroot: handing it to the host `chroot`
+        # process makes the host loader chase the shims on the host, where
+        # they are not, and log a preload failure for every one of them.
+        rbp_argv, rbp_around = chroot.chroot_cmd(
+            root, ["/lib/ld-linux.so.3", "/root/pdj/rbp"] + args, player_env)
         self.children.append(Child(
-            "rbp",
-            ["chroot", root, "/lib/ld-linux.so.3", "/root/pdj/rbp"] + args,
-            logs / "rbp.log", env=player_env, essential=True,
+            "rbp", rbp_argv,
+            logs / "rbp.log", env=rbp_around, essential=True,
             restart=bool(cfg.get("player.restart", True)),
             delay=float(cfg.get("player.restart_delay", 5.0)),
             nproc_limit=int(cfg.get("player.ulimit_procs", 1024) or 0) or None))
@@ -532,10 +537,19 @@ class Supervisor:
 
         tail = self.log_tail(child, lines=14)
         if any("cannot be preloaded" in line for line in tail):
-            util.error("ld.so could not preload the shims (the lines below "
-                       "say which).  The player is running without them, "
-                       "which is why it died - it is not a fault in the "
-                       "player.  Rebuild: sudo python3 launch.py build")
+            # This used to be reported as the cause of death, and it sent a
+            # whole day's debugging after a file that was loading correctly.
+            # The message can come from the HOST loader reading the player's
+            # LD_PRELOAD off the `chroot` process before chroot() happens, in
+            # which case the shims still load fine a moment later.  The
+            # environment is set inside the chroot now, so it should not
+            # appear at all - but if it does, say what to check rather than
+            # asserting a cause.
+            util.warn("ld.so mentions a preload it could not open.  Check "
+                      "whether the shims actually loaded:\n"
+                      "    sudo python3 launch.py shimtest\n"
+                      "If shimtest says they are accepted, this line is the "
+                      "host loader talking and is not why the player died.")
         if tail:
             util.warn(f"the last of {child.log}:")
             for line in tail:

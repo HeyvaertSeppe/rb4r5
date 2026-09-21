@@ -116,8 +116,42 @@ rbp: mask_inline.h:282: snd_mask_value: Assertion `!snd_mask_empty(mask)' failed
 ```
 
 That is alsa-lib aborting because the engine asked a real sound card for
-parameters only the RX3's own hardware has. It could only ask because
-`audioshim.so` was not there to answer for it.
+parameters only the RX3's own hardware has.
+
+### First: make sure the message means what it says
+
+It usually does not. `chroot` is a **host** binary, so anything in its
+environment is read by the **host's** dynamic loader, before `chroot()` has
+happened. Hand it `LD_PRELOAD=/usr/lib/memshim.so` and the aarch64 host loader
+goes looking for that path on the host, where there is no such file — and says
+so, once per shim, every single start:
+
+```
+ERROR: ld.so: object '/usr/lib/memshim.so' from LD_PRELOAD cannot be
+preloaded (cannot open shared object file): ignored.
+```
+
+Then `chroot()` happens, the RX3's own loader runs, and it preloads every shim
+perfectly well. The errors are already in the log, and they read exactly like
+total failure. `LD_DEBUG=libs` is what tells the two apart:
+
+```
+file=/usr/lib/memshim.so [0];  needed by chroot [0]      <- the host, failing
+ERROR: ld.so: object '/usr/lib/memshim.so' ... cannot be preloaded
+file=/usr/lib/memshim.so [0];  needed by /usr/bin/env [0] <- inside the chroot
+file=/usr/lib/memshim.so [0];  generating link map
+calling init: /usr/lib/memshim.so                         <- loaded, and ran
+```
+
+`chroot.chroot_cmd()` therefore puts the player's environment *after* the
+chroot, as arguments to the runtime's own `/usr/bin/env`, so the host process
+never sees it. If your runtime has no `/usr/bin/env` the variables have to go
+around `chroot` instead, the spurious errors come back, and the launcher says
+so when it warns.
+
+Before believing this message, run `sudo python3 launch.py shimtest`: it asks
+the chroot's loader directly, and prints ld.so's own account of what it
+opened.
 
 Three things now stand between that and you:
 
@@ -129,7 +163,8 @@ Three things now stand between that and you:
   needs — with `NO` against any that could not load.
 * **`launch.py run` refuses to start** when one cannot be preloaded, rather
   than crash-looping; and if it sees `cannot be preloaded` in the log of a
-  child that died, it says that is the cause.
+  child that died, it points at `shimtest` rather than asserting a cause —
+  because the host loader can produce that line while the shims load fine.
 
 ```
   shim  ok memshim.so     18104 bytes, needs libc.so.6, libdl.so.2

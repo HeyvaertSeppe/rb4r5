@@ -43,7 +43,7 @@ listed as such:
 | Firmware decryption (`.UPD` → ISO) | ✅ byte-for-byte against an independent AES implementation |
 | Firmware unpacking (cramfs rootfs, gui, key discovery) | ✅ end-to-end on a synthetic firmware image |
 | Firmware download from AlphaTheta | ⚠️ the URL is upstream's own and the code is tested with the download stubbed — this session's network policy blocked the host, so the real fetch is unrun |
-| FLX4 MIDI → engine translation | ✅ end-to-end tested with synthetic MIDI (`tools/flx4-selftest.sh`) |
+| FLX4 MIDI → engine translation | ✅ all 33 controls driven through the real bridge binary and checked against what the engine would receive (`tools/tests/test_control_chain.py`) |
 | Touch gestures → engine controls | ✅ 18 offline checks over synthetic evdev frames |
 | Boot-config edits (`config.txt`, `cmdline.txt`) | ✅ idempotent + reversible, tested on fixtures |
 | ALSA discovery and device choice | ✅ tested against captured `/proc/asound` data |
@@ -110,10 +110,35 @@ The individual steps exist too, if you would rather watch them one at a time:
 
 ```sh
 sudo python3 launch.py setup       # packages, KMS, console handover, service
-sudo python3 launch.py firmware    # pick the .UPD; decrypt and unpack it
+sudo python3 launch.py firmware    # fetch and unpack the firmware
 sudo python3 launch.py build       # shims, DirectFB, daemons, patched player
 sudo python3 launch.py run         # run and supervise it
 sudo python3 launch.py doctor      # check every subsystem
+sudo python3 launch.py verify      # screenshot it, and walk every FLX4 control
+```
+
+## Seeing it work
+
+The screen belongs to the player, so there is nothing to look at over SSH — the
+launcher therefore takes its own screenshots:
+
+* one is saved automatically 25 s after every start, in
+  `/var/log/rb4r5/screenshots/`;
+* `sudo python3 launch.py fbdump shot.png` grabs one on demand;
+* `sudo python3 launch.py verify` saves one, checks the frame really covers the
+  whole panel (a letterboxed or top-left-corner frame is the classic symptom of
+  a broken scale path), confirms audio is running through the FLX4, and then
+  asks you to move each of the **33 FLX4 controls** in turn, reporting which
+  ones the engine actually received:
+
+```
+  -> press PLAY/PAUSE on the left deck ... seen
+  -> turn the browse knob ... seen
+  -> move a channel fader ... seen
+  ...
+  31 passed, 0 failed, 2 warnings, 0 skipped
+  report:      /var/log/rb4r5/verify-report.txt
+  screenshots: /var/log/rb4r5/screenshots
 ```
 
 ## Layout

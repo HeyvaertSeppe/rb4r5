@@ -24,6 +24,7 @@ only asks if it cannot find one.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -52,6 +53,16 @@ OFFICIAL = {
     "upd_size": 69_171_216,          # documented by the upstream tutorial
     "rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6",   # the stock v1.20 player
 }
+
+# Tried in order until one produces a usable file.  A mirror is somewhere the
+# operator of this installation already keeps a copy - nothing is served from
+# this repository, which holds no vendor firmware at all (see NOTICE.md).
+# "gdrive:<file id>" is handled specially: Google Drive serves large files
+# behind a confirmation page rather than at a plain URL.
+MIRRORS = [
+    OFFICIAL["url"],
+    "gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul",
+]
 
 # Where to look for a .UPD or a key, in order of likelihood.
 SCAN_ROOTS = [
@@ -208,10 +219,87 @@ def choose_file(title: str, candidates: list[dict], what: str = "file",
 # --------------------------------------------------------------------------
 # getting the firmware itself
 # --------------------------------------------------------------------------
+GDRIVE_PREFIX = "gdrive:"
+
+
+def _looks_like_html(path: Path) -> bool:
+    """Drive and friends serve an error/consent page with a 200 status."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(512).lstrip().lower()
+    except OSError:
+        return False
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def download_from_gdrive(file_id: str, dest: Path) -> bool:
+    """Fetch a large file from Google Drive, past its confirmation page.
+
+    Drive does not serve anything over ~100 MB at a plain URL: the first
+    request returns an HTML interstitial carrying a confirm token, and the file
+    comes from a second request that quotes it.  Both shapes of that dance (the
+    old cookie one and the current drive.usercontent one) are tried.
+    """
+    if not util.have("curl"):
+        util.warn("Google Drive downloads need curl")
+        return False
+    util.ensure_dir(dest.parent)
+    partial = dest.with_suffix(dest.suffix + ".part")
+    cookies = dest.with_suffix(".cookies")
+
+    attempts = [
+        ["curl", "-sSL", "--fail", "-o", str(partial),
+         f"https://drive.usercontent.google.com/download"
+         f"?id={file_id}&export=download&confirm=t"],
+        ["curl", "-sSL", "-c", str(cookies), "-b", str(cookies),
+         "-o", str(partial),
+         f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"],
+    ]
+    try:
+        for cmd in attempts:
+            if sys.stderr.isatty():
+                cmd = [cmd[0], "--progress-bar"] + cmd[1:]
+            proc = util.run(cmd, check=False, capture=False, timeout=3600)
+            if proc.returncode == 0 and partial.exists() and \
+                    partial.stat().st_size > (1 << 20) and \
+                    not _looks_like_html(partial):
+                partial.replace(dest)
+                return True
+
+            # the interstitial: pull the confirm token out of it and retry
+            if partial.exists() and _looks_like_html(partial):
+                page = partial.read_text(errors="replace")
+                token = re.search(r'name="confirm"\s+value="([^"]+)"', page) or \
+                    re.search(r"confirm=([0-9A-Za-z_-]+)", page)
+                uuid = re.search(r'name="uuid"\s+value="([^"]+)"', page)
+                if token:
+                    url = (f"https://drive.usercontent.google.com/download"
+                           f"?id={file_id}&export=download"
+                           f"&confirm={token.group(1)}")
+                    if uuid:
+                        url += f"&uuid={uuid.group(1)}"
+                    proc = util.run(["curl", "-sSL", "--fail", "-o", str(partial),
+                                     url], check=False, capture=False,
+                                    timeout=3600)
+                    if proc.returncode == 0 and partial.exists() and \
+                            not _looks_like_html(partial):
+                        partial.replace(dest)
+                        return True
+        return False
+    finally:
+        partial.unlink(missing_ok=True)
+        cookies.unlink(missing_ok=True)
+
+
 def download_file(url: str, dest: Path, expect_size: int = 0) -> Path:
     """Fetch a URL to a file, resuming and showing progress where possible."""
     util.ensure_dir(dest.parent)
     partial = dest.with_suffix(dest.suffix + ".part")
+
+    if url.startswith(GDRIVE_PREFIX):
+        if not download_from_gdrive(url[len(GDRIVE_PREFIX):], dest):
+            raise util.Fail(f"could not download {url}")
+        return dest
 
     if util.have("curl"):
         cmd = ["curl", "-L", "--fail", "--retry", "3", "--retry-delay", "2",
@@ -288,34 +376,91 @@ def upd_from_zip(archive: Path, dest_dir: Path) -> Path:
     return target
 
 
+def mirrors(cfg) -> list[str]:
+    configured = cfg.get("firmware.url")
+    extra = cfg.get("firmware.mirrors") or []
+    ordered = ([configured] if configured else []) + list(extra)
+    for url in MIRRORS:
+        if url not in ordered:
+            ordered.append(url)
+    return ordered
+
+
 def fetch_official(cfg, force: bool = False) -> Path:
-    """Download (once) the firmware this port is built around."""
+    """Download (once) the firmware this port is built around.
+
+    Each source in turn until one yields a file that is actually firmware; a
+    download that comes back as an HTML page or the wrong size is discarded
+    rather than fed into the decryptor.
+    """
     cache = util.ensure_dir(Path(cfg.get("paths.payload")) / "firmware")
-    url = cfg.get("firmware.url") or OFFICIAL["url"]
     zip_path = cache / (cfg.get("firmware.zip_name") or OFFICIAL["zip_name"])
+    version = cfg.get("firmware.version") or OFFICIAL["version"]
 
     existing = sorted(cache.glob("*.UPD")) + sorted(cache.glob("*.upd"))
     if existing and not force:
         util.info(f"using the firmware already downloaded: {existing[0]}")
         return existing[0]
 
-    if not zip_path.exists() or force:
-        util.step(f"downloading the XDJ-RX3 v{cfg.get('firmware.version') or OFFICIAL['version']} "
-                  f"firmware (~66 MB) from AlphaTheta")
-        util.info(url)
-        download_file(url, zip_path)
-        util.ok(f"downloaded {zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB)")
-    else:
+    if zip_path.exists() and not force:
         util.info(f"using the archive already downloaded: {zip_path}")
+    else:
+        sources = mirrors(cfg)
+        util.step(f"downloading the XDJ-RX3 v{version} firmware (~66 MB)")
+        last_error = None
+        for index, url in enumerate(sources, 1):
+            label = ("Google Drive mirror" if url.startswith(GDRIVE_PREFIX)
+                     else url)
+            util.info(f"[{index}/{len(sources)}] {label}")
+            try:
+                download_file(url, zip_path)
+            except util.Fail as exc:
+                last_error = exc
+                util.warn(f"  that source did not work: "
+                          f"{str(exc).splitlines()[0]}")
+                continue
+            if _looks_like_html(zip_path):
+                zip_path.unlink(missing_ok=True)
+                util.warn("  that source returned a web page, not a file")
+                continue
+            util.ok(f"downloaded {zip_path} "
+                    f"({zip_path.stat().st_size / 1e6:.1f} MB)")
+            break
+        else:
+            raise util.Fail(
+                "none of the firmware sources worked"
+                + (f" (last error: {last_error})" if last_error else "") +
+                f"\nFetch this on another machine and drop it in "
+                f"{cfg.payload}:\n    {OFFICIAL['url']}")
 
-    upd = upd_from_zip(zip_path, cache)
+    # the download may be the zip or the .UPD itself, depending on the mirror
+    if zipfile_is_zip(zip_path):
+        upd = upd_from_zip(zip_path, cache)
+    else:
+        upd = cache / "XDJ-RX3.UPD"
+        if zip_path != upd:
+            shutil.move(str(zip_path), str(upd))
+
     expect = int(cfg.get("firmware.expect_upd_size") or OFFICIAL["upd_size"])
     size = upd.stat().st_size
+    ok, note = looks_like_upd(upd)
+    if not ok:
+        raise util.Fail(f"what came down is not firmware: {note}\n"
+                        f"Delete {cache} and try again, or supply the file "
+                        f"yourself with --upd.")
     if expect and size != expect:
-        util.warn(f"{upd.name} is {size} bytes; v1.20 is {expect}.  "
+        util.warn(f"{upd.name} is {size} bytes; v{version} is {expect}.  "
                   "A different firmware version may not patch.")
     util.ok(f"firmware: {upd} ({size / 1e6:.1f} MB)")
     return upd
+
+
+def zipfile_is_zip(path: Path) -> bool:
+    import zipfile
+    try:
+        return zipfile.is_zipfile(path)
+    except OSError:
+        return False
 
 
 def locate_upd(cfg, explicit=None, ask: bool = False,

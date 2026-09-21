@@ -21,6 +21,7 @@ sudo python3 launch.py            # do whatever is missing, then run
 | `stop` | Stop the player and its daemons, release the bind mounts. `--restore-console` gives the text console back. |
 | `status` | What is running, plus whether the framebuffer has content. |
 | `doctor` | Check every subsystem and print what is wrong and how to fix it. `-v` adds the zone list. Exit 1 if anything is broken. |
+| `verify` | Prove it works on this machine: screenshot the player, check it fills the screen, check audio is running through the FLX4, then walk **every** FLX4 control and report which ones reached the engine. `--quick` does seven instead of 33, `--timeout` sets the wait per control, `--no-controller` / `--no-touch` skip a section. |
 | `probe` | Read the player's live USB/database state out of its memory. Exit 0 when USB1 is ready. |
 | `keys` | Inject a key: `keys play 1`, `keys 0x4101 2`, `keys selector 1 --op rotate --value -1`, `keys --list`. |
 | `calibrate` | Show which zone each touch hits (does not drive the engine). |
@@ -116,6 +117,8 @@ and `flx4-map.conf` (extra controller bindings).
 | `/var/log/rb4r5/usbwatch.log` | mounts, announcements, the confirm loop |
 | `/var/log/rb4r5/edb_streamd.log` | DeviceSQL |
 | `/var/log/rb4r5/supervisor.log` | the launcher itself, when run as a service |
+| `/var/log/rb4r5/screenshots/` | PNGs of the player: one captured 25 s after every start, plus whatever `verify` and `fbdump` save |
+| `/var/log/rb4r5/verify-report.txt` | the last verification run |
 | `/tmp/audioshim.log` | ALSA negotiation and periodic peak levels — the first place to look for audio |
 | `/tmp/keyshim.log` | every key/control the engine actually received |
 | `/tmp/flipdbg.log` | the display driver's publish log (with `RB_DFB_DEBUG=1`) |
@@ -129,6 +132,8 @@ the chroot and the host.
 $ tools/tests/run-all.sh                       # everything below, in one go
 $ python3 tools/tests/test_firmware_decrypt.py # .UPD decryption vs openssl
 $ python3 tools/tests/test_firmware_fetch.py   # where the firmware comes from
+$ python3 tools/tests/test_control_chain.py   # all 33 FLX4 controls, end to end
+$ python3 tools/tests/test_verify.py          # the full-screen probe, log watching
 $ python3 tools/tests/test_firmware_pipeline.py# .UPD -> complete payload
 $ python3 tools/tests/test_cramfs.py           # the cramfs reader
 $ python3 tools/tests/test_audio_parse.py      # ALSA parsing and device choice

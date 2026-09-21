@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import (__version__, audio, build, chroot, config, display, doctor,
                firmware, keys, platform5, probe, provision, supervisor, touchd,
-               usbwatch, util, zones)
+               usbwatch, util, verify, zones)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -168,6 +168,12 @@ def cmd_status(args, cfg) -> int:
 
 def cmd_doctor(args, cfg) -> int:
     return doctor.run(cfg, verbose=args.verbose)
+
+
+def cmd_verify(args, cfg) -> int:
+    return verify.run(cfg, quick=args.quick, timeout=args.timeout,
+                      skip_controller=args.no_controller,
+                      skip_touch=args.no_touch)
 
 
 def cmd_touchd(args, cfg) -> int:
@@ -382,6 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
     doc = sub.add_parser("doctor", help="check every subsystem and say what is "
                                         "wrong")
     doc.set_defaults(func=cmd_doctor)
+
+    ver = sub.add_parser("verify", help="prove it works: screenshot, audio, "
+                                        "and every FLX4 control one by one")
+    ver.add_argument("--quick", action="store_true",
+                     help="a handful of controls instead of all 33")
+    ver.add_argument("--timeout", type=float, default=20.0,
+                     help="seconds to wait for each control (default 20)")
+    ver.add_argument("--no-controller", action="store_true")
+    ver.add_argument("--no-touch", action="store_true")
+    ver.set_defaults(func=cmd_verify)
 
     touch = sub.add_parser("touchd", help="the touchscreen daemon (run by the "
                                           "supervisor)")

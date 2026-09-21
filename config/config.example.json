@@ -16,6 +16,7 @@
     "hdmi_port": 0,
     "rotate": "off",
     "quiet_console": 2,
+    "screenshot_on_start": true,
     "blank_timeout": 0
   },
   "audio": {
@@ -80,6 +81,9 @@
   "firmware": {
     "auto_download": true,
     "url": "https://downloads.support.alphatheta.com/firmwares/all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
+    "mirrors": [
+      "gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul"
+    ],
     "zip_name": "XDJ-RX3_v120.zip",
     "version": "1.20",
     "expect_upd_size": 69171216,

@@ -21,6 +21,7 @@ import resource
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -275,6 +276,7 @@ class Supervisor:
         util.step("starting the player")
         self.start_all()
         util.ok("rb4r5 is running - the rekordbox UI should be on the screen")
+        self.capture_screenshot()
         util.info("logs: " + str(self.cfg.logs) + "  (rbp.log, flx4-bridge.log, "
                   "touchd.log, usbwatch.log)")
 
@@ -305,6 +307,30 @@ class Supervisor:
         finally:
             self.shutdown()
         return 0
+
+    def capture_screenshot(self, delay: float = 25.0) -> None:
+        """Save what the player put on screen, a few seconds in.
+
+        There is no other way to see the UI over SSH, and it is the first thing
+        anyone asks for when something looks wrong.  Best effort: a failure
+        here must never affect the player.
+        """
+        if not self.cfg.get("display.screenshot_on_start", True):
+            return
+
+        def shoot():
+            time.sleep(delay)
+            try:
+                shots = util.ensure_dir(self.cfg.logs / "screenshots")
+                path = shots / f"startup-{time.strftime('%Y%m%d-%H%M%S')}.png"
+                util.info(display.fb_dump(str(path),
+                                          self.cfg.get("display.fbdev",
+                                                       "/dev/fb0")))
+            except Exception as exc:                      # noqa: BLE001
+                util.debug(f"screenshot failed: {exc}")
+
+        thread = threading.Thread(target=shoot, daemon=True)
+        thread.start()
 
     # -- status ------------------------------------------------------------
     def status_lines(self) -> list[str]:

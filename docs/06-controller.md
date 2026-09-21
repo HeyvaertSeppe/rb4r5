@@ -165,10 +165,22 @@ it scales the speed the engine is told. To calibrate, run the bridge with `-v`,
 turn the platter exactly one revolution and add up the deltas. A too-low value
 makes scratching hypersensitive, too high makes it sluggish.
 
+## Checking every control on real hardware
+
+```sh
+PI# python3 launch.py verify            # all 33, one at a time
+PI# python3 launch.py verify --quick    # seven of them
+```
+
+It asks you to move each control and watches what the engine received, so a
+control that is mapped but not arriving shows up as a failure rather than as a
+puzzle. The result is written to `/var/log/rb4r5/verify-report.txt`.
+
 ## Testing without a controller
 
 ```sh
-PI$ tools/flx4-selftest.sh          # synthetic MIDI through the real bridge
+PI$ tools/flx4-selftest.sh                       # synthetic MIDI, decoded
+PI$ python3 tools/tests/test_control_chain.py    # all 33 controls, end to end
 ```
 
 It creates a FIFO, runs `flx4-bridge` against it, feeds it the byte sequences a

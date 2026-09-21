@@ -54,6 +54,26 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the v1.20 size is recorded", cfg.get("firmware.expect_upd_size"),
           69171216)
 
+    # ---------------------------------------------------------- mirrors
+    order = firmware.mirrors(cfg)
+    check("the official URL is tried first",
+          order[0].startswith("https://downloads.support.alphatheta.com/"))
+    check("a mirror is configured behind it", len(order) >= 2)
+    check("the Drive mirror is expressed as gdrive:<id>",
+          any(u.startswith("gdrive:") for u in order))
+    cfg.set("firmware.mirrors", ["https://example.invalid/fw.zip"])
+    check("configured mirrors come before the built-in ones",
+          firmware.mirrors(cfg)[1], "https://example.invalid/fw.zip")
+    cfg.set("firmware.mirrors", ["gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul"])
+
+    # an HTML consent page must never be mistaken for firmware
+    page = tmp / "consent.html"
+    page.write_bytes(b"<!DOCTYPE html>\n<html><body>Google Drive</body></html>")
+    check("an HTML page is recognised", firmware._looks_like_html(page))
+    real = tmp / "real.bin"
+    real.write_bytes(b"\x00\x01\x02" * 1000)
+    check("a binary is not", firmware._looks_like_html(real), False)
+
     # ---------------------------------------------------------- zip handling
     archive = make_zip(tmp / "XDJ-RX3_v120.zip")
     extracted = firmware.upd_from_zip(archive, tmp / "out")
@@ -145,6 +165,63 @@ with tempfile.TemporaryDirectory() as tmp:
 
     firmware.fetch_official = real_fetch
     firmware.find_upd_files = real_find
+
+    # ------------------------------------------- when every source fails
+    payload4 = tmp / "payload4"
+    payload4.mkdir()
+    cfg.set("paths.payload", str(payload4))
+    real_download = firmware.download_file
+
+    def dead_download(url, dest, expect_size=0):
+        raise firmware.util.Fail(f"could not download {url}")
+
+    firmware.download_file = dead_download
+    try:
+        firmware.fetch_official(cfg)
+        check("every source failing is reported clearly", False)
+    except Exception as exc:
+        check("every source failing is reported clearly",
+              "none of the firmware sources worked" in str(exc) and
+              "alphatheta.com" in str(exc))
+    firmware.download_file = real_download
+
+    # a source that returns a web page is discarded, not decrypted
+    def html_download(url, dest, expect_size=0):
+        Path(dest).write_bytes(b"<!DOCTYPE html><html>nope</html>")
+        return Path(dest)
+
+    firmware.download_file = html_download
+    try:
+        firmware.fetch_official(cfg)
+        check("a web page is not accepted as firmware", False)
+    except Exception as exc:
+        check("a web page is not accepted as firmware",
+              "none of the firmware sources worked" in str(exc))
+    firmware.download_file = real_download
+
+    # a download that is the bare .UPD (not a zip) is handled too
+    def upd_download(url, dest, expect_size=0):
+        Path(dest).write_bytes(FAKE_UPD)
+        return Path(dest)
+
+    firmware.download_file = upd_download
+    got = firmware.fetch_official(cfg, force=True)
+    check("a bare .UPD download is accepted", got.name, "XDJ-RX3.UPD")
+    check("and is what was downloaded", got.read_bytes(), FAKE_UPD)
+
+    # something that is not firmware at all is rejected before decryption
+    def junk_download(url, dest, expect_size=0):
+        Path(dest).write_bytes(b"\x00" * 4096)
+        return Path(dest)
+
+    firmware.download_file = junk_download
+    try:
+        firmware.fetch_official(cfg, force=True)
+        check("junk is rejected before decryption", False)
+    except Exception as exc:
+        check("junk is rejected before decryption",
+              "not firmware" in str(exc))
+    firmware.download_file = real_download
 
     # ---------------------------------------------------------- key in an archive
     key_text = b"a-key-that-is-not-real-0123456\n"

@@ -74,6 +74,17 @@ and were:
   root filesystem (symlinks and modes included), the key being remembered, and
   a second run being a no-op.  A wrong key is refused before anything is
   written.
+* **All 33 DDJ-FLX4 controls, end to end.**  `tools/tests/test_control_chain.py`
+  builds the real `flx4-bridge`, feeds it the MIDI bytes an FLX4 sends for every
+  control in the verification walk, renders the records it writes exactly as
+  `keyshim.so` logs them inside the player, and asserts that `rb4r5 verify`
+  would have seen each one - so the only untested links in that chain are the
+  physical controller and the engine itself.  It also checks the pad bank is
+  switched before the first pad of a mode, and that 14-bit controls arrive as
+  10-bit values with the right op.
+* **The full-screen probe**, against synthetic framebuffers: a filled frame
+  passes, and a top-left-corner frame (the classic missing-scale symptom), a
+  letterboxed one and a black screen are all caught.
 * **The cramfs reader**, against an image built byte by byte in the test:
   multi-block files, empty files, symlinks, nested directories, permissions,
   and a corrupt image being reported rather than half-extracted.
@@ -97,6 +108,9 @@ and were:
 
 In the order I would check them:
 
+0. **Run `sudo python3 launch.py verify`.** It is the fastest way to find out
+   what is real: it screenshots the player, says whether the frame covers the
+   panel, checks audio is running through the FLX4, and walks every control.
 1. **The display.** `RB_DFB_DEBUG=1 launch.py run`, then `/tmp/flipdbg.log`
    should show `FLIP 0` and then `UPDATE` lines, and `launch.py fbdump` should
    show the UI. This is inherited working code aimed at a new framebuffer; the

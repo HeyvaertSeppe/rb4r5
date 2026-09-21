@@ -25,7 +25,9 @@ END = "# <<< rb4r5 <<<"
 PACKAGES_RUNTIME = ["alsa-utils", "coreutils", "util-linux", "psmisc",
                     "exfatprogs", "dosfstools",
                     # firmware unpacking: AES for the .UPD, bsdtar for the ISO
-                    "python3-cryptography", "libarchive-tools", "git"]
+                    "python3-cryptography", "libarchive-tools", "git",
+                    # screenshots of the player (launch.py verify / fbdump)
+                    "python3-pil"]
 PACKAGES_BUILD = ["build-essential", "gcc-arm-linux-gnueabi",
                   "libc6-dev-armel-cross", "autoconf", "automake", "libtool",
                   "libtool-bin", "patchelf", "pkg-config", "git", "patch"]

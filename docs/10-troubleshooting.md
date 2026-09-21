@@ -11,6 +11,11 @@ is organised by what you are seeing.
 
 ## Nothing on the screen
 
+First: `sudo python3 launch.py verify` samples the framebuffer and saves a
+screenshot, so you can see what the player is actually putting out before
+guessing.
+
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Console text, no player | the player is not running | `launch.py status`, then `launch.py logs rbp.log` |
@@ -27,7 +32,8 @@ is organised by what you are seeing.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `could not download …alphatheta.com…` | no network, DNS, or the vendor moved the file | fetch the zip on another machine, put it in `/opt/rb4r5/payload`, and re-run — or `--upd /path/to/file` |
+| `none of the firmware sources worked` | no network, or every mirror is unreachable | fetch the zip on another machine, put it in `/opt/rb4r5/payload`, and re-run — or `--upd /path/to/file` |
+| `that source returned a web page, not a file` | a mirror needs a login or a consent click | it moves on to the next source by itself; supply the file with `--upd` if they all do it |
 | It downloads every time | the payload directory is not writable, so nothing is cached | check `/opt/rb4r5/payload/firmware` |
 | It used the wrong file | a `.UPD` was already in the payload directory | remove it, or name the one you want with `--upd` |
 | `downloaded N bytes, expected 69171216` | a truncated download, or a different firmware version | delete `/opt/rb4r5/payload/firmware` and re-run |

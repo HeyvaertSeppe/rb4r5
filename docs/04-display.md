@@ -125,6 +125,7 @@ builds the portable scalar version.
 ## Checking it
 
 ```sh
+PI# python3 launch.py verify            # + does the frame fill the panel?
 PI# python3 launch.py doctor            # geometry, connectors, non-zero bytes
 PI# python3 launch.py fbdump /tmp/screen.png   # what is on screen, over SSH
 PI# cat /sys/class/graphics/fb0/{name,virtual_size,bits_per_pixel,stride,pan}
@@ -134,7 +135,14 @@ PI# head -20 /tmp/flipdbg.log
 
 A healthy run shows `FLIP 0` once and then `UPDATE 0..n`, `pan=0,0`, and a
 framebuffer whose first 400 kB is mostly non-zero. `fbdump` needs
-`python3-pil` for PNG output and otherwise writes raw BGRA.
+`python3-pil` for PNG output (installed by `setup`) and otherwise writes raw
+BGRA.
+
+A screenshot is also saved automatically 25 s after every start, in
+`/var/log/rb4r5/screenshots/` — so if the screen ever looks wrong there is a
+record of what it looked like. `verify` additionally samples the framebuffer's
+four corners and its centre: a frame that leaves corners black is not covering
+the panel, which is exactly what a missing scale path (F4) looks like.
 
 ## If the screen is black
 

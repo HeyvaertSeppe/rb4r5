@@ -138,3 +138,34 @@ flowing; `hw_params` showing `state: RUNNING` is the proof the device is open.
 | Only 2 channels offered | the controller is in a 2-channel USB mode | `cat /proc/asound/card*/stream0`; the launcher falls back to stereo and says so |
 | Crackling / xruns | under-voltage, or too small a period | use the 27 W supply; check `vcgencmd get_throttled` |
 | Playhead frozen, UI alive | no running PCM (see above) | fix the device; this is the single most common cause |
+
+## The controller plugged in after the player started
+
+The engine opens its PCM **once**, at startup, and there is no way to hand a
+running engine a different card. Plug the FLX4 in a minute later and nothing
+moves: the sound stays on HDMI and the controller looks undetected.
+
+The supervisor now watches for it. When a controller appears after startup it
+says so and restarts the player, which takes a few seconds and is what you
+were about to do by hand:
+
+```
+[!!] the controller appeared (DDJ-FLX4) after the player had already chosen
+     its audio device - restarting so master and cue go to it
+```
+
+`audio.restart_on_controller=false` turns that off. Plugging it in *before*
+`launch.py run` is still the quickest path.
+
+## The master level meter
+
+`audioshim` is the only thing in the stack that sees the audio — the engine's
+own meters are drawn into the panel link this port does not decode — so it
+measures the peak of each channel as it mixes, and writes it to
+`/tmp/rb-levels.dat` twenty times a second. The launcher draws that in the
+black bar to the right of the picture (see [12-overlay](12-overlay.md)):
+two columns, green to about -12 dBFS, amber above that, red over the line at
+-3 dBFS, which is where the RX3 puts its own.
+
+It needs the black bar to live in, so it appears with `display.fit=aspect`
+(the default) and not with `fill`. `overlay.meter=false` turns it off.

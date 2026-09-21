@@ -66,6 +66,9 @@ DEFAULTS: dict = {
         "splash_min_seconds": 2.0,       # never flash past too fast to read
         "splash_max_seconds": 75.0,      # give up waiting and show the player
         "nudge_after_picker": False,
+        # master level meter in the black bar beside the picture, fed by
+        # audioshim (which is the only thing that sees the audio)
+        "meter": True,
     },
     # ---- audio -------------------------------------------------------------
     "audio": {
@@ -78,6 +81,9 @@ DEFAULTS: dict = {
         "plug": True,                    # use plughw: (lets alsa-lib convert)
         "cue_mirror": False,             # mirror master into the phones until PFL
         "cue_on_stereo": False,          # on a stereo sink, follow the cue mix
+        # The engine picks its output once, at startup.  If the controller is
+        # plugged in later, restart so master + cue move onto it.
+        "restart_on_controller": True,
         "startup_mute_ms": 1500,         # kill the engine's power-on transient
         "startup_fade_ms": 300,
         "fallback_hdmi": True,           # use HDMI audio when no controller
@@ -92,9 +98,21 @@ DEFAULTS: dict = {
         # turn pushes the deck (0.5 = half as far, 2 = twice).
         "jog_reverse": False,
         "jog_scale": 1.0,
+        # How many MIDI messages the FLX4 sends for one turn of its own jog
+        # wheel.  Measure it: `launch.py jogtest`.  Getting this wrong makes
+        # the wheel feel dead and the position run away.
+        "jog_ticks_per_rev": 1800,
+        "jog_touch_timeout_ms": 4000,    # let a stuck plate-touch go
+        "midi_device": None,             # /dev/snd/midiC*D*, null = auto
         "filter_init": True,             # select FILTER as the colour FX type
         "map_file": "/etc/rb4r5/flx4-map.conf",
         "verbose": False,
+    },
+    # ---- the panel link (subucom) ------------------------------------------
+    "panel": {
+        # Always drained (see rb4r5/subucom.py); capture writes the stream to
+        # /var/log/rb4r5/subucom.bin for decoding the LED protocol.
+        "capture": False,
     },
     # ---- touchscreen -------------------------------------------------------
     "touch": {

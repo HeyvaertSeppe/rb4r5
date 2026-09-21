@@ -24,8 +24,10 @@ redraw (which it does continuously anyway).
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
+import struct
 import time
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from . import canvas, config, fb, font, inputs, keys, util, zones
 
 CMD_FIFO = "/tmp/rb-overlay.fifo"
 STATE_FILE = "/tmp/rb-overlay.state"
+LEVELS_FILE = "/tmp/rb-levels.dat"      # written by audioshim, 5 x int32
 
 # --- colours, near enough to the RX3's own panel ---------------------------
 BG          = (10, 11, 14)
@@ -44,6 +47,11 @@ LIT_LABEL   = (16, 14, 10)
 ACCENT      = (70, 160, 255)
 PICK_BG     = (16, 18, 23)
 PICK_EDGE   = (70, 160, 255)
+# the meter, in the RX3's own three bands
+METER_OK    = (60, 210, 120)
+METER_WARM  = (230, 190, 50)
+METER_HOT   = (235, 60, 50)
+METER_OFF   = (28, 30, 36)
 
 # Beat FX, in the order the player steps through them.  The picker moves the
 # selection by sending that many steps on the FX-type encoder, so the ORDER is
@@ -297,6 +305,80 @@ class Overlay:
             screen.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return screen
 
+    # -- the master level meter -------------------------------------------
+    def meter_rect(self) -> tuple[int, int, int, int]:
+        """The right-hand black bar, which is otherwise wasted.
+
+        With the aspect fit there is a strip of black down each side of the
+        picture; the master meter goes in the right one, where a DJ looks for
+        it on the player itself.  If the frame fills the panel there is no bar
+        to use and the meter is off.
+        """
+        fx, fy, fw, fh = self.layout.frame
+        right = fx + fw
+        spare = self.layout.fw - right
+        if spare < 24:
+            return 0, 0, 0, 0
+        pad = max(2, spare // 10)
+        return right + pad, fy + pad, spare - 2 * pad, fh - 2 * pad
+
+    def read_levels(self) -> tuple[float, float, int]:
+        """(left, right, sequence) as 0..1 of full scale."""
+        try:
+            blob = Path(LEVELS_FILE).read_bytes()
+            if len(blob) < 20:
+                return 0.0, 0.0, 0
+            seq, left, right, _phones, full = struct.unpack("<5i", blob[:20])
+        except (OSError, struct.error):
+            return 0.0, 0.0, 0
+        full = full or 8388607
+        return (min(1.0, max(0.0, left / full)),
+                min(1.0, max(0.0, right / full)), seq)
+
+    def draw_meter(self, left: float, right: float,
+                   target: str | None = None) -> canvas.Canvas | None:
+        x, y, w, h = self.meter_rect()
+        if w <= 0 or h <= 0:
+            return None
+        meter = canvas.Canvas(self.layout.info, x, y, w, h)
+        meter.fill(BG)
+
+        segments = max(12, h // 26)
+        gap = max(1, h // (segments * 8))
+        seg_h = (h - gap * (segments - 1)) // segments
+        col_w = (w - max(2, w // 8)) // 2
+        col_gap = w - col_w * 2
+
+        for column, level in enumerate((left, right)):
+            cx = column * (col_w + col_gap)
+            # dBFS, so the top of the scale behaves like a real meter: the
+            # last fifth is the red, and -6 dB is about three quarters up
+            db = -60.0 if level <= 0.0005 else 20.0 * math.log10(level)
+            filled = int(round((db + 48.0) / 48.0 * segments))
+            for index in range(segments):
+                top = h - (index + 1) * (seg_h + gap) + gap
+                share = index / max(1, segments - 1)
+                if index >= filled:
+                    colour = METER_OFF
+                elif share > 0.88:
+                    colour = METER_HOT
+                elif share > 0.72:
+                    colour = METER_WARM
+                else:
+                    colour = METER_OK
+                meter.rect(cx, top, col_w, seg_h, colour)
+
+        # the red line, where the RX3 puts it
+        line_y = h - int(h * 0.88) - 1
+        meter.rect(0, line_y, w, max(1, h // 300), (90, 40, 40))
+        scale = meter.fit_scale("LR", w, max(6, h // 40))
+        meter.text(0, h - font.text_height(scale) - 1, "L", (90, 96, 108), scale)
+        meter.text(col_w + col_gap, h - font.text_height(scale) - 1, "R",
+                   (90, 96, 108), scale)
+        if target is not False:
+            meter.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
+        return meter
+
     # -- state shared with the touch daemon --------------------------------
     def write_state(self) -> None:
         """touchd reads this: while a modal is up the UI must not be touched."""
@@ -354,6 +436,10 @@ class OverlayDaemon:
         self.splash_sample = b""
         self.splash_min = float(cfg.get("overlay.splash_min_seconds", 2.0))
         self.splash_max = float(cfg.get("overlay.splash_max_seconds", 75.0))
+        self.meter_on = bool(cfg.get("overlay.meter", True))
+        self.meter_at = 0.0
+        self.meter_seq = -1
+        self.meter_last = (-1.0, -1.0)
 
     # -- devices -----------------------------------------------------------
     def open_touch(self) -> bool:
@@ -505,6 +591,27 @@ class OverlayDaemon:
             return b""
         return blob
 
+    def poll_meter(self) -> None:
+        """Redraw the master meter, but only when it would look different.
+
+        It is a handful of rectangles in a strip the player never touches, so
+        the cost is the framebuffer write and nothing else - but there is no
+        point doing even that 50 times a second when the level has not moved
+        a segment.
+        """
+        if not self.meter_on or self.overlay.mode == "splash":
+            return
+        now = time.monotonic()
+        if now - self.meter_at < 0.05:
+            return
+        self.meter_at = now
+        left, right, seq = self.overlay.read_levels()
+        if seq == self.meter_seq and (left, right) == self.meter_last:
+            return
+        self.meter_seq = seq
+        self.meter_last = (left, right)
+        self.overlay.draw_meter(left, right)
+
     def poll_splash(self) -> None:
         if self.overlay.mode != "splash":
             return
@@ -607,6 +714,13 @@ class OverlayDaemon:
                   f"{over.layout.frame[0]},{over.layout.frame[1]}")
         self.open_fifo()
         over.draw_bar()
+        if self.meter_on and over.meter_rect()[2] > 0:
+            over.draw_meter(0.0, 0.0)
+            util.info(f"overlay: master meter in the right bar "
+                      f"({over.meter_rect()[2]}px wide)")
+        elif self.meter_on:
+            util.info("overlay: no room for the master meter (the frame "
+                      "fills the panel - display.fit=aspect leaves a strip)")
         backoff = 1.0
         while True:
             if not self.reader and not self.open_touch():
@@ -629,6 +743,7 @@ class OverlayDaemon:
                             raise OSError("touch device gone")
                         self.handle_events(events)
                     self.poll_splash()
+                    self.poll_meter()
                     if self.dirty or any(b.until and b.until < time.monotonic()
                                          for b in over.buttons):
                         for button in over.buttons:

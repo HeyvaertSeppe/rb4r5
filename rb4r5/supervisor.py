@@ -219,7 +219,9 @@ class Supervisor:
             if bridge.exists():
                 argv = [str(bridge), "-f", config.FIFO_CTRL,
                         "-J", str(cfg.get("controller.jog_ppr", 1800)),
+                        "-T", str(cfg.get("controller.jog_ticks_per_rev", 1800)),
                         "-S", str(cfg.get("controller.jog_scale", 1.0)),
+                        "-H", str(cfg.get("controller.jog_touch_timeout_ms", 4000)),
                         "-O", overlay.CMD_FIFO]
                 if cfg.get("controller.jog_reverse"):
                     argv.append("-R")
@@ -238,6 +240,15 @@ class Supervisor:
         if cfg.get("touch.enabled", True):
             self.children.append(Child(
                 "rbtouchd", [python, launcher, "touchd"], logs / "touchd.log"))
+
+        # Nothing else reads the panel link, and a fifo with no reader stops
+        # the writer once its buffer fills - which parks the player's panel
+        # thread mid-write and looks like the UI freezing.
+        self.children.append(Child(
+            "rbpanel", [python, launcher, "subucom",
+                        "--daemon"] + (["--capture"]
+                                       if cfg.get("panel.capture") else []),
+            logs / "panel.log"))
 
         if cfg.get("overlay.enabled", True):
             self.children.append(Child(
@@ -283,6 +294,48 @@ class Supervisor:
                 time.sleep(1.0)     # let it create its sockets
             elif child.name == "rbp":
                 time.sleep(1.0)
+
+    # -- the controller appearing after we started -------------------------
+    def watch_for_controller(self) -> None:
+        """Notice the FLX4 being plugged in, and take it into use.
+
+        The engine opens its PCM once, at startup, so the audio device is
+        decided before the player draws its first frame.  Plug the controller
+        in a minute later and nothing moves: the sound stays on HDMI and the
+        controller looks like it was never detected.  There is no way to hand
+        a running engine a different card, so the honest fix is to start
+        again, which takes a few seconds and is what the user was about to do
+        by hand anyway.
+        """
+        if not self.cfg.get("audio.restart_on_controller", True):
+            return
+        fragment = str(self.cfg.get("controller.name", "FLX4"))
+        if audio.find_controller(fragment):
+            return                      # it was already there at startup
+
+        def watch():
+            while not self.stopping:
+                time.sleep(2.0)
+                card = audio.find_controller(fragment)
+                if not card or self.stopping:
+                    continue
+                util.warn(f"the controller appeared ({card['name']}) after "
+                          "the player had already chosen its audio device - "
+                          "restarting so master and cue go to it")
+                time.sleep(1.5)         # let the card's PCMs settle
+                self.restart_everything()
+                return
+
+        threading.Thread(target=watch, daemon=True).start()
+
+    def restart_everything(self) -> None:
+        """Re-exec the launcher, which is the only clean way to re-pick audio."""
+        try:
+            self.shutdown()
+        finally:
+            argv = [sys.executable, str(REPO / "launch.py"), "run"]
+            util.info("restarting: " + " ".join(argv))
+            os.execv(sys.executable, argv)
 
     # -- the boot splash ---------------------------------------------------
     def splash_until_ready(self) -> None:
@@ -343,6 +396,7 @@ class Supervisor:
         self.prepare_system()
         self.build_children()
         self.splash_until_ready()
+        self.watch_for_controller()
 
         signals = {}
 

@@ -16,8 +16,9 @@ import time
 from pathlib import Path
 
 from . import (__version__, audio, build, chroot, config, display, doctor,
-               fb, firmware, keys, overlay, platform5, probe, provision,
-               supervisor, touchd, usbwatch, util, verify, zones)
+               fb, firmware, jogcal, keys, overlay, platform5, probe,
+               provision, subucom, supervisor, touchd, usbwatch, util, verify,
+               zones)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -298,6 +299,24 @@ def cmd_logs(args, cfg) -> int:
     return subprocess.call(cmd)
 
 
+def cmd_subucom(args, cfg) -> int:
+    """The panel link: drain it, watch it, or work out what a control lights."""
+    util.require_root("reading the panel link")
+    if args.replay:
+        return subucom.replay(args.replay)
+    if args.learn:
+        return subucom.learn(cfg, args.learn)
+    if args.watch:
+        return subucom.watch(cfg, seconds=args.seconds)
+    return subucom.run(cfg, capture=args.capture)
+
+
+def cmd_jogtest(args, cfg) -> int:
+    """Measure the FLX4's jog wheel: ticks per revolution and direction."""
+    util.require_root("reading the controller's MIDI")
+    return jogcal.run(cfg, seconds=args.seconds, quiet=args.quiet)
+
+
 def cmd_overlay(args, cfg) -> int:
     """The daemon that owns the button bar, the picker and the splash."""
     util.require_root("drawing on the framebuffer")
@@ -568,6 +587,29 @@ def build_parser() -> argparse.ArgumentParser:
                                           "supervisor)")
     usb.add_argument("--once", action="store_true")
     usb.set_defaults(func=cmd_usbwatch)
+
+    panel = sub.add_parser("subucom", help="the panel link: drain it, and "
+                                          "decode what it lights")
+    panel.add_argument("--daemon", action="store_true",
+                       help="drain it forever (what the supervisor runs)")
+    panel.add_argument("--capture", action="store_true",
+                       help="with --daemon: also record the stream")
+    panel.add_argument("--watch", action="store_true",
+                       help="print frames live, marking what changed")
+    panel.add_argument("--learn", metavar="WHAT",
+                       help="diff the panel across one action, e.g. 'cue 1'")
+    panel.add_argument("--replay", metavar="FILE",
+                       help="the same view over a capture file")
+    panel.add_argument("--seconds", type=float, default=30.0)
+    panel.set_defaults(func=cmd_subucom)
+
+    jog = sub.add_parser("jogtest", help="measure the jog wheel: ticks per "
+                                        "revolution and which way it counts")
+    jog.add_argument("--seconds", type=float, default=12.0,
+                     help="how long to watch the turn (default 12)")
+    jog.add_argument("--quiet", action="store_true",
+                     help="totals only, no per-message lines")
+    jog.set_defaults(func=cmd_jogtest)
 
     ov = sub.add_parser("overlay", help="the top button bar, the effect "
                                        "picker and the boot splash")

@@ -132,8 +132,20 @@ static const char *fifo_path = "/tmp/rb-ctrl.fifo";
 static const char *midi_dev  = NULL;
 static const char *map_file  = NULL;
 static const char *opt_overlay = "/tmp/rb-overlay.fifo";
-static float jog_ppr = 1800.0f;    /* jog pulses per revolution */
+/* Two different resolutions, and confusing them is what makes a jog wheel
+ * feel dead and then skip:
+ *   jog_ppr   - the units the ENGINE counts a platter revolution in, so the
+ *               position it is handed must wrap at this and no higher;
+ *   jog_tpr   - how many messages the FLX4 sends for one revolution of its
+ *               own wheel, which is what turns those messages into a real
+ *               speed.  Measure it: launch.py jogtest.
+ * Dividing the FLX4's ticks by the engine's number (which is what this used
+ * to do) makes every turn look far slower than it is, and letting the
+ * position run to 16 bits hands the engine an angle it cannot mean. */
+static float jog_ppr = 1800.0f;    /* engine units per revolution         */
+static float jog_tpr = 1800.0f;    /* FLX4 messages per revolution        */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
+static int   jog_touch_timeout_ms = 4000;  /* 0 = never let a touch go     */
 static int   jog_reverse = 0;      /* the platter turns the other way     */
 static float jog_scale = 1.0f;     /* how hard a turn pushes the engine   */
 
@@ -330,10 +342,12 @@ static void build_cc14(void)
 struct jog {
     int midi_ch;
     int send_ch;
-    unsigned int vpos;
+    float vpos;            /* platter angle in engine units, 0 .. jog_ppr */
     int moving;
+    int touched;           /* the plate is held (note 0x36)               */
     long long last_ms;
     long long last_emit_ms;
+    long long touch_ms;    /* when the touch arrived, for the stuck guard */
 };
 static struct jog jogs[2];
 
@@ -344,12 +358,17 @@ static long long now_ms(void)
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
-static void jog_delta(int midi_ch, int delta)
+static struct jog *jog_for(int midi_ch)
 {
-    struct jog *s = NULL;
     for (int i = 0; i < 2; i++)
         if (jogs[i].midi_ch == midi_ch)
-            s = &jogs[i];
+            return &jogs[i];
+    return NULL;
+}
+
+static void jog_delta(int midi_ch, int delta)
+{
+    struct jog *s = jog_for(midi_ch);
     if (!s || delta == 0)
         return;
     if (jog_reverse)
@@ -361,11 +380,17 @@ static void jog_delta(int midi_ch, int delta)
     if (dt < 0.0005f)
         dt = 0.0005f;
 
-    s->vpos = (s->vpos + (unsigned int)delta) & 0xFFFFu;
-    /* revolutions per second, which is what the engine's jog control wants;
-     * jog_scale is the tuning knob when a turn moves the platter too far or
-     * not far enough, and jog_ppr is the wheel's own resolution. */
-    float speed = (float)delta / jog_ppr / dt * jog_scale;
+    /* the wheel's own resolution turns messages into revolutions ... */
+    float revs = (float)delta / (jog_tpr > 0.5f ? jog_tpr : 1800.0f);
+
+    /* ... the engine's resolution turns revolutions into a platter angle,
+     * which must stay inside one revolution: handing it a number that keeps
+     * growing is what makes the track jump. */
+    s->vpos += revs * jog_ppr;
+    while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
+    while (s->vpos < 0.0f)     s->vpos += jog_ppr;
+
+    float speed = revs / dt * jog_scale;
     if (speed > 8.0f) speed = 8.0f;
     if (speed < -8.0f) speed = -8.0f;
     s->moving = 1;
@@ -373,8 +398,9 @@ static void jog_delta(int midi_ch, int delta)
 
     send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, speed, (int)s->vpos);
     if (opt_verbose)
-        logmsg("  jog deck%d delta=%d speed=%.2f rev/s pos=%u\n",
-               s->send_ch, delta, (double)speed, s->vpos);
+        logmsg("  jog deck%d delta=%d speed=%.2f rev/s pos=%d%s\n",
+               s->send_ch, delta, (double)speed, (int)s->vpos,
+               s->touched ? " (touched)" : "");
 }
 
 /* A jog that stops sending must be told to stop, or the engine keeps nudging. */
@@ -385,6 +411,19 @@ static void jog_tick(void)
         struct jog *s = &jogs[i];
         if (!s->moving)
             continue;
+        /* A plate reported as touched but not moving for a long time is
+         * almost always a note-off that went missing (the FLX4 sends them on
+         * a different note under SHIFT).  Let it go rather than leave the
+         * deck in scratch. */
+        if (s->touched && jog_touch_timeout_ms > 0 &&
+            t - s->touch_ms > jog_touch_timeout_ms &&
+            t - s->last_ms > jog_touch_timeout_ms) {
+            s->touched = 0;
+            send_ctrl(K_JOG_TOUCH, OP_RELEASE, s->send_ch, 0, 0.0f, 0);
+            if (opt_verbose)
+                logmsg("  jog deck%d: releasing a touch held %lldms with no "
+                       "movement\n", s->send_ch, t - s->touch_ms);
+        }
         if (t - s->last_emit_ms < jog_idle_ms)
             continue;
         s->moving = 0;
@@ -659,6 +698,18 @@ static void handle_note(int ch, int note, int on)
         int sch;
         if (notemap[i].ch != ch || notemap[i].note != note || !notemap[i].key)
             continue;
+        if (notemap[i].key == K_JOG_TOUCH) {
+            /* Remember it as well as forwarding it.  A touch that never
+             * arrives at its note-off leaves the engine in scratch mode for
+             * good, and then every nudge of the wheel seeks the track
+             * instead of bending it - which is what "the music skips" looks
+             * like from the outside. */
+            struct jog *s = jog_for(ch);
+            if (s) {
+                s->touched = on;
+                s->touch_ms = now_ms();
+            }
+        }
         if (notemap[i].key == K_OVERLAY_FX) {
             if (on)
                 overlay_command("fx");
@@ -817,7 +868,7 @@ int main(int argc, char **argv)
 
     /* -l is handled after the whole option list, so `-l -m map.conf` and
      * `-m map.conf -l` behave the same. */
-    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:RF")) != -1) {
+    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:RF")) != -1) {
         switch (opt) {
         case 'v': opt_verbose = 1; break;
         case 's': opt_sniff = 1; opt_verbose = 1; break;
@@ -827,12 +878,15 @@ int main(int argc, char **argv)
         case 'J': jog_ppr = (float)atof(optarg); break;
         case 'R': jog_reverse = 1; break;
         case 'S': jog_scale = (float)atof(optarg); break;
+        case 'T': jog_tpr = (float)atof(optarg); break;
+        case 'H': jog_touch_timeout_ms = atoi(optarg); break;
         case 'O': opt_overlay = optarg; break;
         case 'F': opt_filter_init = 1; break;
         case 'l': opt_list = 1; break;
         default:
             fprintf(stderr, "usage: %s [-v] [-s] [-l] [-d dev] [-f fifo] "
-                            "[-m mapfile] [-J jog_ppr] [-S jog_scale] [-R] "
+                            "[-m mapfile] [-J engine_ppr] [-T flx4_ticks_per_rev] "
+                            "[-S jog_scale] [-R] [-H touch_timeout_ms] "
                             "[-O overlayfifo] [-F]\n", argv[0]);
             return 2;
         }
@@ -848,9 +902,11 @@ int main(int argc, char **argv)
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
 
-    logmsg("flx4-bridge: %s -> %s (jog %g pulses/rev, scale %g%s)\n",
+    logmsg("flx4-bridge: %s -> %s (jog: engine %g/rev, wheel %g/rev, "
+           "scale %g%s)\n",
            opt_sniff ? "SNIFF (no output)" : "bridge", fifo_path,
-           (double)jog_ppr, (double)jog_scale, jog_reverse ? ", reversed" : "");
+           (double)jog_ppr, (double)jog_tpr, (double)jog_scale,
+           jog_reverse ? ", reversed" : "");
 
     if (!opt_sniff) {
         fifo_fd = open(fifo_path, O_RDWR | O_NONBLOCK);

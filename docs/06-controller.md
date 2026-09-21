@@ -211,3 +211,44 @@ called.
 | Channel 2's fader moves deck 1 | mixer input routing stuck on player 0 | `keyshim` pins it; check `/tmp/keyshim.log` for `mixer defaults sent` |
 | Pads do nothing in one mode | a mode with no engine equivalent | expected; see the pad table |
 | Jog scratches wildly | `controller.jog_ppr` too low | calibrate it |
+
+## The jog wheel: measure it, do not guess
+
+A jog wheel needs two numbers, and only one of them was ever right here.
+
+| | what it is | where it comes from |
+|---|---|---|
+| `controller.jog_ppr` | the units the **engine** counts one platter revolution in | the RX3's own wheel: 1800 |
+| `controller.jog_ticks_per_rev` | how many MIDI messages the **FLX4** sends for one turn of its wheel | nobody documents it — measure it |
+
+The bridge used to divide the FLX4's messages by the *engine's* number, which
+makes every turn look far slower than it is (the wheel feels dead), and let
+the platter position run to 16 bits, which hands the engine an angle it cannot
+mean (the track skips). Both are fixed: the wheel's own resolution turns
+messages into revolutions per second, and the position wraps inside one
+revolution the way a platter angle has to.
+
+So measure the wheel:
+
+```sh
+sudo python3 launch.py jogtest
+```
+
+It asks you to touch the plate (checking the touch notes arrive at all — the
+engine cannot tell scratching from bending without them) and then to turn the
+wheel exactly one full revolution. It reports ticks per revolution and which
+way it counts, and prints the two commands to set:
+
+```sh
+sudo python3 launch.py config --set controller.jog_ticks_per_rev=<measured>
+sudo python3 launch.py config --set controller.jog_reverse=true   # if needed
+```
+
+`controller.jog_scale` is the last knob: it multiplies how far a turn pushes
+the deck, for when the units are right but the feel is not.
+
+**A stuck plate touch** leaves the deck in scratch mode, and then every nudge
+of the wheel seeks the track instead of bending it — which is what "the music
+skips" looks like. The FLX4 sends the touch on one note and the shifted touch
+on another, so a missed note-off is possible; `controller.jog_touch_timeout_ms`
+(4 s) releases a touch that has been held with no movement at all.

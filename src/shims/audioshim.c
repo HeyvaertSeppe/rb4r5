@@ -51,6 +51,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <sys/syscall.h>
 
 /* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13 */
@@ -233,6 +234,11 @@ static void init_real_alsa(void)
 static int32_t g_mix4ch[MAX_FRAMES * 4];    /* RX3 master L/R + cue L/R   */
 static int32_t g_out[MAX_FRAMES * 4];       /* what goes to the hardware  */
 static unsigned long g_write_count = 0;
+
+/* The chroot bind-mounts the host /tmp, so the launcher outside can read it. */
+#ifndef RB_LEVELS_PATH
+#define RB_LEVELS_PATH "/tmp/rb-levels.dat"
+#endif
 
 /* ---- Startup mute / fade-in --------------------------------------------
  * rb's first audio buffers contain a full-scale transient (0x800000, the
@@ -598,6 +604,36 @@ int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
     return 0;   /* the streams are already muxed into one device here */
 }
 
+/* peak L, peak R, peak headphones, all 0..2^23, plus a counter so a reader
+ * can tell a stalled engine from a silent one. */
+static void publish_levels(int32_t left, int32_t right, int32_t phones)
+{
+    static long long s_last_ms = 0;
+    static unsigned long s_seq = 0;
+    struct timespec ts;
+    long long now;
+    int fd;
+    int32_t record[5];
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    if (now - s_last_ms < 50)
+        return;
+    s_last_ms = now;
+
+    record[0] = (int32_t)(++s_seq);
+    record[1] = left;
+    record[2] = right;
+    record[3] = phones;
+    record[4] = 8388607;                 /* full scale, so the reader scales */
+
+    fd = open(RB_LEVELS_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK, 0666);
+    if (fd < 0)
+        return;
+    if (write(fd, record, sizeof(record)) < 0) { /* nothing to be done */ }
+    close(fd);
+}
+
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
     init_real_alsa();
@@ -610,6 +646,9 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     static int32_t s_peak_master = 0;
     static int32_t s_peak_hp = 0;
     static int s_has_hp_audio = 0;
+    /* Separately per side, because a master meter that cannot show one
+     * channel clipping on its own is not a master meter. */
+    static int32_t s_peak_l = 0, s_peak_r = 0;
 
     if (pcm == (snd_pcm_t *)&g_h_hp) {
         /* Headphone/cue stream: park it in channels 2/3 of the mix and return.
@@ -639,6 +678,8 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         int32_t ar = (r < 0) ? -r : r;
         if (al > s_peak_master) s_peak_master = al;
         if (ar > s_peak_master) s_peak_master = ar;
+        if (al > s_peak_l) s_peak_l = al;
+        if (ar > s_peak_r) s_peak_r = ar;
         g_mix4ch[i * 4 + 0] = l;
         g_mix4ch[i * 4 + 1] = r;
         /* Mirror master into the cue pair only while the engine has not
@@ -704,6 +745,22 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     } else {
         /* No hardware: pace the engine thread so the UI still runs */
         usleep((useconds_t)(size * 1000000UL / (unsigned long)g_rate));
+    }
+
+    /* Publish the master level ~20x a second.  The launcher draws the meter
+     * from this (rb4r5/overlay.py); nothing else in the stack knows what the
+     * output is actually doing, because the engine's own meters are drawn
+     * into the panel link this port does not decode. */
+    publish_levels(s_peak_l, s_peak_r, s_peak_hp);
+    {
+        /* let the peaks fall back so the meter follows the music rather than
+         * holding the loudest moment since the player started */
+        static unsigned long s_decay = 0;
+        if ((++s_decay & 0x0f) == 0) {
+            s_peak_l -= s_peak_l >> 2;
+            s_peak_r -= s_peak_r >> 2;
+            s_peak_hp -= s_peak_hp >> 2;
+        }
     }
 
     if ((g_write_count % 500) == 1) {

@@ -15,6 +15,7 @@
 | [10-troubleshooting](10-troubleshooting.md) | Symptom → cause → fix |
 | [11-porting-notes](11-porting-notes.md) | What changed from the Chromebit port, what is unverified |
 | [12-overlay](12-overlay.md) | The top button bar, the effect picker and the boot splash |
+| [13-panel-link](13-panel-link.md) | The subucom link: draining it, and decoding the LEDs |
 
 Conventions:
 

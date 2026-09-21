@@ -63,7 +63,7 @@ def cmd_setup(args, cfg) -> int:
 def cmd_firmware(args, cfg) -> int:
     util.require_root("unpacking the firmware")
     if args.show:
-        for line in firmware.describe(cfg):
+        for line in firmware.describe(cfg, verbose=args.verbose):
             print(line)
         return 0 if firmware.ready(cfg) else 1
     if args.offline:

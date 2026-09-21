@@ -82,6 +82,7 @@ XDJ-RX3.UPD  ──decrypt──▶ XDJRX3.iso ──unpack──▶ XDJRX3/
 | **Decrypt** | AES-256-CBC per 512-byte sector, IV = `LE32(sector)` padded with zeroes, the last 16 bytes a plaintext trailer — the scheme PrimeBox's `rx3dec` documents, reimplemented in Python so no Rust toolchain is needed. It is done as one ECB pass plus an XOR (CBC decryption *is* ECB decryption XOR the previous ciphertext block), which is why 69 MB takes a second or two. |
 | **Verify** | The ISO 9660 signature `CD001` must appear at sector 64. A wrong key cannot fake that, so a bad key is caught before anything is written. |
 | **Unpack the ISO** | A loop mount when running as root (keeps Rock Ridge symlinks and modes), otherwise `bsdtar`, otherwise `7z`. |
+| **Normalise the layout** | An ISO9660 image without Rock Ridge extracts as `PDJ/RBP;1` rather than `pdj/rbp`, and some extractors add a wrapper directory. The version suffixes are stripped, a wholly upper-cased tree is lower-cased (the player's loader wants `libc.so.6`, not `LIBC.SO.6`), a wrapper directory is flattened, and the player, the root filesystem image and the gui archive are located case-insensitively wherever they ended up — including inside the root filesystem, if the ISO tree has no copy. |
 | **Unpack `gui.tar.gz`** | Python's `tarfile`. Without these fonts the UI does not start. |
 | **Unpack `rootfs.cramfs`** | rb4r5's own cramfs reader ([`rb4r5/cramfs.py`](../rb4r5/cramfs.py)). The Pi's kernel is built **without** `CONFIG_CRAMFS` and Debian no longer ships `cramfsprogs`, so neither mounting nor `cramfsck` is available — PrimeBox's tutorial needs a privileged Docker container here, and rb4r5 does not. |
 
@@ -126,7 +127,7 @@ PI$ sudo python3 launch.py firmware --upd ~/XDJ-RX3.UPD --key ~/aes256.key
 ## Checking what you got
 
 ```sh
-PI$ sudo python3 launch.py firmware --show
+PI$ sudo python3 launch.py firmware --show          # -v shows the ISO tree too
 payload dir: /opt/rb4r5/payload
 firmware ISO: present
 player (pdj/rbp): present

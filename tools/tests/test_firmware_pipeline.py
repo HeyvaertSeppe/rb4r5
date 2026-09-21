@@ -163,6 +163,34 @@ with tempfile.TemporaryDirectory() as tmp:
     described = "\n".join(firmware.describe(cfg))
     check("describe() reports the version", "1.20" in described)
 
+    # ---- an ISO with no player in it, but one inside the root filesystem ----
+    # (this is what "pdj/rbp is not in this ISO" used to die on)
+    payload2 = tmp / "payload2"
+    cfg.set("paths.payload", str(payload2))
+    iso_src2 = tmp / "iso-no-player"
+    (iso_src2 / "images").mkdir(parents=True)
+    rootfs_with_player = dict(ROOTFS)
+    rootfs_with_player["root"] = {"pdj": {"rbp": b"\x7fELF" + b"player" * 300}}
+    (iso_src2 / "images/rootfs.cramfs").write_bytes(
+        _cramfs_fixture.build(rootfs_with_player))
+    (iso_src2 / "images/release.txt").write_text("1.20\n")
+    (iso_src2 / "images/gui.tar.gz").write_bytes(buffer.getvalue())
+
+    def fake_extract_iso2(iso, dest):
+        util.run(["cp", "-a", f"{iso_src2}/.", str(util.ensure_dir(dest))])
+        return "test stub (no pdj/rbp in the ISO)"
+
+    firmware.extract_iso = fake_extract_iso2
+    notes = firmware.prepare(cfg, upd=upd, ask=False)
+    check("a player inside the rootfs is used when the ISO has none",
+          (payload2 / "XDJRX3/pdj/rbp").exists())
+    check("and it is the one from the rootfs",
+          (payload2 / "XDJRX3/pdj/rbp").read_bytes(),
+          rootfs_with_player["root"]["pdj"]["rbp"])
+    check("the payload is then complete", firmware.ready(cfg))
+    check("and it says where the player came from",
+          any("root filesystem" in n for n in notes))
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

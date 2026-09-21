@@ -906,14 +906,206 @@ def extract_iso(iso: Path, dest: Path) -> str:
         "    sudo apt-get install p7zip-full           # 7z")
 
 
+# The names the firmware uses, and how an ISO9660 extraction can mangle them:
+# without Rock Ridge every name comes out upper case with a ";1" version
+# suffix, so "pdj/rbp" arrives as "PDJ/RBP;1".  Everything below is written to
+# cope with that rather than to assume it did not happen.
+ISO_VERSION_SUFFIX = re.compile(r";\d+$")
+EXPECTED_FILES = {
+    "pdj/rbp": ("rbp",),
+    "images/rootfs.cramfs": ("rootfs.cramfs",),
+    "images/gui.tar.gz": ("gui.tar.gz", "gui.tgz"),
+}
+EXPECTED_DIRS = ("pdj", "images", "lib", "usr", "gui", "etc")
+
+
+def strip_version_suffixes(root: Path) -> list[str]:
+    """Rename `NAME;1` to `NAME` throughout a tree (bottom up)."""
+    renamed = []
+    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        clean = ISO_VERSION_SUFFIX.sub("", path.name)
+        if clean == path.name:
+            continue
+        target = path.with_name(clean)
+        try:
+            if target.exists():
+                continue
+            path.rename(target)
+            renamed.append(f"{path.name} -> {clean}")
+        except OSError:
+            continue
+    return renamed
+
+
+def looks_uppercase(root: Path, sample: int = 400) -> bool:
+    """Does this tree look like an ISO9660 extraction with no Rock Ridge?
+
+    Such an extraction upper-cases everything, and the firmware's real names
+    are all lower case - so "no lower-case letter anywhere" is a reliable
+    signal, and a safe condition for renaming the lot.
+    """
+    seen = lowered = 0
+    for path in root.rglob("*"):
+        name = ISO_VERSION_SUFFIX.sub("", path.name)
+        if not any(c.isalpha() for c in name):
+            continue
+        seen += 1
+        if any(c.islower() for c in name):
+            lowered += 1
+        if seen >= sample:
+            break
+    return seen >= 3 and lowered == 0
+
+
+def lowercase_tree(root: Path) -> int:
+    """Lower-case every name in a tree, deepest first.  Returns the count.
+
+    Only called when looks_uppercase() says the extraction mangled the case:
+    the player's loader looks for `libc.so.6`, not `LIBC.SO.6`, so leaving the
+    tree upper case breaks the chroot in a way that is hard to diagnose later.
+    """
+    renamed = 0
+    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        lower = path.name.lower()
+        if lower == path.name:
+            continue
+        target = path.with_name(lower)
+        if target.exists():
+            continue                    # a genuine case clash: leave both
+        try:
+            path.rename(target)
+            renamed += 1
+        except OSError:
+            continue
+    return renamed
+
+
+def find_file(root: Path, names, max_depth: int = 6) -> Path | None:
+    """Case-insensitive search for a file with any of `names`, nearest first."""
+    wanted = {n.lower() for n in names}
+    best = None
+    best_depth = 10 ** 6
+    base = len(root.parts)
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        here = Path(dirpath)
+        depth = len(here.parts) - base
+        if depth >= max_depth:
+            dirnames[:] = []
+        for filename in filenames:
+            plain = ISO_VERSION_SUFFIX.sub("", filename).lower()
+            if plain in wanted and depth < best_depth:
+                best, best_depth = here / filename, depth
+    return best
+
+
+def find_dir(root: Path, name: str) -> Path | None:
+    """A directory called `name`, whatever its case, at the top of the tree."""
+    try:
+        for entry in root.iterdir():
+            if entry.is_dir() and entry.name.lower() == name.lower():
+                return entry
+    except OSError:
+        pass
+    return None
+
+
+def normalise_iso_tree(iso_tree: Path) -> list[str]:
+    """Make an extracted ISO look the way the rest of rb4r5 expects.
+
+    Three things go wrong depending on which extractor ran and whether the ISO
+    carries Rock Ridge or Joliet names:
+
+      * `RBP;1` instead of `rbp` (ISO9660 version suffixes),
+      * `PDJ/` instead of `pdj/` (ISO9660 upper case),
+      * everything one level down inside a wrapper directory.
+
+    All three are fixed here rather than left for the build to trip over.
+    """
+    notes = []
+
+    stripped = strip_version_suffixes(iso_tree)
+    if stripped:
+        notes.append(f"removed ISO9660 version suffixes from {len(stripped)} "
+                     f"names (e.g. {stripped[0]})")
+
+    # a wrapper directory: one entry at the top which itself holds the firmware
+    try:
+        entries = [e for e in iso_tree.iterdir() if not e.name.startswith(".")]
+    except OSError:
+        entries = []
+    if len(entries) == 1 and entries[0].is_dir():
+        inner = entries[0]
+        if find_dir(inner, "images") or find_dir(inner, "pdj"):
+            for item in list(inner.iterdir()):
+                target = iso_tree / item.name
+                if not target.exists():
+                    item.rename(target)
+            notes.append(f"flattened the wrapper directory {inner.name}/")
+            try:
+                inner.rmdir()
+            except OSError:
+                pass
+
+    # a wholesale upper-case extraction: the whole tree has to come down,
+    # not just the directories we happen to look for by name
+    if looks_uppercase(iso_tree):
+        count = lowercase_tree(iso_tree)
+        notes.append(f"the ISO extracted upper case (no Rock Ridge names): "
+                     f"lower-cased {count} entries")
+
+    # upper-case directories -> the lower-case names the firmware uses
+    for name in EXPECTED_DIRS:
+        wanted = iso_tree / name
+        if wanted.exists():
+            continue
+        found = find_dir(iso_tree, name)
+        if found:
+            found.rename(wanted)
+            notes.append(f"{found.name}/ -> {name}/")
+
+    # and the three files everything depends on, wherever they ended up
+    for relative, names in EXPECTED_FILES.items():
+        target = iso_tree / relative
+        if target.exists():
+            continue
+        found = find_file(iso_tree, names)
+        if not found:
+            continue
+        util.ensure_dir(target.parent)
+        try:
+            found.rename(target)
+        except OSError:
+            shutil.copy2(found, target)
+        notes.append(f"{found.relative_to(iso_tree)} -> {relative}")
+
+    return notes
+
+
+def tree_summary(iso_tree: Path, limit: int = 24) -> list[str]:
+    """What is actually in the extracted ISO - for when something is missing."""
+    lines = []
+    try:
+        for entry in sorted(iso_tree.iterdir())[:limit]:
+            if entry.is_dir():
+                children = sorted(c.name for c in entry.iterdir())[:8]
+                lines.append(f"  {entry.name}/  ({', '.join(children)}"
+                             f"{', …' if len(children) == 8 else ''})")
+            else:
+                lines.append(f"  {entry.name}  "
+                             f"({entry.stat().st_size / 1e6:.1f} MB)")
+    except OSError as exc:
+        lines.append(f"  (cannot read {iso_tree}: {exc})")
+    return lines or ["  (the extracted ISO is empty)"]
+
+
 def extract_gui(iso_tree: Path, dest: Path) -> str:
     """gui.tar.gz holds the fonts and images - the UI will not start without it."""
     archive = iso_tree / "images/gui.tar.gz"
     if not archive.exists():
-        alternatives = list(iso_tree.rglob("gui.tar.gz"))
-        if not alternatives:
+        found = find_file(iso_tree, ("gui.tar.gz", "gui.tgz"))
+        if not found:
             return "gui.tar.gz not found in the ISO (fonts will be missing)"
-        archive = alternatives[0]
+        archive = found
     util.step(f"unpacking {archive.name} -> {dest}")
     util.ensure_dir(dest)
     with tarfile.open(archive, "r:gz") as tar:
@@ -940,11 +1132,14 @@ def extract_rootfs(iso_tree: Path, dest: Path) -> str:
     """rootfs.cramfs -> the soft-float userland the player runs inside."""
     image = iso_tree / "images/rootfs.cramfs"
     if not image.exists():
-        found = list(iso_tree.rglob("rootfs.cramfs"))
+        found = find_file(iso_tree, ("rootfs.cramfs",))
         if not found:
-            raise util.Fail("rootfs.cramfs is not in this ISO - is it really "
-                            "XDJ-RX3 firmware?")
-        image = found[0]
+            raise util.Fail(
+                "rootfs.cramfs is not in this ISO.  What it does contain:\n"
+                + "\n".join(tree_summary(iso_tree)) +
+                "\nIf that does not look like XDJ-RX3 firmware, the .UPD is "
+                "for another model or the download is damaged.")
+        image = found
     util.step(f"unpacking {image.name} ({image.stat().st_size / 1e6:.1f} MB) "
               f"-> {dest}")
     if not cramfs.is_cramfs(image):
@@ -1032,6 +1227,8 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
     if force and iso_tree.exists():
         shutil.rmtree(iso_tree)
     notes.append(f"ISO unpacked with {extract_iso(iso, iso_tree)}")
+    for note in normalise_iso_tree(iso_tree):
+        notes.append(f"layout: {note}")
 
     release = util.read_text(iso_tree / "images/release.txt").strip()
     if release:
@@ -1050,8 +1247,18 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
     else:
         notes.append(f"rootfs: {extract_rootfs(iso_tree, rootfs)}")
 
-    # 5. what we ended up with
+    # 5. the player.  Normally it is in the ISO tree; some dumps only carry it
+    #    inside the root filesystem, so look there before concluding anything.
     player = iso_tree / "pdj/rbp"
+    if not player.exists():
+        from_rootfs = find_file(rootfs, ("rbp",))
+        if from_rootfs:
+            util.ensure_dir(player.parent)
+            shutil.copy2(from_rootfs, player)
+            os.chmod(player, 0o755)
+            notes.append(f"player taken from the root filesystem "
+                         f"({from_rootfs.relative_to(rootfs)})")
+
     if player.exists():
         import hashlib
         digest = hashlib.md5(player.read_bytes()).hexdigest()
@@ -1064,7 +1271,18 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
         else:
             notes.append("player md5 matches the stock v1.20 binary")
     else:
-        util.warn("pdj/rbp is not in this ISO - the payload is incomplete")
+        util.error("the player (pdj/rbp) is not in this ISO.")
+        print("\nWhat the extracted ISO does contain:")
+        for line in tree_summary(iso_tree):
+            print(line)
+        print(f"\nLook for the player yourself with:\n"
+              f"    sudo find {iso_tree} -iname 'rbp*'\n"
+              f"If it is there under another name, copy it to "
+              f"{iso_tree}/pdj/rbp and re-run the build.\n"
+              f"If it is not there at all, the .UPD is for a different model "
+              f"or the download is damaged - delete\n"
+              f"    {cfg.payload}/firmware\n"
+              f"and run `launch.py firmware --force` to fetch it again.")
     loader = rootfs / "lib/ld-linux.so.3"
     notes.append(f"loader: {loader} "
                  f"({'present' if loader.exists() else 'MISSING'})")
@@ -1079,7 +1297,7 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
     return notes
 
 
-def describe(cfg) -> list[str]:
+def describe(cfg, verbose: bool = False) -> list[str]:
     state = status(cfg)
     rows = [
         f"payload dir: {state['payload']}",
@@ -1091,6 +1309,22 @@ def describe(cfg) -> list[str]:
     ]
     if state["release"]:
         rows.append(f"firmware version: {state['release']}")
+
+    cache = state["payload"] / "firmware"
+    downloads = sorted(cache.glob("*")) if cache.is_dir() else []
+    if downloads:
+        rows.append("downloaded:")
+        rows += [f"  {d.name}  ({d.stat().st_size / 1e6:.1f} MB)"
+                 for d in downloads if d.is_file()]
+
+    if state["iso_tree"].is_dir() and (verbose or not state["have_player"]):
+        rows.append(f"inside {state['iso_tree']}:")
+        rows += tree_summary(state["iso_tree"])
+        if not state["have_player"]:
+            found = find_file(state["iso_tree"], ("rbp",))
+            rows.append(f"  a file called 'rbp' was "
+                        + (f"found at {found.relative_to(state['iso_tree'])}"
+                           if found else "NOT found anywhere in the tree"))
     if not ready(cfg):
-        rows.append("run: sudo python3 launch.py firmware")
+        rows.append("run: sudo python3 launch.py firmware --force")
     return rows

@@ -45,13 +45,11 @@ ISO_PVD_SECTOR = 64          # where the "CD001" signature must appear
 # downloaded by hand and nothing has to be chosen.  Every published patch set
 # for this player was derived from v1.20.
 OFFICIAL = {
-    "version": "1.20",
-    "url": "https://downloads.support.alphatheta.com/firmwares/"
-           "all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
-    "zip_name": "XDJ-RX3_v120.zip",
-    "member": "XDJ-RX3_v120/XDJ-RX3.UPD",
-    "upd_size": 69_171_216,          # documented by the upstream tutorial
-    "rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6",   # the stock v1.20 player
+    "version": "1.30",
+    "url": "https://downloads.support.alphatheta.com/firmwares/all-in-one-dj-systems/XDJ-AZ/XDJAZv130.zip",
+    "zip_name": "XDJAZv130.zip",
+    "member": "XDJAZv130.UPD", 
+    "upd_size": 177_507_328,  # Based on 173.347 KB shown in the provided screenshot
 }
 
 # Where the firmware is fetched from, in order, until one yields a usable file.

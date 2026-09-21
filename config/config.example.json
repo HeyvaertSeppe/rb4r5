@@ -77,6 +77,14 @@
     "ulimit_procs": 1024,
     "env": {}
   },
+  "firmware": {
+    "auto_download": true,
+    "url": "https://downloads.support.alphatheta.com/firmwares/all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
+    "zip_name": "XDJ-RX3_v120.zip",
+    "version": "1.20",
+    "expect_upd_size": 69171216,
+    "verify_rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6"
+  },
   "build": {
     "primebox": "/opt/rb4r5/PrimeBox",
     "neon": true,

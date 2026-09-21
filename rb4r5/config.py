@@ -111,6 +111,20 @@ DEFAULTS: dict = {
         "ulimit_procs": 1024,
         "env": {},                       # extra environment for rbp
     },
+    # ---- firmware ----------------------------------------------------------
+    "firmware": {
+        # The launcher fetches the firmware this port is built around straight
+        # from AlphaTheta, so there is nothing to pick.  A .UPD (or their zip)
+        # already sitting in the payload directory is used instead, so an
+        # offline Pi works too.
+        "auto_download": True,
+        "url": ("https://downloads.support.alphatheta.com/firmwares/"
+                "all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip"),
+        "zip_name": "XDJ-RX3_v120.zip",
+        "version": "1.20",
+        "expect_upd_size": 69171216,
+        "verify_rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6",
+    },
     # ---- build -------------------------------------------------------------
     "build": {
         "primebox": "/opt/rb4r5/PrimeBox",

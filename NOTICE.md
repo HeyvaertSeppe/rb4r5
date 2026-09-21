@@ -23,8 +23,14 @@ any of their subsidiaries.
 
 * **No XDJ-RX3 firmware** (`.UPD`), no decrypted firmware image, no `rootfs`,
   no `gui/` assets and **no `rbp` player binary**. These are
-  Pioneer/AlphaTheta property. You supply your own, extracted from firmware you
-  legally obtained — [docs/03-payload.md](docs/03-payload.md).
+  Pioneer/AlphaTheta property.
+
+  The launcher *downloads* the official update package from AlphaTheta's own
+  server (the same URL upstream's `get-firmware.sh` uses) and unpacks it on
+  your machine, which is convenience, not redistribution: no vendor bytes are
+  stored in this repository or served from it, and you can supply the file
+  yourself instead (`--upd`, or drop it in the payload directory).
+  See [docs/03-payload.md](docs/03-payload.md).
 * **No firmware decryption key.** AlphaTheta published it in their own GPL
   source distribution; you obtain it yourself. It is gitignored here.
 * **No rekordbox music, playlists, analysis data or databases** (`export.pdb`),

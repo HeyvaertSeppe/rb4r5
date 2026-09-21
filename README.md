@@ -42,6 +42,7 @@ listed as such:
 | Launcher, supervisor, config, diagnostics | ✅ run and exercised (`tools/tests/`) |
 | Firmware decryption (`.UPD` → ISO) | ✅ byte-for-byte against an independent AES implementation |
 | Firmware unpacking (cramfs rootfs, gui, key discovery) | ✅ end-to-end on a synthetic firmware image |
+| Firmware download from AlphaTheta | ⚠️ the URL is upstream's own and the code is tested with the download stubbed — this session's network policy blocked the host, so the real fetch is unrun |
 | FLX4 MIDI → engine translation | ✅ end-to-end tested with synthetic MIDI (`tools/flx4-selftest.sh`) |
 | Touch gestures → engine controls | ✅ 18 offline checks over synthetic evdev frames |
 | Boot-config edits (`config.txt`, `cmdline.txt`) | ✅ idempotent + reversible, tested on fixtures |
@@ -55,32 +56,35 @@ listed as such:
 [docs/11-porting-notes.md](docs/11-porting-notes.md) has the full list of what
 changed, what was kept, and what to check first on hardware.
 
-## What you must supply
+## What you have to supply
 
-One file: the **XDJ-RX3 firmware update** (`.UPD`) you downloaded. On the first
-run the launcher shows you every `.UPD` it can find and asks which one — after
-that it decrypts it, unpacks the ISO, the fonts and the soft-float root
-filesystem, patches the player and builds everything, by itself.
+Almost nothing. The firmware this port is built around is baked into the
+launcher — the official **XDJ-RX3 v1.20** update package, which AlphaTheta
+publish themselves — so on a first run it downloads and unpacks it with no
+questions asked:
 
 ```
-Select your XDJ-RX3 firmware file
-=================================
-
-   1) /home/pi/Downloads/XDJ-RX3.UPD                  69.2 MB  2026-09-21 09:16
-   2) /media/pi/USB-STICK/firmware/XDJ-RX3_v120.UPD   69.2 MB  2026-09-18 10:16
-
-   p) type a path      q) cancel
-
-Select the firmware file [1]:
+[==] downloading the XDJ-RX3 v1.20 firmware (~66 MB) from AlphaTheta
+[--] https://downloads.support.alphatheta.com/firmwares/all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip
+[ok] downloaded XDJ-RX3_v120.zip (66.0 MB)
+[==] extracting XDJ-RX3_v120/XDJ-RX3.UPD from XDJ-RX3_v120.zip
+[==] decrypting XDJ-RX3.UPD (69.2 MB)
+[ok] ISO 9660 signature found; wrote XDJRX3.iso (69.2 MB in 1.4s)
+[==] unpacking rootfs.cramfs (48.3 MB) -> /opt/rb4r5/payload/XDJRX3-rootfs
 ```
 
-The firmware key (`aes256.key`, published by AlphaTheta in their own GPL source
-distribution) is found automatically if it is anywhere sensible — next to the
-`.UPD` is easiest — and you are only asked for it if it is not.
+The firmware **binary is not in this repository** — it is AlphaTheta's
+copyrighted firmware, so rb4r5 fetches it from their own server instead of
+redistributing it. The effect is the same for you: nothing to download, nothing
+to choose. An offline Pi works too: drop their zip (or the `.UPD`) into
+`/opt/rb4r5/payload` and it is used instead.
 
-This repository contains **no Pioneer/AlphaTheta firmware, no `rbp` binary, no
-decryption key and no music database**; see
-[docs/03-payload.md](docs/03-payload.md) and [NOTICE.md](NOTICE.md).
+The one thing rb4r5 genuinely cannot get for you is the firmware **key**
+(`aes256.key`), which AlphaTheta published in their GPL source distribution.
+It is found automatically if it is anywhere sensible — next to the firmware, in
+the payload directory, or *inside* one of their GPL archives if you have one —
+and you are asked only if none of that works. After the first time it is
+remembered. See [docs/03-payload.md](docs/03-payload.md).
 
 ## Hardware
 

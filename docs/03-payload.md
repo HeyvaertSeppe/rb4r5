@@ -1,40 +1,71 @@
-# 03 — The firmware: pick your `.UPD`, the launcher does the rest
+# 03 — The firmware
 
 rb4r5 contains **no Pioneer/AlphaTheta firmware, no `rbp` binary, no decryption
-key and no music database**. It is the glue that runs *your* copy on *your*
-hardware. What you supply is one file: the XDJ-RX3 firmware update you
-downloaded.
+key and no music database**. What it does contain is the *address* of the
+firmware this port is built around, so there is nothing for you to fetch or
+pick:
+
+```python
+# rb4r5/firmware.py
+OFFICIAL = {
+    "version": "1.20",
+    "url": "https://downloads.support.alphatheta.com/firmwares/"
+           "all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
+    "member": "XDJ-RX3_v120/XDJ-RX3.UPD",
+    "upd_size": 69_171_216,
+    "rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6",
+}
+```
+
+On a first run — including the very first `sudo python3 launch.py` — the
+launcher downloads that package from AlphaTheta's own server, pulls the `.UPD`
+out of the zip, decrypts it, unpacks it and checks that the player inside is
+the stock v1.20 binary. You are not asked anything.
 
 ```sh
 PI$ sudo python3 launch.py firmware
+[==] downloading the XDJ-RX3 v1.20 firmware (~66 MB) from AlphaTheta
+[ok] downloaded /opt/rb4r5/payload/firmware/XDJ-RX3_v120.zip (66.0 MB)
+[==] extracting XDJ-RX3_v120/XDJ-RX3.UPD from XDJ-RX3_v120.zip
+[ok] firmware: /opt/rb4r5/payload/firmware/XDJ-RX3.UPD (69.2 MB)
+[==] decrypting XDJ-RX3.UPD (69.2 MB)
+[ok] ISO 9660 signature found; wrote /opt/rb4r5/payload/XDJRX3.iso
+...
+     player md5 matches the stock v1.20 binary
 ```
 
+**Why the file itself is not committed here.** It is AlphaTheta's copyrighted
+firmware; putting 69 MB of it in a public repository is redistribution, which
+is both unlawful and the fastest way to get the repository taken down. The
+upstream projects take the same line (PrimeBox ships a download script, not the
+firmware). Fetching it from the vendor at run time gives you the identical
+result with none of that risk.
+
+## Doing it without a network
+
+Everything works offline as long as the file is somewhere deliberate. Put
+either AlphaTheta's zip or the `.UPD` from it in the payload directory:
+
+```sh
+PI$ sudo mkdir -p /opt/rb4r5/payload
+PI$ sudo cp /media/usb/XDJ-RX3_v120.zip /opt/rb4r5/payload/
+PI$ sudo python3 launch.py firmware          # uses it, downloads nothing
 ```
-Select your XDJ-RX3 firmware file
-=================================
 
-   1) /home/pi/Downloads/XDJ-RX3.UPD                  69.2 MB  2026-09-21 09:16
-   2) /media/pi/USB-STICK/firmware/XDJ-RX3_v120.UPD   69.2 MB  2026-09-18 10:16
+Or name it explicitly, which always wins:
 
-This is the .UPD you downloaded from AlphaTheta (XDJ-RX3 v1.20, about 69 MB).
-Everything after this is automatic.
-
-   p) type a path
-   q) cancel
-
-Select the firmware file [1]:
+```sh
+PI$ sudo python3 launch.py firmware --upd /media/usb/XDJ-RX3.UPD
+PI$ sudo python3 launch.py firmware --offline      # never touch the network
+PI$ sudo python3 launch.py firmware --ask          # show the file picker
 ```
 
-From there it decrypts, unpacks and lays out everything the build needs. The
-same thing happens by itself the first time you run `sudo python3 launch.py`,
-so in practice you never type this command — you just answer the question.
+The order it uses: `--upd` → whatever is already in `/opt/rb4r5/payload`
+(including a previous download) → the picker if you asked for it → the official
+download → any plausible `.UPD` elsewhere on the machine. A stray file in `/tmp`
+deliberately does *not* outrank the firmware the port was built for.
 
-Read [NOTICE.md](../NOTICE.md) first: extracting firmware may be restricted
-where you live, and running a vendor application on other hardware is very
-likely against its EULA. This is for research, repair, preservation and
-personal interoperability.
-
-## What happens after you choose
+## What happens after you choose## What happens next
 
 ```
 XDJ-RX3.UPD  ──decrypt──▶ XDJRX3.iso ──unpack──▶ XDJRX3/

@@ -65,8 +65,10 @@ def cmd_firmware(args, cfg) -> int:
         for line in firmware.describe(cfg):
             print(line)
         return 0 if firmware.ready(cfg) else 1
+    if args.offline:
+        cfg.set("firmware.auto_download", False)
     _print_notes(firmware.prepare(cfg, upd=args.upd, key=args.key,
-                                  force=args.force, ask=not args.no_ask))
+                                  force=args.force, ask=args.ask))
     util.ok("the firmware payload is ready")
     print()
     print("Next:  sudo python3 launch.py build     (then it runs)")
@@ -124,12 +126,7 @@ def cmd_auto(args, cfg) -> int:
     state = chroot.status(cfg)
     if not state["ready"]:
         if not firmware.ready(cfg):
-            util.step("first run: the player's runtime has not been unpacked yet")
-            print()
-            print("rb4r5 ships no Pioneer firmware, so point it at the .UPD "
-                  "update file you downloaded;")
-            print("everything after that - decrypting, unpacking, patching, "
-                  "building - is automatic.")
+            util.step("first run: fetching and unpacking the player's firmware")
             _print_notes(firmware.prepare(cfg))
         util.step("building the runtime")
         _print_notes(build.all_steps(cfg, REPO))
@@ -340,16 +337,19 @@ def build_parser() -> argparse.ArgumentParser:
                        help="do not ask for confirmation")
     setup.set_defaults(func=cmd_setup)
 
-    fw = sub.add_parser("firmware", help="pick your .UPD and unpack it into a "
-                                        "ready payload")
+    fw = sub.add_parser("firmware", help="get the XDJ-RX3 firmware and unpack "
+                                        "it into a ready payload")
     fw.add_argument("--upd", metavar="FILE",
-                    help="the firmware file (skips the prompt)")
+                    help="use this .UPD (or AlphaTheta's zip) instead of "
+                         "downloading")
     fw.add_argument("--key", metavar="FILE",
                     help="the aes256.key (normally found automatically)")
     fw.add_argument("--force", action="store_true",
                     help="unpack again even if it was done before")
-    fw.add_argument("--no-ask", action="store_true",
-                    help="never prompt; fail instead")
+    fw.add_argument("--ask", action="store_true",
+                    help="show the file picker instead of choosing by itself")
+    fw.add_argument("--offline", action="store_true",
+                    help="never download; use only what is already here")
     fw.add_argument("--show", action="store_true",
                     help="just report what is unpacked already")
     fw.set_defaults(func=cmd_firmware)

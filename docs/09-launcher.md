@@ -14,7 +14,7 @@ sudo python3 launch.py            # do whatever is missing, then run
 |---|---|
 | *(none)* / `auto` | Provision if this is a first run, build if the runtime is incomplete, then run and supervise. |
 | `setup` | Provision only: packages, `config.txt`/`cmdline.txt`, console handover, sysctl, udev, the boot service, default config files. `--no-service` skips enabling the service; `--undo` reverts everything; `-y` does not ask. |
-| `firmware` | Pick your `.UPD` (a menu of everything it can find) and turn it into a ready payload: decrypt, unpack the ISO, the fonts and the rootfs. `--upd FILE` and `--key FILE` skip the questions, `--show` just reports, `--force` redoes it, `--no-ask` never prompts. |
+| `firmware` | Get the XDJ-RX3 firmware and turn it into a ready payload: download it from AlphaTheta (or use a local copy), decrypt, unpack the ISO, the fonts and the rootfs. `--upd FILE` uses your own file or zip, `--key FILE` names the key, `--offline` never touches the network, `--ask` shows a file picker, `--show` just reports, `--force` redoes it. |
 | `payload` | Assemble `<chroot>` from the unpacked firmware (runs `firmware` first if needed). `--force` overwrites. |
 | `build` | Host daemons, LD_PRELOAD shims, the patched player, DirectFB, then install into the chroot. `--no-directfb`, `--no-player`, `--fast-directfb`. |
 | `run` | Prepare the screen and the chroot, start everything, supervise it. `--detach` starts and returns. |
@@ -93,6 +93,7 @@ key=value` (JSON values: `true`, `4`, `"1920x1080@60"`, `null`) or edit it.
 | Section | Keys that matter |
 |---|---|
 | `paths` | `chroot`, `payload`, `work`, `bin`, `logs`, `media` |
+| `firmware` | `auto_download`, `url`, `version`, `expect_upd_size`, `verify_rbp_md5` ([03](03-payload.md)) |
 | `display` | `force_mode`, `hdmi_port`, `rotate`, `quiet_console` ([04](04-display.md)) |
 | `audio` | `card`, `device`, `channels`, `rate`, `format`, `plug`, `cue_mirror`, `cue_on_stereo`, `startup_mute_ms`, `fallback_hdmi` ([05](05-audio.md)) |
 | `controller` | `enabled`, `name`, `jog_ppr`, `filter_init`, `map_file` ([06](06-controller.md)) |
@@ -127,6 +128,7 @@ the chroot and the host.
 ```sh
 $ tools/tests/run-all.sh                       # everything below, in one go
 $ python3 tools/tests/test_firmware_decrypt.py # .UPD decryption vs openssl
+$ python3 tools/tests/test_firmware_fetch.py   # where the firmware comes from
 $ python3 tools/tests/test_firmware_pipeline.py# .UPD -> complete payload
 $ python3 tools/tests/test_cramfs.py           # the cramfs reader
 $ python3 tools/tests/test_audio_parse.py      # ALSA parsing and device choice

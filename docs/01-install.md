@@ -45,24 +45,23 @@ This is idempotent and every change it makes is reversible
 
 Reboot if it says a desktop is still running.
 
-## 4. Supply the firmware
+## 4. The firmware
 
-Put the XDJ-RX3 `.UPD` you downloaded anywhere on the Pi (your home directory, a
-USB stick, `scp` it over) and:
+Nothing to do. The launcher downloads the official XDJ-RX3 v1.20 update package
+from AlphaTheta and unpacks it by itself:
 
 ```sh
-PI$ sudo python3 launch.py firmware
+PI$ sudo python3 launch.py firmware        # or just let step 5 do it
 ```
 
-It lists every `.UPD` it can find, you pick one, and it decrypts and unpacks
-everything else — the player, the fonts, the soft-float root filesystem. The
-firmware key is found automatically wherever it sensibly lives; put it next to
-the `.UPD` and you will never be asked. Details, and where the key comes from:
-[03-payload.md](03-payload.md).
+If the Pi has no network, put AlphaTheta's zip (or the `.UPD` from it) in
+`/opt/rb4r5/payload` and it is used instead. The firmware **key** is the only
+thing that may need your help — it is searched for automatically, including
+inside AlphaTheta's GPL archives if you have one on the Pi, and you are asked
+only if nothing works. See [03-payload.md](03-payload.md).
 
-rb4r5 ships no Pioneer material, and the build also needs the PrimeBox tooling
-(the player's patch set and the DirectFB base diff) — it is cloned into
-`/opt/rb4r5/PrimeBox` automatically on the first build.
+The build also needs the PrimeBox tooling (the player's patch set and the
+DirectFB base diff); it is cloned into `/opt/rb4r5/PrimeBox` automatically.
 
 ## 5. Build
 
@@ -74,7 +73,8 @@ On a Pi 5 this takes roughly:
 
 | Step | Time |
 |---|---|
-| decrypting and unpacking the firmware | under a minute |
+| downloading the firmware (66 MB) | depends on your line |
+| decrypting and unpacking it | under a minute |
 | host daemons (`flx4-bridge`, `rbkeyd`, `fakekbd`) | seconds |
 | assembling the chroot from the payload | 1–2 min |
 | the four LD_PRELOAD shims | seconds |

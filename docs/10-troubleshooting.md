@@ -27,7 +27,11 @@ is organised by what you are seeing.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| The menu lists no `.UPD` files | it is somewhere the scan does not reach (it looks in `~`, `/home`, `/media`, `/mnt`, `/root`, `/tmp`, `/srv`, `/boot/firmware` and the payload dir, three levels deep) | press `p` and type the path, or `--upd /path/to/XDJ-RX3.UPD` |
+| `could not download …alphatheta.com…` | no network, DNS, or the vendor moved the file | fetch the zip on another machine, put it in `/opt/rb4r5/payload`, and re-run — or `--upd /path/to/file` |
+| It downloads every time | the payload directory is not writable, so nothing is cached | check `/opt/rb4r5/payload/firmware` |
+| It used the wrong file | a `.UPD` was already in the payload directory | remove it, or name the one you want with `--upd` |
+| `downloaded N bytes, expected 69171216` | a truncated download, or a different firmware version | delete `/opt/rb4r5/payload/firmware` and re-run |
+| `the player's md5 is …, not the stock v1.20` | a different firmware version | the published patch sets were derived from v1.20; expect the build to fail |
 | Your file is listed as "does not look right" | the body is not 512-byte aligned plus a 16-byte trailer | it is probably not an XDJ-RX3 `.UPD` — a partial download does this too |
 | `no working firmware key found` | no `aes256.key` anywhere it looked, or the one it found is for something else | get it from AlphaTheta's GPL source distribution ([03-payload](03-payload.md)) and drop it next to the `.UPD` |
 | `decryption produced something that is not an ISO image` | wrong key, or a corrupt download | check the `.UPD` size (v1.20 is 69,171,216 bytes) |

@@ -38,6 +38,21 @@ SECTOR = 512
 TRAILER = 16
 ISO_PVD_SECTOR = 64          # where the "CD001" signature must appear
 
+# The firmware this port is built around.  AlphaTheta publish the update
+# package themselves; rb4r5 fetches it from them rather than redistributing it
+# (it is their copyrighted firmware - see NOTICE.md), so nothing has to be
+# downloaded by hand and nothing has to be chosen.  Every published patch set
+# for this player was derived from v1.20.
+OFFICIAL = {
+    "version": "1.20",
+    "url": "https://downloads.support.alphatheta.com/firmwares/"
+           "all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
+    "zip_name": "XDJ-RX3_v120.zip",
+    "member": "XDJ-RX3_v120/XDJ-RX3.UPD",
+    "upd_size": 69_171_216,          # documented by the upstream tutorial
+    "rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6",   # the stock v1.20 player
+}
+
 # Where to look for a .UPD or a key, in order of likelihood.
 SCAN_ROOTS = [
     ".", "~", "~/Downloads", "~/Desktop", "~/firmware", "/root", "/root/Downloads",
@@ -188,6 +203,189 @@ def choose_file(title: str, candidates: list[dict], what: str = "file",
         if path.is_file():
             return path
         print("  not a valid choice")
+
+
+# --------------------------------------------------------------------------
+# getting the firmware itself
+# --------------------------------------------------------------------------
+def download_file(url: str, dest: Path, expect_size: int = 0) -> Path:
+    """Fetch a URL to a file, resuming and showing progress where possible."""
+    util.ensure_dir(dest.parent)
+    partial = dest.with_suffix(dest.suffix + ".part")
+
+    if util.have("curl"):
+        cmd = ["curl", "-L", "--fail", "--retry", "3", "--retry-delay", "2",
+               "-C", "-", "-o", str(partial), url]
+        if sys.stderr.isatty():
+            cmd.insert(1, "--progress-bar")
+        else:
+            cmd.insert(1, "-sS")
+        proc = util.run(cmd, check=False, capture=False, timeout=3600)
+    elif util.have("wget"):
+        proc = util.run(["wget", "-c", "-O", str(partial), url],
+                        check=False, capture=False, timeout=3600)
+    else:
+        proc = _download_with_python(url, partial)
+
+    if proc.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        raise util.Fail(
+            f"could not download {url}\n"
+            "Check the Pi's network, or fetch the file on another machine and "
+            "drop it next to the launcher - it is picked up automatically.")
+    size = partial.stat().st_size
+    if expect_size and size != expect_size:
+        util.warn(f"downloaded {size} bytes, expected {expect_size} "
+                  "- continuing, but check the result")
+    partial.replace(dest)
+    return dest
+
+
+def _download_with_python(url: str, dest: Path):
+    """Last resort when neither curl nor wget is installed."""
+    import urllib.request
+
+    class Result:
+        returncode = 0
+
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, \
+                open(dest, "wb") as handle:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                done += len(chunk)
+                if total and sys.stderr.isatty():
+                    print(f"\r  {done / 1e6:6.1f} / {total / 1e6:.1f} MB", 
+                          end="", file=sys.stderr)
+        if sys.stderr.isatty():
+            print(file=sys.stderr)
+    except Exception as exc:                      # noqa: BLE001
+        util.warn(f"download failed: {exc}")
+        Result.returncode = 1
+    return Result()
+
+
+def upd_from_zip(archive: Path, dest_dir: Path) -> Path:
+    """Pull the .UPD out of AlphaTheta's zip."""
+    import zipfile
+
+    util.ensure_dir(dest_dir)
+    with zipfile.ZipFile(archive) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(".upd")]
+        if not names:
+            raise util.Fail(f"{archive} contains no .UPD file "
+                            f"(members: {', '.join(zf.namelist()[:5])})")
+        member = names[0]
+        target = dest_dir / Path(member).name
+        util.step(f"extracting {member} from {archive.name}")
+        with zf.open(member) as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+    return target
+
+
+def fetch_official(cfg, force: bool = False) -> Path:
+    """Download (once) the firmware this port is built around."""
+    cache = util.ensure_dir(Path(cfg.get("paths.payload")) / "firmware")
+    url = cfg.get("firmware.url") or OFFICIAL["url"]
+    zip_path = cache / (cfg.get("firmware.zip_name") or OFFICIAL["zip_name"])
+
+    existing = sorted(cache.glob("*.UPD")) + sorted(cache.glob("*.upd"))
+    if existing and not force:
+        util.info(f"using the firmware already downloaded: {existing[0]}")
+        return existing[0]
+
+    if not zip_path.exists() or force:
+        util.step(f"downloading the XDJ-RX3 v{cfg.get('firmware.version') or OFFICIAL['version']} "
+                  f"firmware (~66 MB) from AlphaTheta")
+        util.info(url)
+        download_file(url, zip_path)
+        util.ok(f"downloaded {zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB)")
+    else:
+        util.info(f"using the archive already downloaded: {zip_path}")
+
+    upd = upd_from_zip(zip_path, cache)
+    expect = int(cfg.get("firmware.expect_upd_size") or OFFICIAL["upd_size"])
+    size = upd.stat().st_size
+    if expect and size != expect:
+        util.warn(f"{upd.name} is {size} bytes; v1.20 is {expect}.  "
+                  "A different firmware version may not patch.")
+    util.ok(f"firmware: {upd} ({size / 1e6:.1f} MB)")
+    return upd
+
+
+def locate_upd(cfg, explicit=None, ask: bool = False,
+               allow_download: bool = True) -> Path:
+    """Decide which .UPD to use.  Deliberate choices beat accidental ones.
+
+        1. --upd, if you passed one
+        2. what was downloaded or placed in the payload directory before
+        3. a .UPD or AlphaTheta's zip sitting in the payload directory
+        4. the picker, but only with --ask
+        5. the official download (the normal path - nothing to choose)
+        6. failing that, a .UPD found elsewhere on this machine
+
+    A stray file in /tmp or an old download in ~ deliberately does *not* win
+    over the firmware this port is built around; you have to put it in the
+    payload directory or name it to mean it.
+    """
+    cache = cfg.payload / "firmware"
+
+    if explicit:
+        path = Path(os.path.expanduser(str(explicit)))
+        if not path.is_file():
+            raise util.Fail(f"no such file: {path}")
+        if path.suffix.lower() == ".zip":
+            return upd_from_zip(path, util.ensure_dir(cache))
+        return path
+
+    # 2 + 3: the payload directory is where a deliberate copy lives
+    for directory in (cache, cfg.payload):
+        if not directory.is_dir():
+            continue
+        for found in sorted(directory.glob("*.UPD")) + \
+                sorted(directory.glob("*.upd")):
+            util.info(f"firmware: {found}")
+            return found
+        for found in sorted(directory.glob("*.zip")):
+            if "xdj" in found.name.lower() or "rx3" in found.name.lower():
+                util.info(f"firmware archive: {found}")
+                return upd_from_zip(found, util.ensure_dir(cache))
+
+    # 4: only when explicitly asked for
+    if ask and interactive():
+        picked = choose_file(
+            "Select your XDJ-RX3 firmware file", find_upd_files([cfg.payload]),
+            what="firmware file",
+            hint="Leave this and rb4r5 downloads the official v1.20 firmware "
+                 "from AlphaTheta by itself.")
+        if picked:
+            return picked
+
+    # 5: the normal path
+    if allow_download and cfg.get("firmware.auto_download", True):
+        try:
+            return fetch_official(cfg)
+        except util.Fail as exc:
+            util.warn(str(exc).splitlines()[0])
+            util.info("looking for a firmware file on this machine instead")
+
+    # 6: anything plausible lying around
+    candidates = [c for c in find_upd_files([cfg.payload]) if c["plausible"]]
+    if candidates:
+        chosen = candidates[0]["path"]
+        util.info(f"firmware: {chosen} (found on this machine)")
+        return chosen
+
+    raise util.Fail(
+        "no firmware available.\n"
+        f"Either let rb4r5 download it (needs network):\n"
+        f"    {cfg.get('firmware.url') or OFFICIAL['url']}\n"
+        f"or fetch that zip on another machine and drop it in {cfg.payload}.")
 
 
 # --------------------------------------------------------------------------
@@ -377,6 +575,55 @@ def find_key_files(upd_path: Path, payload: Path, primebox: Path) -> list[Path]:
     return ordered
 
 
+def key_from_archives(upd_path: Path, payload: Path) -> Path | None:
+    """Look for aes256.key inside archives the user already downloaded.
+
+    AlphaTheta's GPL source distribution is a set of very large tarballs with
+    the key somewhere inside.  Unpacking one by hand to find a 32-byte file is
+    miserable, so if such an archive is sitting next to the firmware (or in the
+    payload directory) we read it out directly.
+    """
+    import tarfile as tar_module
+    import zipfile
+
+    searched = []
+    for directory in {upd_path.parent, payload, Path.cwd()}:
+        try:
+            searched += [p for p in directory.iterdir()
+                         if p.is_file() and p.suffix.lower() in
+                         (".gz", ".bz2", ".xz", ".zip", ".tar", ".tgz")]
+        except OSError:
+            continue
+    if not searched:
+        return None
+
+    out = payload / "aes256.key"
+    for archive in searched:
+        util.info(f"looking for the key inside {archive.name} "
+                  f"({archive.stat().st_size / 1e6:.0f} MB)…")
+        try:
+            if zipfile.is_zipfile(archive):
+                with zipfile.ZipFile(archive) as zf:
+                    for name in zf.namelist():
+                        if Path(name).name == "aes256.key":
+                            out.write_bytes(zf.read(name))
+                            util.ok(f"found {name} in {archive.name}")
+                            return out
+            elif tar_module.is_tarfile(archive):
+                with tar_module.open(archive) as tf:
+                    for member in tf:
+                        if member.isfile() and \
+                                Path(member.name).name == "aes256.key":
+                            handle = tf.extractfile(member)
+                            if handle:
+                                out.write_bytes(handle.read())
+                                util.ok(f"found {member.name} in {archive.name}")
+                                return out
+        except (OSError, ValueError, tar_module.TarError) as exc:
+            util.debug(f"  {archive.name}: {exc}")
+    return None
+
+
 def resolve_key(upd_path: Path, payload: Path, primebox: Path,
                 explicit: Path | None = None, ask: bool = True) -> Path:
     """Find a key that actually decrypts this file, asking only if we must."""
@@ -397,6 +644,12 @@ def resolve_key(upd_path: Path, payload: Path, primebox: Path,
             util.ok(f"key: {candidate}")
             return candidate
         util.debug(f"  {candidate}: does not decrypt this file")
+
+    # the GPL archives the key ships in may already be on this machine
+    from_archive = key_from_archives(upd_path, payload)
+    if from_archive and key_works(upd_path, from_archive):
+        util.ok(f"key: {from_archive} (extracted from an archive)")
+        return from_archive
 
     if not ask or not interactive():
         raise util.Fail(
@@ -568,7 +821,7 @@ def ready(cfg) -> bool:
 
 
 def prepare(cfg, upd=None, key=None, force: bool = False,
-            ask: bool = True) -> list[str]:
+            ask: bool = False) -> list[str]:
     """Pick the .UPD (if needed) and turn it into a complete payload."""
     payload = util.ensure_dir(cfg.payload)
     primebox = Path(cfg.get("build.primebox"))
@@ -580,34 +833,10 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
                 + (f" (firmware {state['release']})" if state["release"] else ""),
                 "pass --force to unpack it again"]
 
-    # 1. the one thing you have to choose
-    if upd:
-        upd_path = Path(os.path.expanduser(str(upd)))
-        if not upd_path.is_file():
-            raise util.Fail(f"no such file: {upd_path}")
-    else:
-        util.step("looking for XDJ-RX3 firmware (.UPD) files")
-        candidates = find_upd_files([payload])
-        if len(candidates) == 1 and candidates[0]["plausible"] and not ask:
-            upd_path = candidates[0]["path"]
-        elif not interactive() and candidates and candidates[0]["plausible"]:
-            upd_path = candidates[0]["path"]
-            util.info(f"not a terminal; taking the only sensible candidate: "
-                      f"{upd_path}")
-        elif not interactive():
-            raise util.Fail(
-                "no firmware file given and no terminal to ask on.  Run:\n"
-                "    sudo python3 launch.py firmware --upd /path/to/XDJ-RX3.UPD")
-        else:
-            chosen = choose_file(
-                "Select your XDJ-RX3 firmware file",
-                candidates, what="firmware file",
-                hint="This is the .UPD you downloaded from AlphaTheta "
-                     "(XDJ-RX3 v1.20, about 69 MB).\nEverything after this is "
-                     "automatic.")
-            if chosen is None:
-                raise util.Fail("cancelled")
-            upd_path = chosen
+    # 1. the firmware itself - downloaded from AlphaTheta unless one is already
+    #    here.  Nothing to choose, nothing to ask.
+    upd_path = locate_upd(cfg, explicit=upd, ask=ask,
+                          allow_download=cfg.get("firmware.auto_download", True))
 
     ok, note = looks_like_upd(upd_path)
     if not ok:
@@ -659,8 +888,16 @@ def prepare(cfg, upd=None, key=None, force: bool = False,
     # 5. what we ended up with
     player = iso_tree / "pdj/rbp"
     if player.exists():
+        import hashlib
+        digest = hashlib.md5(player.read_bytes()).hexdigest()
+        expected = cfg.get("firmware.verify_rbp_md5") or OFFICIAL["rbp_md5"]
         notes.append(f"player: {player} "
-                     f"({player.stat().st_size / 1e6:.1f} MB)")
+                     f"({player.stat().st_size / 1e6:.1f} MB, md5 {digest})")
+        if expected and digest != expected:
+            util.warn(f"the player's md5 is {digest}, not the stock v1.20 "
+                      f"{expected} - the published patch sets may not apply")
+        else:
+            notes.append("player md5 matches the stock v1.20 binary")
     else:
         util.warn("pdj/rbp is not in this ISO - the payload is incomplete")
     loader = rootfs / "lib/ld-linux.so.3"

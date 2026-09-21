@@ -183,6 +183,19 @@ appeared to be at — which looks exactly like "touch does not work". If the
 screen is not showing the UI correctly, fix that first and re-test touch
 afterwards.
 
+**With black bars, the panel and the UI are different rectangles.** Since
+`display.fit` defaults to `aspect`, the picture does not reach the edges of
+the glass: on a 2880×1620 panel the frame is 2592×1620 with 144 px of black
+each side. The daemon reads the framebuffer geometry at start-up, works out
+the same rectangle the driver uses (`fb.frame_rect()`, tied to the C by a
+test), and maps every contact through it — so a touch two thirds across the
+glass is two thirds across the *UI*, and a press on a bar presses nothing.
+`launch.py calibrate` prints the rectangle it is using:
+
+```
+the UI covers 90% x 100% of the panel at 5%,0% (black bars) - touches are mapped through that
+```
+
 Once the picture is right:
 
 ```sh

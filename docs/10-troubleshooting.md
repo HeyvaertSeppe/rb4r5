@@ -51,6 +51,9 @@ guessing.
 | Colours look wrong in some other way | the framebuffer's layout is not one the driver recognises, or the panel is BGR | `sudo python3 launch.py fbtest` — photograph it and compare with the printed bar order; `launch.py doctor` prints the bitfields |
 | The picture is stretched horizontally | `display.fit` is set to `fill` | the default is `aspect` (black bars, never distorted): `launch.py config --set display.fit=aspect` |
 | The picture is coarse, blocky, "low resolution" | nearest-neighbour scaling from 1280x800 | the default is now `bilinear`: `launch.py config --set display.scale=bilinear`, and check `doctor` says the driver "can interpolate" |
+| Still soft even with bilinear | the monitor is being driven above its real panel resolution and downscaling in its own scaler, so the picture is resampled twice | `doctor` lists the modes the monitor offers; pin its native one with `display.force_mode`, e.g. `"1920x1080@60"` |
+| Touches are offset sideways | a touch daemon from before the black bars existed | `git pull`; `calibrate` prints the rectangle it maps through |
+| `the player cannot be executed: ld-linux.so.3 would not run: --version: ...` | a false alarm - glibc 2.13's loader predates `--version` and reports it as a missing library, which *is* the loader running | fixed; `git pull` |
 | **`fbtest` looks right but the player does not** | the player is loading a display driver from an older build | `sudo python3 launch.py build --fast-directfb`. `doctor` prints which markers the installed module is missing, and `run` now refuses to start with a stale one |
 | `launch.py run` says the display driver is not the current build | exactly that | `sudo python3 launch.py build --fast-directfb`, or `run --force` to run it anyway |
 | The image is torn | a frame is published while the panel is scanning it out | harmless on the Pi's single-buffer fbdev emulation; `display.force_mode` can pin a lower refresh |

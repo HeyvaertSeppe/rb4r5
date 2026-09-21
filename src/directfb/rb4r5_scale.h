@@ -182,16 +182,21 @@ rb4r5_px_8888( unsigned int v, int swap )
 /*
  * Blend two 8-8-8 pixels.  w runs 0..256, and because the weights sum to 256
  * the widest field only reaches 255*256 = 0xff00, so the two channels packed
- * into each half never carry into one another.
+ * into each half never carry into one another - and nor do they with the
+ * rounding term added, which tops them out at 0xff80.
+ *
+ * Rounding rather than truncating matters here: a bilinear sample is two of
+ * these chained, one per axis, so truncation loses up to a whole level twice
+ * over, which is enough to show against a floating point reference.
  */
 static inline unsigned int
 rb4r5_lerp888( unsigned int p, unsigned int q, unsigned int w )
 {
      unsigned int iw = 256 - w;
      unsigned int rb = ((((p & 0x00ff00ffu) * iw) +
-                         ((q & 0x00ff00ffu) * w)) >> 8) & 0x00ff00ffu;
+                         ((q & 0x00ff00ffu) * w) + 0x00800080u) >> 8) & 0x00ff00ffu;
      unsigned int g  = ((((p & 0x0000ff00u) * iw) +
-                         ((q & 0x0000ff00u) * w)) >> 8) & 0x0000ff00u;
+                         ((q & 0x0000ff00u) * w) + 0x00008000u) >> 8) & 0x0000ff00u;
      return 0xff000000u | rb | g;
 }
 
@@ -418,9 +423,10 @@ rb4r5_blend_row( const unsigned int *above, const unsigned int *below,
                                          vget_low_u8( b ), vw );
                uint16x8_t hi = vmlal_u8( vmull_u8( vget_high_u8( a ), viw ),
                                          vget_high_u8( b ), vw );
+               /* rounding narrow, to match rb4r5_lerp888 exactly */
                vst1q_u8( (unsigned char *)(out + i),
-                         vcombine_u8( vshrn_n_u16( lo, 8 ),
-                                      vshrn_n_u16( hi, 8 ) ) );
+                         vcombine_u8( vrshrn_n_u16( lo, 8 ),
+                                      vrshrn_n_u16( hi, 8 ) ) );
           }
      }
 #endif
@@ -428,30 +434,53 @@ rb4r5_blend_row( const unsigned int *above, const unsigned int *below,
           out[i] = rb4r5_lerp888( above[i], below[i], w );
 }
 
+/* 8-8-8 -> RGB565, one row.  The destination is 16bpp far more often than
+ * not on a Pi, and at 2592x1620 this is four million pixels a frame, so it
+ * gets the same treatment as the expander. */
+static void
+rb4r5_pack_row_565( const unsigned int *s, unsigned short *t, int n )
+{
+     int i = 0;
+
+#ifdef RB4R5_NEON
+     for (; i + 8 <= n; i += 8) {
+          /* a u32 is b,g,r,a in memory, which is exactly what vld4 wants */
+          uint8x8x4_t px = vld4_u8( (const unsigned char *)(s + i) );
+          uint16x8_t  r  = vshlq_n_u16( vmovl_u8( vshr_n_u8( px.val[2], 3 ) ), 11 );
+          uint16x8_t  g  = vshlq_n_u16( vmovl_u8( vshr_n_u8( px.val[1], 2 ) ),  5 );
+          uint16x8_t  b  = vmovl_u8( vshr_n_u8( px.val[0], 3 ) );
+
+          vst1q_u16( t + i, vorrq_u16( vorrq_u16( r, g ), b ) );
+     }
+#endif
+     for (; i < n; i++) {
+          unsigned int v = s[i];
+          t[i] = (unsigned short)((((v >> 16) & 0xf8) << 8) |
+                                  (((v >> 8) & 0xfc) << 3) |
+                                  ((v & 0xff) >> 3));
+     }
+}
+
 static void
 rb4r5_scale565_bilinear( const unsigned char *src, int sw, int sh, int spitch,
                          unsigned char *dst, const RB4R5Dst *d )
 {
-     static unsigned int rowbuf[2][RB4R5_ROW_MAX];
-     static unsigned int vblend[RB4R5_ROW_MAX];
+     static unsigned int expanded[RB4R5_ROW_MAX];      /* one source row, 8888 */
+     static unsigned int hrow[2][RB4R5_DST_MAX];       /* ... resampled across */
+     static unsigned int vrow[RB4R5_DST_MAX];
      static RB4R5Tap     xmap[RB4R5_DST_MAX];
      static int          xmap_n = -1, xmap_w = -1;
-     unsigned int *above = rowbuf[0], *below = rowbuf[1];
-     int above_row = -1, below_row = -1;
+     unsigned int *top = hrow[0], *bottom = hrow[1];
+     int top_row = -1, bottom_row = -1;
      int n = (sw > RB4R5_ROW_MAX) ? RB4R5_ROW_MAX : sw;
-     /* 32.32 fixed point: at 16.16 the truncated step loses 0.667 per pixel,
-      * which by the right hand edge of a 1920 wide panel has drifted far
-      * enough to pick visibly wrong weights (measured against a floating
-      * point reference: out by up to 6.6/255 on a high contrast edge). */
      unsigned long long ystep = ((unsigned long long)sh << 32) / (unsigned)d->h;
-     RB4R5Tap ytap;
-     int fast565  = (d->fmt == RB_DST_RGB565);
-     int fast8888 = (d->fmt == RB_DST_XRGB8888);
      int x, y;
 
-     if (d->w > RB4R5_DST_MAX)
-          return;                           /* wider than any panel we handle */
-
+     /* The horizontal pass runs once per SOURCE row and the vertical pass
+      * once per DESTINATION row.  That ordering matters when the picture is
+      * enlarged: on a 2880x1620 panel the frame is 2592x1620, so this is 800
+      * horizontal passes instead of 1620, and what is left per destination row
+      * is a two-row blend and a pack - both of which vectorise. */
      if (xmap_n != n || xmap_w != d->w) {
           rb4r5_taps( xmap, d->w, n,
                       ((unsigned long long)n << 32) / (unsigned)d->w );
@@ -460,71 +489,64 @@ rb4r5_scale565_bilinear( const unsigned char *src, int sw, int sh, int spitch,
      }
 
      for (y = 0; y < d->h; y++) {
-          const unsigned int *vrow;
+          const unsigned int *row;
           unsigned char *drow = dst + (size_t)(d->y + y) * d->pitch
                                     + (size_t)d->x * d->bpp;
-          int sr, next;
+          RB4R5Tap ytap;
+          int sr, next, want;
 
           rb4r5_tap( &ytap, y, sh, ystep );
           sr   = ytap.sc;
           next = (sr + 1 < sh) ? sr + 1 : sr;
 
-          /* keep the two source rows expanded, reusing them as y advances,
-           * so each source row is expanded exactly once per frame */
-          if (above_row != sr && below_row == sr) {
-               unsigned int *swapbuf = above;
-               int           swaprow = above_row;
-               above = below;   above_row = below_row;
-               below = swapbuf; below_row = swaprow;
+          /* keep the two resampled rows we need, reusing them as y advances */
+          if (top_row != sr && bottom_row == sr) {
+               unsigned int *swapbuf = top;  int swaprow = top_row;
+               top = bottom;   top_row = bottom_row;
+               bottom = swapbuf; bottom_row = swaprow;
           }
-          if (above_row != sr) {
+          for (want = 0; want < 2; want++) {
+               unsigned int *into = want ? bottom : top;
+               int           line = want ? next : sr;
+
+               if (want && !ytap.w)
+                    break;                   /* the row lands exactly */
+               if ((want ? bottom_row : top_row) == line)
+                    continue;
+
                rb4r5_row_8888( (const unsigned short *)
-                               (src + (size_t)sr * spitch), above, n, 0 );
-               above_row = sr;
-          }
-          if (ytap.w && below_row != next) {
-               rb4r5_row_8888( (const unsigned short *)
-                               (src + (size_t)next * spitch), below, n, 0 );
-               below_row = next;
+                               (src + (size_t)line * spitch), expanded, n, 0 );
+               for (x = 0; x < d->w; x++)
+                    into[x] = xmap[x].w
+                         ? rb4r5_lerp888( expanded[xmap[x].sc],
+                                          expanded[xmap[x].sc + 1], xmap[x].w )
+                         : expanded[xmap[x].sc];
+               if (want)
+                    bottom_row = line;
+               else
+                    top_row = line;
           }
 
           if (!ytap.w)
-               vrow = above;                 /* the row lands exactly */
+               row = top;
           else if (ytap.w >= 256)
-               vrow = below;
+               row = bottom;
           else {
-               rb4r5_blend_row( above, below, vblend, n, ytap.w );
-               vrow = vblend;
+               rb4r5_blend_row( top, bottom, vrow, d->w, ytap.w );
+               row = vrow;
           }
 
-          if (fast565) {
-               unsigned short *o = (unsigned short *)drow;
-               for (x = 0; x < d->w; x++) {
-                    unsigned int v = xmap[x].w
-                         ? rb4r5_lerp888( vrow[xmap[x].sc],
-                                          vrow[xmap[x].sc + 1], xmap[x].w )
-                         : vrow[xmap[x].sc];
-                    o[x] = (unsigned short)((((v >> 16) & 0xf8) << 8) |
-                                            (((v >> 8) & 0xfc) << 3) |
-                                            ((v & 0xff) >> 3));
-               }
-          }
-          else if (fast8888) {
-               unsigned int *o = (unsigned int *)drow;
+          switch (d->fmt) {
+          case RB_DST_RGB565:
+               rb4r5_pack_row_565( row, (unsigned short *)drow, d->w );
+               break;
+          case RB_DST_XRGB8888:
+               memcpy( drow, row, (size_t)d->w * 4 );
+               break;
+          default:
                for (x = 0; x < d->w; x++)
-                    o[x] = xmap[x].w
-                         ? rb4r5_lerp888( vrow[xmap[x].sc],
-                                          vrow[xmap[x].sc + 1], xmap[x].w )
-                         : vrow[xmap[x].sc];
-          }
-          else {
-               for (x = 0; x < d->w; x++) {
-                    unsigned int v = xmap[x].w
-                         ? rb4r5_lerp888( vrow[xmap[x].sc],
-                                          vrow[xmap[x].sc + 1], xmap[x].w )
-                         : vrow[xmap[x].sc];
-                    rb4r5_store_argb( drow + (size_t)x * d->bpp, d->fmt, v );
-               }
+                    rb4r5_store_argb( drow + (size_t)x * d->bpp, d->fmt, row[x] );
+               break;
           }
      }
 }
@@ -555,7 +577,9 @@ rb4r5_scale565( const unsigned char *src, int sw, int sh, int spitch,
          d->fw * d->bpp > d->pitch)
           return;
 
-     if (d->filter) {
+     /* Wider than the precomputed tap map can hold (no panel here is, but
+      * be explicit): fall through to nearest rather than draw nothing. */
+     if (d->filter && d->w <= RB4R5_DST_MAX) {
           rb4r5_scale565_bilinear( src, sw, sh, spitch, dst, d );
           return;
      }

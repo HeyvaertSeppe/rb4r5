@@ -140,12 +140,25 @@ def can_run_arm32(loader: str | None = None) -> tuple[bool, str]:
         return True, "native 32-bit userland"
 
     if loader and Path(loader).exists():
-        proc = subprocess.run([loader, "--version"], capture_output=True,
-                              text=True, timeout=10, check=False)
-        blob = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode == 0 or "ld.so" in blob or "GNU C Library" in blob:
+        # The only question is whether the kernel will execute this 32-bit ELF,
+        # so ANY output from it is a yes - including a complaint.  glibc 2.13's
+        # ld.so predates --version and reports it as a missing library
+        # ("--version: cannot open shared object file"), which read as a
+        # failure but is the loader running and talking.
+        try:
+            proc = subprocess.run([loader], capture_output=True, text=True,
+                                  timeout=10, check=False)
+        except OSError as exc:
+            return False, (f"the kernel refused to execute {loader} ({exc}). "
+                           "Boot a kernel with CONFIG_COMPAT=y (the stock "
+                           "Raspberry Pi OS kernel has it).")
+        except subprocess.TimeoutExpired:
+            return False, f"{loader} hung"
+        blob = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if proc.returncode == 0 or blob:
             return True, f"{loader} runs (the chroot's own soft-float loader)"
-        return False, f"{loader} would not run: {blob.strip()[:120] or proc.returncode}"
+        return False, (f"{loader} exited {proc.returncode} without a word - "
+                       "the kernel may lack CONFIG_COMPAT")
 
     with tempfile.NamedTemporaryFile(prefix="rb4r5-arm32-", delete=False) as handle:
         handle.write(_arm32_probe_bytes())

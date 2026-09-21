@@ -131,6 +131,28 @@ def describe(fbdev: str = "/dev/fb0") -> list[str]:
     return lines
 
 
+def frame_rect(info: dict, ui_w: int = 1280, ui_h: int = 800,
+               aspect: bool = True) -> tuple[int, int, int, int]:
+    """Where the player's frame lands in the framebuffer: (x, y, w, h).
+
+    The same arithmetic as rb4r5_dst_init() in src/directfb/rb4r5_scale.h, and
+    it has to stay the same: the touch daemon maps panel coordinates through
+    this rectangle, so if the two disagree every touch is offset by the width
+    of the black bars.
+    """
+    fw, fh = info.get("width", 0), info.get("height", 0)
+    if not (aspect and ui_w > 0 and ui_h > 0 and fw > 0 and fh > 0):
+        return 0, 0, fw, fh
+    by_h = fw * ui_h
+    by_w = fh * ui_w
+    if by_h > by_w:                     # height limited
+        h, w = fh, by_w // ui_h
+    else:                               # width limited
+        w, h = fw, by_h // ui_w
+    w, h = min(w, fw), min(h, fh)
+    return (fw - w) // 2, (fh - h) // 2, w, h
+
+
 # --------------------------------------------------------------------------
 # reading pixels back
 # --------------------------------------------------------------------------

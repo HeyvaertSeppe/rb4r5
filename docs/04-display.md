@@ -148,30 +148,48 @@ reference for all 65536 RGB565 values in both channel orders.
 
 Two separate decisions, both of which were wrong to begin with.
 
-**Shape.** The RX3's screen is 1280×800, i.e. 16:10. A 22″ monitor is 16:9.
+**Shape.** The RX3's screen is 1280×800, i.e. 16:10. A 16:9 monitor is not.
 Stretching one onto the other makes everything 8% wide — noticeably so on the
 round jog displays and the text. The default is now `fit: aspect`: the frame
-is scaled to 1728×1080 and centred, with 96 px of black down each side, so
-**the UI is never distorted**. `fit: fill` brings the stretch back.
+keeps its shape and is centred, with black down each side, so **the UI is
+never distorted**.
 
-**Filtering.** 1280→1728 is a factor of 1.35, and nearest neighbour at 1.35×
-duplicates about a third of the columns and rows and leaves the rest alone.
-On text and on the waveform's single-pixel lines that reads as a coarse,
-uneven, low-resolution picture — because it is one. The default is now
+| panel | frame | bars |
+|---|---|---|
+| 1920×1080 | 1728×1080 | 96 px each side |
+| 2880×1620 | 2592×1620 | 144 px each side |
+| 1024×768 | 1024×640 | 64 px top and bottom |
+| 1280×800 | 1280×800 | none — an exact 1:1 copy |
+
+`fit: fill` brings the stretch back. **The touch daemon maps through the same
+rectangle** (`fb.frame_rect()`, which is the same arithmetic as
+`rb4r5_dst_init()`, with a test pinning the two together): with bars, a touch
+two thirds across the glass is *not* two thirds across the UI, and a press on
+a bar presses nothing.
+
+**Filtering.** 1280→1728 is 1.35×, 1280→2592 is 2.03×, and nearest neighbour
+at either duplicates some columns and rows and leaves the others alone. On
+text and on the waveform's single-pixel lines that reads as a coarse, uneven,
+low-resolution picture — because it is one. The default is now
 `scale: bilinear`, which interpolates:
 
 | | nearest | bilinear |
 |---|---|---|
 | 1px lines at 8, 4, 2 px spacing | uneven — some doubled, some dropped | even, softened consistently |
 | a smooth ramp over 64 px | 31 distinct values | 248 distinct values |
-| accuracy vs a floating-point reference | n/a | worst channel error 1.9/255 |
-| cost per frame (1728×1080, measured on x86) | ~1 ms | ~9 ms |
+| accuracy vs a floating-point reference | n/a | worst channel error **0.94/255** |
+| cost per frame, 2592×1620, x86, no NEON | ~2.8 ms | ~13 ms |
 
-The cost is real but affordable: the publish path is not the bottleneck at the
-rate the player redraws. `scale: nearest` is there if a particular machine
-disagrees.
+`scale: nearest` is there if a particular machine disagrees.
 
-Three details make the filtered path worth trusting:
+The work is arranged so the expensive part happens as few times as possible:
+**the horizontal pass runs once per source row and the vertical pass once per
+destination row.** Enlarging 800 rows to 1620 that is 800 horizontal passes
+instead of 1620, and what is left per destination row — a two-row blend and a
+pack to the framebuffer's format — both vectorise (16 bytes per iteration for
+the blend, 8 pixels for the RGB565 pack).
+
+Three more details make the filtered path worth trusting:
 
 * **32.32 fixed point.** At 16.16 the truncated step `(1280<<16)/1920` loses
   0.667 per pixel; by the right-hand edge of a 1920-wide panel that has
@@ -183,8 +201,13 @@ Three details make the filtered path worth trusting:
   offset, which is what makes a 1:1 scale a bit-exact copy rather than a
   half-pixel blur, and makes the edges clamp instead of sampling past the
   frame.
-* **The weights are precomputed per column**, so the inner loop has no 64-bit
-  arithmetic in it, and the vertical blend is NEON (16 bytes per iteration).
+* **The weights are precomputed per column**, so no 64-bit arithmetic
+  survives in the inner loop.
+* **The blend rounds, it does not truncate.** A bilinear sample is two blends
+  chained, one per axis, so truncation loses up to a whole level twice over —
+  enough to show against the reference (it was the difference between 2.08 and
+  0.94). The NEON path uses a rounding narrowing shift to match the scalar one
+  exactly: both come out at 0.94.
 
 Sharpest of all, if the monitor accepts it: run the panel at 1280×800
 (`force_mode: "1280x800@60"`). The scale becomes an exact 1:1 copy — the

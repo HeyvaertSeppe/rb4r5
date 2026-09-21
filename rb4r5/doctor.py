@@ -108,6 +108,12 @@ def run(cfg, verbose: bool = False) -> int:
                         f"{platform5.boot_dir()}/config.txt and reboot")
     for conn in display.connectors():
         _row(conn["name"], f"{conn['status']} {conn['mode']}")
+        if conn["status"] == "connected" and len(conn["modes"]) > 1:
+            _row("", "offers: " + ", ".join(conn["modes"][:8]) +
+                     ("..." if len(conn["modes"]) > 8 else ""))
+            _row("", "the first one is what the monitor asks for; if its "
+                     "panel is really a smaller one, display.force_mode is "
+                     "sharper and cheaper")
     if not any(c["status"] == "connected" for c in display.connectors()):
         warnings.append("no connected display output found")
     comp = platform5.compositor_running()

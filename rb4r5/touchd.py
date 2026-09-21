@@ -20,7 +20,7 @@ import struct
 import time
 from pathlib import Path
 
-from . import config, inputs, keys, util, zones
+from . import config, fb, inputs, keys, util, zones
 
 
 class Contact:
@@ -55,6 +55,7 @@ class TouchDaemon:
         self.verbose = bool(cfg.get("touch.verbose", False))
         self.ui_w = int(cfg.get("display.ui_width", 1280))
         self.ui_h = int(cfg.get("display.ui_height", 800))
+        self.frame = self._frame_fractions()
         self.state_path = config.TOUCH_STATE
         self.seq = 0
         self.contact = Contact()
@@ -66,6 +67,33 @@ class TouchDaemon:
         self.pending = {}          # axis values within the current SYN frame
         self.btn_touch = None
         self.on_zone = None        # callback for `calibrate`
+
+    def _frame_fractions(self) -> tuple[float, float, float, float]:
+        """Where the UI sits on the panel, as fractions of the panel.
+
+        With display.fit = aspect the player's 16:10 frame is centred with
+        black bars, so the panel and the UI are not the same rectangle any
+        more: a touch two thirds of the way across the glass is NOT two thirds
+        of the way across the UI.  Everything below works in UI coordinates,
+        so the conversion happens once, here.
+        """
+        aspect = str(self.cfg.get("display.fit", "aspect")) != "fill"
+        info = fb.screeninfo(self.cfg.get("display.fbdev", "/dev/fb0"))
+        if info.get("error") or not info.get("width"):
+            return 0.0, 0.0, 1.0, 1.0          # no framebuffer: assume it fills
+        x, y, w, h = fb.frame_rect(info, self.ui_w, self.ui_h, aspect)
+        fw, fh = info["width"], info["height"]
+        if not (fw and fh and w and h):
+            return 0.0, 0.0, 1.0, 1.0
+        return x / fw, y / fh, w / fw, h / fh
+
+    def frame_note(self) -> str:
+        fx, fy, fw, fh = self.frame
+        if fw >= 0.999 and fh >= 0.999:
+            return "the UI fills the panel"
+        return (f"the UI covers {fw * 100:.0f}% x {fh * 100:.0f}% of the panel "
+                f"at {fx * 100:.0f}%,{fy * 100:.0f}% (black bars) - touches are "
+                f"mapped through that")
 
     # -- device ------------------------------------------------------------
     def open_device(self) -> bool:
@@ -94,7 +122,12 @@ class TouchDaemon:
         self.dev = None
 
     # -- coordinates -------------------------------------------------------
-    def normalise(self, raw_x: int, raw_y: int) -> tuple[float, float]:
+    def normalise(self, raw_x: int, raw_y: int) -> tuple[float, float, bool]:
+        """Panel coordinates -> UI coordinates, plus "was it on the UI".
+
+        The zone map is in UI space (0..1 of the RX3's 1280x800), so the black
+        bars have to come out here or every zone is shifted.
+        """
         ax, ay = self.axis["x"], self.axis["y"]
         span_x = max(1, ax["max"] - ax["min"])
         span_y = max(1, ay["max"] - ay["min"])
@@ -106,7 +139,12 @@ class TouchDaemon:
             nx = 1.0 - nx
         if self.invert_y:
             ny = 1.0 - ny
-        return min(max(nx, 0.0), 1.0), min(max(ny, 0.0), 1.0)
+
+        fx, fy, fw, fh = self.frame
+        nx = (nx - fx) / fw if fw > 0 else nx
+        ny = (ny - fy) / fh if fh > 0 else ny
+        inside = -0.001 <= nx <= 1.001 and -0.001 <= ny <= 1.001
+        return min(max(nx, 0.0), 1.0), min(max(ny, 0.0), 1.0), inside
 
     def publish_state(self, down: bool, nx: float, ny: float) -> None:
         """Hand the contact to memshim (native tsc2007 path, docs/07-touch.md)."""
@@ -256,9 +294,9 @@ class TouchDaemon:
             last_x = raw_x if raw_x is not None else self._last_raw_x
             last_y = raw_y if raw_y is not None else self._last_raw_y
             self._last_raw_x, self._last_raw_y = last_x, last_y
-            nx, ny = self.normalise(last_x, last_y)
+            nx, ny, inside = self.normalise(last_x, last_y)
         else:
-            nx, ny = self.contact.nx, self.contact.ny
+            nx, ny, inside = self.contact.nx, self.contact.ny, True
 
         if frame.get("up"):
             # A release always wins, even in the same frame as a new contact.
@@ -275,10 +313,18 @@ class TouchDaemon:
             if not have_position:
                 self._down_pending = True
                 return
+            # A touch on the black bar beside the picture is not a touch on
+            # anything; a drag that wanders onto one keeps working, because
+            # only the press decides the zone.
+            if not inside:
+                self.log(f"touch at {nx:.3f},{ny:.3f} is off the picture")
+                return
             self.down(nx, ny)
             self.publish_state(True, nx, ny)
         elif self._down_pending and have_position:
             self._down_pending = False
+            if not inside:
+                return
             self.down(nx, ny)
             self.publish_state(True, nx, ny)
         elif self.contact.active and have_position:
@@ -292,6 +338,7 @@ class TouchDaemon:
     def run(self, once: bool = False) -> int:
         util.info("touch daemon starting "
                   f"(zones: {self.cfg.get('touch.zones_file')})")
+        util.info(self.frame_note())
         self.publish_state(False, 0.0, 0.0)
         backoff = 1.0
         while True:
@@ -377,6 +424,7 @@ def calibrate(cfg, seconds: float = 60.0, raw: bool = False) -> int:
     if not daemon.open_device():
         print("\n".join(why_no_touchscreen()))
         raise util.Fail("no touchscreen found")
+    print(f"\n{daemon.frame_note()}")
     print(f"\nTouch the screen; each contact prints its position and zone.")
     print(f"Zones from {cfg.get('touch.zones_file')}:")
     print("\n".join(zones.describe(daemon.zone_map)))

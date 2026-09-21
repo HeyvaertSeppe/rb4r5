@@ -166,7 +166,25 @@ check("release still pairs up", len(sent), 2)
 dae = daemon(touch__invert_x=True, touch__swap_xy=True)
 dae.axis = {"x": {"min": 0, "max": 1000}, "y": {"min": 0, "max": 1000}}
 check("swap+invert", tuple(round(v, 3) for v in dae.normalise(250, 750)),
-      (0.25, 0.25))
+      (0.25, 0.25, True))
+
+# ------------------------------------------------------- the letterbox bars
+# With display.fit = aspect the picture does not fill the panel, so panel
+# coordinates are not UI coordinates.  On a 2880x1620 screen the 16:10 frame
+# is 2592 wide with 144px bars: the left bar is off the picture, and the
+# picture's own left edge is at 5% of the glass.
+dae = daemon()
+dae.axis = {"x": {"min": 0, "max": 1000}, "y": {"min": 0, "max": 1000}}
+dae.frame = (144 / 2880, 0.0, 2592 / 2880, 1.0)
+check("bar touch is off the picture", dae.normalise(20, 500)[2], False)
+check("picture left edge maps to 0", round(dae.normalise(50, 500)[0], 3), 0.0)
+check("picture right edge maps to 1", round(dae.normalise(950, 500)[0], 3), 1.0)
+check("picture centre stays centred", round(dae.normalise(500, 500)[0], 3), 0.5)
+check("a press on the bar presses nothing", (lambda: (
+    sent.clear(),
+    dae.handle_events([(EV_ABS, MTX, 10), (EV_ABS, MTY, 500),
+                       (EV_ABS, TRACK, 3), SYN]),
+    list(sent))[-1])(), [])
 
 print()
 if failures:

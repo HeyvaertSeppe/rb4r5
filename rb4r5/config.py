@@ -221,7 +221,10 @@ class Config:
 
 def load(path: Path | None = None) -> Config:
     path = Path(path) if path else CONFIG_PATH
-    data = DEFAULTS
+    # a copy, never DEFAULTS itself: Config.set() writes into this dict, and
+    # with no config file on disk that would edit the defaults for the rest of
+    # the process - every later load() would inherit the change
+    data = copy.deepcopy(DEFAULTS)
     if path.exists():
         try:
             data = _merge(DEFAULTS, json.loads(path.read_text()))

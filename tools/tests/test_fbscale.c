@@ -132,6 +132,11 @@ test_fit( void )
      CHECK( d.w == 1728 && d.h == 1080 && d.x == 96 && d.y == 0,
             "aspect 1920x1080: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
+     /* aspect: the 2880x1620 panel this was first run on */
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 2880, 1620, 5760, 1280, 800, 1, 1 );
+     CHECK( d.w == 2592 && d.h == 1620 && d.x == 144 && d.y == 0,
+            "aspect 2880x1620: %d,%d %dx%d", d.x, d.y, d.w, d.h );
+
      /* aspect: 16:10 on a 4:3 panel, bars top and bottom */
      rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1024, 768, 4096, 1280, 800, 1 , 0);
      CHECK( d.w == 1024 && d.h == 640 && d.x == 0 && d.y == 64,
@@ -401,14 +406,14 @@ test_bilinear( void )
                     double diff = have - want[c];
                     if (diff < 0) diff = -diff;
                     if (diff > worst) worst = diff;
-                    if (diff > 2.0 && off++ < 4)
+                    if (diff > 1.5 && off++ < 4)
                          CHECK( 0, "(%d,%d) channel %d: got %.0f want %.2f",
                                 x, y, c, have, want[c] );
                }
                checked++;
           }
      }
-     CHECK( off == 0, "%d samples off by more than 2 (worst %.2f)", off, worst );
+     CHECK( off == 0, "%d samples off by more than 1.5 (worst %.2f)", off, worst );
      printf("  %d pixels sampled, worst channel error %.2f\n", checked, worst);
 
      /* A flat colour must come out flat: no edge artefact, no clamping bug. */

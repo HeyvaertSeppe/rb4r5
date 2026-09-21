@@ -147,6 +147,21 @@ rebuilt = b"".join(raw[y * stride + 1:(y + 1) * stride]
                    for y in range(info["height"]))
 check(rebuilt == rgb, "the PNG holds exactly the pixels we passed in")
 
+print("\n== where the frame lands (must match rb4r5_scale.h exactly)")
+# touchd maps panel coordinates through this rectangle, so if it disagrees
+# with the C the touches are offset by the width of the black bars.  The
+# numbers are the ones tools/tests/test_fbscale.c asserts on the C side.
+for (fw, fh), want in {
+        (1920, 1080): (96, 0, 1728, 1080),
+        (2880, 1620): (144, 0, 2592, 1620),      # the panel this was run on
+        (1024, 768):  (0, 64, 1024, 640),
+        (1280, 800):  (0, 0, 1280, 800),         # the RX3's own geometry
+}.items():
+    got = fb.frame_rect({"width": fw, "height": fh}, 1280, 800, True)
+    check(got == want, f"{fw}x{fh} aspect -> {got}")
+check(fb.frame_rect({"width": 2880, "height": 1620}, 1280, 800, False) ==
+      (0, 0, 2880, 1620), "fill uses the whole panel")
+
 print("\n== the stale-driver markers")
 # chroot.module_report() decides whether the player is loading the current
 # display driver by looking for these strings in the built .so.  If the patch

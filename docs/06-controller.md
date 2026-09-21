@@ -315,6 +315,10 @@ node **read-write** now — it was read-only, which is why nothing on the
 controller ever lit — echoes every button it handles, and runs a lamp test at
 startup so you can see at a glance whether the output path works.
 
+Pads take their own path through the bridge — the note is computed from the
+pad mode and the pad number rather than looked up in the table — which is how
+they came to be the one thing that never lit. They light now too.
+
 That is not the same as mirroring the player. The player's own LED state goes
 down the panel link, which is not decoded yet
 ([13-panel-link](13-panel-link.md)) — so what lights is what *you* pressed,
@@ -323,6 +327,21 @@ not what the RX3 thinks. `controller.leds=false` turns it off.
 The bridge only ever writes to a real MIDI character device. A FIFO or a file
 would send the bytes straight back as input, where they would parse as button
 presses nobody made.
+
+## "It responds slowly"
+
+That has to be somebody's microseconds. `-v` (or `controller.verbose=true`)
+makes the bridge say how long it took, from the MIDI byte arriving to the
+record reaching the player's FIFO:
+
+```
+  HOT CUE pad 1 handled in 84us
+```
+
+Tens of microseconds is the bridge doing nothing wrong, and the delay is the
+player's side — which, until the audio clock was fixed, it invariably was: the
+engine's transport, and everything timed against it, ran off a clock that was
+not being paced at all ([05-audio](05-audio.md)).
 
 ## Finding a button's note
 

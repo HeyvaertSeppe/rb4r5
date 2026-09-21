@@ -202,6 +202,16 @@ with tempfile.TemporaryDirectory() as tmp:
           "key=00004109\n         op=5" in text)
     check("the jog carries a rotate op", "key=00004305\n         op=4" in text)
 
+    # Pads take their own path through the bridge (the note is computed from
+    # the mode and the pad number, not looked up), which is how they came to
+    # be the one thing that never lit.
+    bridge_src = (REPO / "src/host/flx4-bridge.c").read_text()
+    pad_body = bridge_src[bridge_src.index("static void handle_pad("):
+                          bridge_src.index("/* ---------------- note mapping")]
+    check("pads light up on their own path", "led_set(" in pad_body)
+    check("pads switch the bank before the pad press",
+          pad_body.index("pad_select_bank") < pad_body.index("K_PAD1 + idx"))
+
 
 print()
 if failures:

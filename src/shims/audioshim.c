@@ -188,6 +188,7 @@ static int (*real_snd_pcm_sw_params_set_stop_threshold)(snd_pcm_t *, snd_pcm_sw_
 static int (*real_snd_pcm_sw_params)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
 static int (*real_snd_pcm_prepare)(snd_pcm_t *) = NULL;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t) = NULL;
+static int (*real_snd_pcm_state)(snd_pcm_t *) = NULL;
 
 /* Control interface types */
 typedef void snd_ctl_t;
@@ -229,6 +230,7 @@ static void init_real_alsa(void)
     real_snd_pcm_sw_params = dlsym(lib, "snd_pcm_sw_params");
     real_snd_pcm_prepare = dlsym(lib, "snd_pcm_prepare");
     real_snd_pcm_writei = dlsym(lib, "snd_pcm_writei");
+    real_snd_pcm_state = dlsym(lib, "snd_pcm_state");
     real_snd_ctl_open = dlsym(lib, "snd_ctl_open");
     real_snd_ctl_close = dlsym(lib, "snd_ctl_close");
 
@@ -346,6 +348,15 @@ static void open_real_playback(int mode)
     cfg_init();
     if (!real_snd_pcm_open)
         return;
+
+    /* "none" means: do not open anything.  The engine still runs, paced in
+     * software, which is the quickest way to find out whether a crash is the
+     * audio path or something else entirely. */
+    if (!strcmp(g_dev_list, "none")) {
+        alog("audioshim: RB_AUDIO_DEV=none - not opening any device; the "
+             "engine will be paced in software and there will be no sound\n");
+        return;
+    }
 
     if (!g_dev_list[0]) {
         if (pick_device(autodev, sizeof(autodev)))
@@ -784,6 +795,38 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     snd_pcm_sframes_t written = 0;
+    if (g_real_playback && real_snd_pcm_writei && !g_pcm_dead) {
+        /* Never write to a PCM that is not ready for it.  alsa-lib asserts
+         * its way out of several of those states rather than returning an
+         * error, and an assert is abort() - the whole player goes, with
+         * SIGABRT and no explanation.  States: 0 OPEN, 1 SETUP, 2 PREPARED,
+         * 3 RUNNING, 4 XRUN, 5 DRAINING, 6 PAUSED, 7 SUSPENDED, 8
+         * DISCONNECTED.  Anything below PREPARED has to be prepared first;
+         * DISCONNECTED means the device has gone. */
+        if (real_snd_pcm_state) {
+            int state = real_snd_pcm_state(g_real_playback);
+            if (state == 8) {
+                if (!g_pcm_dead) {
+                    g_pcm_dead = 1;
+                    alog("audioshim: the device has been disconnected; "
+                         "pacing the engine in software from here\n");
+                }
+            }
+            else if (state < 2 || state == 4) {
+                int err = real_snd_pcm_prepare ?
+                          real_snd_pcm_prepare(g_real_playback) : -1;
+                alog("audioshim: the device was in state %d (not ready to be "
+                     "written); prepare() res=%d\n", state, err);
+                if (err < 0) {
+                    g_pcm_dead = 1;
+                    alog("audioshim: it will not prepare, so it is not going "
+                         "to take audio - pacing the engine in software "
+                         "instead of writing to it (which would abort)\n");
+                }
+            }
+        }
+    }
+
     if (g_real_playback && real_snd_pcm_writei && !g_pcm_dead) {
         snd_pcm_uframes_t done = 0;
 

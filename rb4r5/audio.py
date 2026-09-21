@@ -130,6 +130,16 @@ def select(cfg) -> dict:
 
     The result is what env() turns into RB_AUDIO_* for audioshim.
     """
+    if cfg.get("audio.disable"):
+        # Deliberately no device: the engine is paced in software and runs
+        # silently.  It is the quickest way to find out whether a crash or a
+        # freeze belongs to the audio path at all.
+        return {"device": "none", "candidates": ["none"], "channels": 2,
+                "rate": int(cfg.get("audio.rate", 44100)),
+                "format": int(cfg.get("audio.format", FORMAT_IDS["S24_LE"])),
+                "source": "disabled", "card": None,
+                "notes": ["audio.disable is set: no device will be opened, "
+                          "and there will be no sound"]}
     want_rate = int(cfg.get("audio.rate", 44100))
     want_fmt = int(cfg.get("audio.format", FORMAT_IDS["S24_LE"]))
     plug = bool(cfg.get("audio.plug", True))

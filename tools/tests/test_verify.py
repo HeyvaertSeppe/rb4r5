@@ -138,8 +138,53 @@ with tempfile.TemporaryDirectory() as tmp:
         want = f"key={keymod.resolve(key_name):08x}"
         check(f"{label} watches for the right keycode", walked[label], want)
 
+print("\n== a crash explains itself")
+import tempfile                                              # noqa: E402
+from rb4r5 import config, supervisor                          # noqa: E402
+
+
+class FakeChild:
+    def __init__(self, log):
+        self.name = "rbp"
+        self.log = log
+        self.delay = 0.0
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    log = Path(tmp) / "rbp.log"
+    log.write_text("\n".join(
+        [f"line {n}" for n in range(40)] +
+        ["*** stack smashing detected ***: terminated", ""]))
+    sup = supervisor.Supervisor.__new__(supervisor.Supervisor)
+    sup.crashes = {}
+    sup.cfg = config.load("/nonexistent-sup.json")
+    child = FakeChild(str(log))
+
+    tail = sup.log_tail(child, lines=5)
+    check("the tail is the end of the log", tail[-1],
+          "*** stack smashing detected ***: terminated")
+    check("blank lines are dropped", "" in tail, False)
+    check("it is the length asked for", len(tail), 5)
+
+    check("signal 6 is named", "SIGABRT" in supervisor.Supervisor.SIGNALS[6])
+    check("signal 11 is named", "SIGSEGV" in supervisor.Supervisor.SIGNALS[11])
+
+    # three deaths in a row is a fault, not bad luck
+    for _ in range(3):
+        sup.report_exit(child, -6)
+    check("it counts the deaths", sup.crashes["rbp"], 3)
+
+    missing = FakeChild(str(Path(tmp) / "nothing.log"))
+    check("a missing log is not a crash of its own",
+          sup.log_tail(missing), [])
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")
     sys.exit(1)
 print("all verify checks passed")
+
+
+# ------------------------------------------------- why a child died
+# "exited (-6)" is a number.  The reason is in the log, and while a thing is
+# crash-looping nobody goes looking - so the supervisor has to bring it.

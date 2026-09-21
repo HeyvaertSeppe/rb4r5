@@ -110,6 +110,7 @@ class Child:
 
 class Supervisor:
     def __init__(self, cfg, repo: Path = REPO):
+        self.crashes: dict[str, int] = {}
         self.cfg = cfg
         self.repo = repo
         self.children: list[Child] = []
@@ -477,8 +478,7 @@ class Supervisor:
                                    f"{window / 60:.0f} min (last exit {code}); "
                                    f"giving up - see {child.log}")
                         return 1
-                    util.warn(f"{child.name} exited ({code}); restarting in "
-                              f"{child.delay:.0f}s")
+                    self.report_exit(child, code)
                     time.sleep(child.delay)
                     if child.name == "rbp":
                         chroot.make_stubs(self.cfg)
@@ -487,6 +487,63 @@ class Supervisor:
         finally:
             self.shutdown()
         return 0
+
+    # -- saying why something died -----------------------------------------
+    SIGNALS = {
+        4: "SIGILL (an illegal instruction)",
+        6: "SIGABRT - the program aborted itself: a failed assertion, a "
+           "corrupted heap, or a smashed stack.  The reason is printed to "
+           "its log just before it goes",
+        7: "SIGBUS (a misaligned or bad memory access)",
+        8: "SIGFPE (a division by zero)",
+        9: "SIGKILL (something killed it, or the OOM killer did)",
+        11: "SIGSEGV (it read or wrote memory it does not own)",
+        15: "SIGTERM (asked to stop)",
+    }
+
+    def report_exit(self, child, code: int) -> None:
+        """Say why a child died, with the end of its log.
+
+        "exited (-6)" is a number; the reason is three lines further down in
+        the log and nobody thinks to look, least of all while it is looping.
+        """
+        why = ""
+        if code is not None and code < 0:
+            why = self.SIGNALS.get(-code, f"signal {-code}")
+        elif code:
+            why = f"exit status {code}"
+        util.warn(f"{child.name} exited ({code}){': ' + why if why else ''}; "
+                  f"restarting in {child.delay:.0f}s")
+
+        tail = self.log_tail(child, lines=14)
+        if tail:
+            util.warn(f"the last of {child.log}:")
+            for line in tail:
+                print(f"    | {line}")
+
+        self.crashes[child.name] = self.crashes.get(child.name, 0) + 1
+        if self.crashes[child.name] in (3, 10, 30):
+            util.error(f"{child.name} has now died {self.crashes[child.name]} "
+                       f"times.  The lines above are the same every time - "
+                       f"that is the fault, not the restarting.")
+            if child.name == "rbp" and self.crashes[child.name] >= 3:
+                util.error(
+                    "If this started when audio began working, run it once "
+                    "without audio to find out:\n"
+                    "    sudo python3 launch.py config --set audio.disable=true\n"
+                    "    sudo python3 launch.py run\n"
+                    "If it stops crashing, the audio path is the cause and "
+                    "that log says which part.")
+
+    def log_tail(self, child, lines: int = 14) -> list[str]:
+        """The interesting end of a log: the last lines, blanks dropped."""
+        try:
+            blob = Path(child.log).read_bytes()[-16384:]
+        except OSError:
+            return []
+        text = blob.decode(errors="replace").splitlines()
+        out = [line.rstrip() for line in text if line.strip()]
+        return out[-lines:]
 
     def capture_screenshot(self) -> None:
         """Save what the player put on screen, a few times as it comes up.

@@ -83,6 +83,9 @@ DEFAULTS: dict = {
         "cue_on_stereo": False,          # on a stereo sink, follow the cue mix
         # The engine picks its output once, at startup.  If the controller is
         # plugged in later, restart so master + cue move onto it.
+        # Open no device at all: the engine runs silently, paced in software.
+        # For finding out whether a crash belongs to the audio path.
+        "disable": False,
         "restart_on_controller": True,
         "controller_settle": 2.5,        # wait this long after it appears
         "startup_mute_ms": 1500,         # kill the engine's power-on transient

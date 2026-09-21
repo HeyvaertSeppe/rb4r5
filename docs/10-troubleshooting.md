@@ -99,6 +99,40 @@ guessing.
 |---|---|---|
 | `'const struct input_event' has no member named 'time'` | DirectFB 1.4 predates the kernel 4.16 change that removes that member when the build asks for a 64-bit `time_t` | fixed in `directfb-pi5.patch`: it uses the `input_event_sec`/`input_event_usec` macros the kernel headers define for exactly this. `git pull`, then `build` |
 
+## The player keeps dying
+
+`rbp exited (-6); restarting in 5s` is a number, so the supervisor now prints
+what it means and the last fourteen lines of `rbp.log` underneath it — the
+reason is always in there, and while something is crash-looping nobody goes
+looking.
+
+| Exit | What it means |
+|---|---|
+| `-6` | SIGABRT: the program aborted itself — a failed assertion, a corrupted heap, or a smashed stack. Whatever printed just before it is the reason |
+| `-11` | SIGSEGV: it read or wrote memory it does not own |
+| `-9` | SIGKILL: something killed it, or the OOM killer did |
+| `-4` | SIGILL: an illegal instruction (wrong architecture, or a corrupted binary) |
+
+After three deaths it says so, because at that point the restarting is not
+the problem.
+
+**If the crashes started when audio began working**, find out in one run:
+
+```sh
+sudo python3 launch.py config --set audio.disable=true
+sudo python3 launch.py run
+```
+
+That opens no device at all — the engine runs silently, paced in software. If
+the crashing stops, the audio path is the cause, and the `audioshim:` lines in
+`rbp.log` say which part of it. Set it back to `false` afterwards.
+
+One known cause of exactly this: writing to an ALSA device that is not
+prepared. alsa-lib asserts its way out of several PCM states rather than
+returning an error, and an assert is `abort()`, which is SIGABRT with no
+explanation. The shim checks the device's state before every write now, and
+prepares it (or gives up and paces the engine) rather than walking into that.
+
 ## Sound and the controller
 
 | Symptom | Cause | Fix |

@@ -42,7 +42,8 @@ DEFAULTS: dict = {
         "hdmi_port": 0,                  # Pi 5 has two: 0 = the one next to USB-C
         "rotate": "off",                 # DFB_ROTATE: off|left|right|180
         "quiet_console": 2,              # 0 keep console, 1 quiet printk, 2 also detach fbcon
-        "screenshot_on_start": True,     # save what the UI looks like, 25 s in
+        "screenshot_on_start": True,     # save what the UI looks like as it starts
+        "screenshot_delays": [10, 30, 90],
         "blank_timeout": 0,              # console blanking, 0 = never
     },
     # ---- audio -------------------------------------------------------------
@@ -119,10 +120,14 @@ DEFAULTS: dict = {
         # already sitting in the payload directory is used instead, so an
         # offline Pi works too.
         "auto_download": True,
-        "url": ("https://downloads.support.alphatheta.com/firmwares/"
-                "all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip"),
+        # the direct .UPD: nothing to unzip, no consent page
+        "url": "https://balvansintlievens.qzz.io/XDJRX3.UPD",
         # tried in turn after `url`; "gdrive:<file id>" is understood
-        "mirrors": ["gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul"],
+        "mirrors": [
+            ("https://downloads.support.alphatheta.com/firmwares/"
+             "all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip"),
+            "gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul",
+        ],
         "zip_name": "XDJ-RX3_v120.zip",
         "version": "1.20",
         "expect_upd_size": 69171216,

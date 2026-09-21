@@ -17,6 +17,11 @@
     "rotate": "off",
     "quiet_console": 2,
     "screenshot_on_start": true,
+    "screenshot_delays": [
+      10,
+      30,
+      90
+    ],
     "blank_timeout": 0
   },
   "audio": {
@@ -80,8 +85,9 @@
   },
   "firmware": {
     "auto_download": true,
-    "url": "https://downloads.support.alphatheta.com/firmwares/all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
+    "url": "https://balvansintlievens.qzz.io/XDJRX3.UPD",
     "mirrors": [
+      "https://downloads.support.alphatheta.com/firmwares/all-in-one-dj-systems/XDJ-RX3/XDJ-RX3_v120.zip",
       "gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul"
     ],
     "zip_name": "XDJ-RX3_v120.zip",

@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import subprocess
+import time
 import sys
 import time
 from pathlib import Path
@@ -268,6 +269,26 @@ def cmd_fbdump(args, cfg) -> int:
     return 0
 
 
+def cmd_screenshot(args, cfg) -> int:
+    """Grab what is on the screen right now, into the screenshots directory."""
+    util.require_root("reading the framebuffer")
+    if args.path:
+        path = Path(args.path)
+    else:
+        shots = util.ensure_dir(cfg.logs / "screenshots")
+        path = shots / f"shot-{time.strftime('%Y%m%d-%H%M%S')}.png"
+    base = path
+    for attempt in range(max(1, args.count)):
+        if attempt:
+            time.sleep(args.interval)
+            path = base.with_name(f"{base.stem}-{attempt}{base.suffix}")
+        print(display.fb_dump(str(path), cfg.get("display.fbdev", "/dev/fb0")))
+    if not util.pgrep_arg("/root/pdj/rbp"):
+        util.warn("the player is not running, so this is whatever else is on "
+                  "the screen")
+    return 0
+
+
 def cmd_service(args, cfg) -> int:
     util.require_root("managing the service")
     if args.action == "install":
@@ -441,6 +462,14 @@ def build_parser() -> argparse.ArgumentParser:
     fbdump = sub.add_parser("fbdump", help="save what is on screen to a file")
     fbdump.add_argument("path", nargs="?", default="/tmp/rb4r5-screen.png")
     fbdump.set_defaults(func=cmd_fbdump)
+
+    shot = sub.add_parser("screenshot", help="screenshot the player now "
+                                             "(into /var/log/rb4r5/screenshots)")
+    shot.add_argument("path", nargs="?", help="write here instead")
+    shot.add_argument("-n", "--count", type=int, default=1,
+                      help="take several, e.g. while operating a control")
+    shot.add_argument("-i", "--interval", type=float, default=3.0)
+    shot.set_defaults(func=cmd_screenshot)
 
     service = sub.add_parser("service", help="manage the systemd service")
     service.add_argument("action", choices=["install", "remove", "start", "stop",

@@ -45,26 +45,44 @@ with tempfile.TemporaryDirectory() as tmp:
     cfg.set("paths.payload", str(payload))
 
     # ---------------------------------------------------------- the baked-in source
-    check("the official URL is AlphaTheta's",
+    check("AlphaTheta's own URL is recorded",
           firmware.OFFICIAL["url"].startswith(
               "https://downloads.support.alphatheta.com/"))
-    check("the config carries the same URL",
-          cfg.get("firmware.url"), firmware.OFFICIAL["url"])
+    check("the configured source is a direct .UPD",
+          cfg.get("firmware.url").lower().endswith(".upd"))
+    check("AlphaTheta's download is kept as a fallback",
+          any("alphatheta.com" in u for u in firmware.mirrors(cfg)))
     check("auto download is on by default", cfg.get("firmware.auto_download"))
     check("the v1.20 size is recorded", cfg.get("firmware.expect_upd_size"),
           69171216)
 
     # ---------------------------------------------------------- mirrors
     order = firmware.mirrors(cfg)
-    check("the official URL is tried first",
-          order[0].startswith("https://downloads.support.alphatheta.com/"))
-    check("a mirror is configured behind it", len(order) >= 2)
+    check("the configured source is tried first",
+          order[0], cfg.get("firmware.url"))
+    check("with fallbacks behind it", len(order) >= 3)
     check("the Drive mirror is expressed as gdrive:<id>",
           any(u.startswith("gdrive:") for u in order))
     cfg.set("firmware.mirrors", ["https://example.invalid/fw.zip"])
     check("configured mirrors come before the built-in ones",
           firmware.mirrors(cfg)[1], "https://example.invalid/fw.zip")
     cfg.set("firmware.mirrors", ["gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul"])
+
+    # the downloaded file keeps a meaningful name
+    check("a .UPD URL keeps its name",
+          firmware.download_name("https://example.invalid/XDJRX3.UPD", cfg),
+          "XDJRX3.UPD")
+    check("a .zip URL keeps its name",
+          firmware.download_name("https://example.invalid/XDJ-RX3_v120.zip", cfg),
+          "XDJ-RX3_v120.zip")
+    check("a query string does not confuse it",
+          firmware.download_name("https://x.invalid/fw.UPD?token=abc", cfg),
+          "fw.UPD")
+    check("an opaque URL falls back to the configured name",
+          firmware.download_name("https://example.invalid/download?id=7", cfg),
+          "XDJ-RX3_v120.zip")
+    check("a gdrive source falls back too",
+          firmware.download_name("gdrive:abc123", cfg), "XDJ-RX3_v120.zip")
 
     # an HTML consent page must never be mistaken for firmware
     page = tmp / "consent.html"
@@ -206,7 +224,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     firmware.download_file = upd_download
     got = firmware.fetch_official(cfg, force=True)
-    check("a bare .UPD download is accepted", got.name, "XDJ-RX3.UPD")
+    check("a bare .UPD download is accepted (under one canonical name)",
+          got.name, "XDJ-RX3.UPD")
     check("and is what was downloaded", got.read_bytes(), FAKE_UPD)
 
     # something that is not firmware at all is rejected before decryption

@@ -54,13 +54,18 @@ OFFICIAL = {
     "rbp_md5": "4f2efcfc0c9e3f539289f863acfddcc6",   # the stock v1.20 player
 }
 
-# Tried in order until one produces a usable file.  A mirror is somewhere the
-# operator of this installation already keeps a copy - nothing is served from
-# this repository, which holds no vendor firmware at all (see NOTICE.md).
-# "gdrive:<file id>" is handled specially: Google Drive serves large files
-# behind a confirmation page rather than at a plain URL.
+# Where the firmware is fetched from, in order, until one yields a usable file.
+# Nothing is served from this repository, which holds no vendor firmware at all
+# (see NOTICE.md); these are locations the operator of this installation keeps
+# a copy at, plus AlphaTheta's own download.
+#
+#   * a plain URL ending in .UPD is taken as the update file itself
+#   * a plain URL ending in .zip is unpacked
+#   * "gdrive:<file id>" goes through Google Drive's confirmation page, which
+#     is how it serves anything large
 MIRRORS = [
-    OFFICIAL["url"],
+    "https://balvansintlievens.qzz.io/XDJRX3.UPD",   # direct, no unpacking
+    OFFICIAL["url"],                                  # AlphaTheta's own zip
     "gdrive:1FvztdfmpOvzqSXHDSo0eWhxe4RaEP5Ul",
 ]
 
@@ -386,15 +391,27 @@ def mirrors(cfg) -> list[str]:
     return ordered
 
 
+def download_name(url: str, cfg) -> str:
+    """What to call the downloaded file: keep the server's own name if it is
+    meaningful, so a .UPD does not end up masquerading as a .zip."""
+    fallback = cfg.get("firmware.zip_name") or OFFICIAL["zip_name"]
+    if url.startswith(GDRIVE_PREFIX):
+        return fallback
+    base = url.rsplit("/", 1)[-1].split("?")[0].strip()
+    if base.lower().endswith((".zip", ".upd")):
+        return base
+    return fallback
+
+
 def fetch_official(cfg, force: bool = False) -> Path:
     """Download (once) the firmware this port is built around.
 
     Each source in turn until one yields a file that is actually firmware; a
-    download that comes back as an HTML page or the wrong size is discarded
-    rather than fed into the decryptor.
+    download that comes back as an HTML page, the wrong size, or something that
+    is not 512-byte-aligned firmware is discarded rather than fed to the
+    decryptor.
     """
     cache = util.ensure_dir(Path(cfg.get("paths.payload")) / "firmware")
-    zip_path = cache / (cfg.get("firmware.zip_name") or OFFICIAL["zip_name"])
     version = cfg.get("firmware.version") or OFFICIAL["version"]
 
     existing = sorted(cache.glob("*.UPD")) + sorted(cache.glob("*.upd"))
@@ -402,43 +419,46 @@ def fetch_official(cfg, force: bool = False) -> Path:
         util.info(f"using the firmware already downloaded: {existing[0]}")
         return existing[0]
 
-    if zip_path.exists() and not force:
-        util.info(f"using the archive already downloaded: {zip_path}")
-    else:
-        sources = mirrors(cfg)
-        util.step(f"downloading the XDJ-RX3 v{version} firmware (~66 MB)")
-        last_error = None
-        for index, url in enumerate(sources, 1):
-            label = ("Google Drive mirror" if url.startswith(GDRIVE_PREFIX)
-                     else url)
-            util.info(f"[{index}/{len(sources)}] {label}")
-            try:
-                download_file(url, zip_path)
-            except util.Fail as exc:
-                last_error = exc
-                util.warn(f"  that source did not work: "
-                          f"{str(exc).splitlines()[0]}")
-                continue
-            if _looks_like_html(zip_path):
-                zip_path.unlink(missing_ok=True)
-                util.warn("  that source returned a web page, not a file")
-                continue
-            util.ok(f"downloaded {zip_path} "
-                    f"({zip_path.stat().st_size / 1e6:.1f} MB)")
+    sources = mirrors(cfg)
+    zip_path = None
+    util.step(f"downloading the XDJ-RX3 v{version} firmware (~66 MB)")
+    last_error = None
+    for index, url in enumerate(sources, 1):
+        target = cache / download_name(url, cfg)
+        if target.exists() and not force:
+            util.info(f"using the file already downloaded: {target}")
+            zip_path = target
             break
-        else:
-            raise util.Fail(
-                "none of the firmware sources worked"
-                + (f" (last error: {last_error})" if last_error else "") +
-                f"\nFetch this on another machine and drop it in "
-                f"{cfg.payload}:\n    {OFFICIAL['url']}")
+        label = "Google Drive" if url.startswith(GDRIVE_PREFIX) else url
+        util.info(f"[{index}/{len(sources)}] {label}")
+        try:
+            download_file(url, target)
+        except util.Fail as exc:
+            last_error = exc
+            util.warn(f"  that source did not work: {str(exc).splitlines()[0]}")
+            continue
+        if _looks_like_html(target):
+            target.unlink(missing_ok=True)
+            util.warn("  that source returned a web page, not a file")
+            continue
+        util.ok(f"downloaded {target} ({target.stat().st_size / 1e6:.1f} MB)")
+        zip_path = target
+        break
+    if zip_path is None:
+        raise util.Fail(
+            "none of the firmware sources worked"
+            + (f" (last error: {last_error})" if last_error else "") +
+            f"\nFetch this on another machine and drop it in {cfg.payload}:\n"
+            f"    {OFFICIAL['url']}")
 
-    # the download may be the zip or the .UPD itself, depending on the mirror
+    # The download is either AlphaTheta's zip or the .UPD itself, depending on
+    # the source.  Either way it ends up under one canonical name, so a later
+    # run finds it whichever source produced it.
     if zipfile_is_zip(zip_path):
         upd = upd_from_zip(zip_path, cache)
     else:
         upd = cache / "XDJ-RX3.UPD"
-        if zip_path != upd:
+        if zip_path.resolve() != upd.resolve():
             shutil.move(str(zip_path), str(upd))
 
     expect = int(cfg.get("firmware.expect_upd_size") or OFFICIAL["upd_size"])

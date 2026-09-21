@@ -122,9 +122,10 @@ sudo python3 launch.py verify      # screenshot it, and walk every FLX4 control
 The screen belongs to the player, so there is nothing to look at over SSH — the
 launcher therefore takes its own screenshots:
 
-* one is saved automatically 25 s after every start, in
-  `/var/log/rb4r5/screenshots/`;
-* `sudo python3 launch.py fbdump shot.png` grabs one on demand;
+* three are saved automatically as it comes up — at 10 s, 30 s and 90 s after
+  every start — in `/var/log/rb4r5/screenshots/`;
+* `sudo python3 launch.py screenshot` grabs one now, and `-n 5 -i 2` takes a
+  burst while you work a control;
 * `sudo python3 launch.py verify` saves one, checks the frame really covers the
   whole panel (a letterboxed or top-left-corner frame is the classic symptom of
   a broken scale path), confirms audio is running through the FLX4, and then

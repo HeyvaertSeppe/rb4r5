@@ -28,7 +28,8 @@ sudo python3 launch.py            # do whatever is missing, then run
 | `zones` | Print and validate the touch layout; `--write-default` restores it. |
 | `audio` | Show the ALSA cards, the device that will be used and why; `--env` prints what the shim gets. |
 | `logs` | Tail the logs: `logs -f`, `logs rbp.log`, `logs -n 100`. |
-| `fbdump` | Save what is on the screen (`/tmp/rb4r5-screen.png` by default) — handy over SSH. |
+| `screenshot` | Screenshot the player right now, into `/var/log/rb4r5/screenshots`. `-n 5 -i 2` takes a burst, which is how you capture the UI reacting to a control. |
+| `fbdump` | The same thing to an exact path (`/tmp/rb4r5-screen.png` by default). |
 | `service` | `install`, `remove`, `start`, `stop`, `restart`, `status`, `enable`, `disable`. |
 | `config` | Print the effective configuration, or change it: `config --set audio.channels=2`. |
 | `touchd`, `usbwatch` | The daemons themselves; the supervisor runs these, and you can run one by hand to watch it work. |

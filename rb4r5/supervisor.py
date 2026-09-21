@@ -308,29 +308,36 @@ class Supervisor:
             self.shutdown()
         return 0
 
-    def capture_screenshot(self, delay: float = 25.0) -> None:
-        """Save what the player put on screen, a few seconds in.
+    def capture_screenshot(self) -> None:
+        """Save what the player put on screen, a few times as it comes up.
 
         There is no other way to see the UI over SSH, and it is the first thing
-        anyone asks for when something looks wrong.  Best effort: a failure
-        here must never affect the player.
+        anyone wants when something looks wrong.  Several captures rather than
+        one, because the first seconds are a black screen and a splash: by 90 s
+        the library is up.  Best effort throughout - a failure here must never
+        touch the player.
         """
         if not self.cfg.get("display.screenshot_on_start", True):
             return
+        delays = self.cfg.get("display.screenshot_delays") or [10, 30, 90]
+        shots = util.ensure_dir(self.cfg.logs / "screenshots")
 
         def shoot():
-            time.sleep(delay)
-            try:
-                shots = util.ensure_dir(self.cfg.logs / "screenshots")
-                path = shots / f"startup-{time.strftime('%Y%m%d-%H%M%S')}.png"
-                util.info(display.fb_dump(str(path),
-                                          self.cfg.get("display.fbdev",
-                                                       "/dev/fb0")))
-            except Exception as exc:                      # noqa: BLE001
-                util.debug(f"screenshot failed: {exc}")
+            previous = 0.0
+            for delay in delays:
+                time.sleep(max(0.0, float(delay) - previous))
+                previous = float(delay)
+                try:
+                    path = shots / (f"startup-{time.strftime('%Y%m%d-%H%M%S')}"
+                                    f"-{int(delay)}s.png")
+                    util.info(display.fb_dump(
+                        str(path), self.cfg.get("display.fbdev", "/dev/fb0")))
+                except Exception as exc:                  # noqa: BLE001
+                    util.debug(f"screenshot at {delay}s failed: {exc}")
 
-        thread = threading.Thread(target=shoot, daemon=True)
-        thread.start()
+        threading.Thread(target=shoot, daemon=True).start()
+        util.info(f"screenshots of the player will appear in {shots} "
+                  f"(at {', '.join(str(d) + 's' for d in delays)})")
 
     # -- status ------------------------------------------------------------
     def status_lines(self) -> list[str]:

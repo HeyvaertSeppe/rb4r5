@@ -138,8 +138,8 @@ framebuffer whose first 400 kB is mostly non-zero. `fbdump` needs
 `python3-pil` for PNG output (installed by `setup`) and otherwise writes raw
 BGRA.
 
-A screenshot is also saved automatically 25 s after every start, in
-`/var/log/rb4r5/screenshots/` — so if the screen ever looks wrong there is a
+Screenshots are also saved automatically as the player comes up — at 10 s,
+30 s and 90 s after every start — in `/var/log/rb4r5/screenshots/` — so if the screen ever looks wrong there is a
 record of what it looked like. `verify` additionally samples the framebuffer's
 four corners and its centre: a frame that leaves corners black is not covering
 the panel, which is exactly what a missing scale path (F4) looks like.

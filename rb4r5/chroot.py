@@ -314,6 +314,8 @@ def player_env(cfg, audio_env: dict) -> dict:
     env = {
         "LD_PRELOAD": preload,
         "DFB_ROTATE": str(cfg.get("display.rotate", "off")),
+        # read by the patched fbdev driver: fill the panel or keep 16:10
+        "RB_FB_FIT": str(cfg.get("display.fit", "fill")),
         "HOME": "/root",
         "TERM": "linux",
     }

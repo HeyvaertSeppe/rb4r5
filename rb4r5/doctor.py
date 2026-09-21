@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import fb as fbmod
 from . import (audio, chroot, config, display, firmware, inputs, platform5,
                probe, supervisor, usbwatch, util, zones)
 
@@ -73,15 +74,21 @@ def run(cfg, verbose: bool = False) -> int:
     _row("framebuffer", f"{fb['dev']} "
                         f"{'present' if fb['present'] else 'MISSING'}")
     if fb["present"]:
-        _row("geometry", f"{fb['width']}x{fb['height']} @{fb['bpp']}bpp "
+        _row("geometry", f"{fb['width']}x{fb['height']} "
+                         f"{fb.get('fmt') or str(fb['bpp']) + 'bpp'} "
                          f"({fb['name']}), stride {fb['stride']}, pan {fb['pan']}")
+        for line in fbmod.describe(cfg.get("display.fbdev", "/dev/fb0"))[1:]:
+            _row("", line.strip())
         _row("scaling", display.scale_note(cfg))
         nonzero = display.fb_nonzero(fb["dev"])
         _row("content", f"{nonzero} non-zero bytes in the first 400k"
                         + (" (something is drawn)" if nonzero > 1000 else " (blank)"))
-        if fb["bpp"] not in (16, 32):
-            warnings.append(f"the framebuffer is {fb['bpp']}bpp; the driver's "
-                            "convert path expects 16 or 32")
+        if not fb.get("fmt"):
+            warnings.append(
+                f"the framebuffer's pixel layout is not one the driver knows "
+                f"({fb['bpp']}bpp, red at {fb.get('red')}); it will be "
+                f"treated as the usual layout for that depth.  Run "
+                f"`launch.py fbtest` and check the colours.")
     else:
         problems.append("no framebuffer: add dtoverlay=vc4-kms-v3d to "
                         f"{platform5.boot_dir()}/config.txt and reboot")

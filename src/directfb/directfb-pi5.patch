@@ -1,34 +1,182 @@
---- a/systems/fbdev/fbdev.c	2026-09-11 20:29:29.472224817 +0200
-+++ b/systems/fbdev/fbdev.c	2026-09-11 20:28:48.118948207 +0200
-@@ -159,6 +159,27 @@
-      /* copy the whole logical buffer to scratch first (safe in-place) */
-      memcpy( scratch, src, (size_t)sh * spitch );
+--- a/systems/fbdev/fbdev.c
++++ b/systems/fbdev/fbdev.c
+@@ -49,6 +49,10 @@
  
-+     if (src_bpp == 2 && deg == 0 && sw > 0 && sh > 0 && fw > 0 && fh > 0) {
-+          /* Pi 5 HDMI: scale the logical RGB565 frame to fill the whole
-+           * physical RGB32 fb (nearest neighbour, 16.16 fixed point).
-+           * 1280x800 -> 1920x1080 covers every destination pixel, so stale
-+           * content (and the letterbox area) is cleared each frame. */
-+          unsigned int xstep = (unsigned int)(((unsigned long)sw << 16) / fw);
-+          unsigned int ystep = (unsigned int)(((unsigned long)sh << 16) / fh);
+ #include <pthread.h>
+ 
++/* rb4r5: RGB565 -> physical fb publish path (format aware, NEON where the
++ * compiler is told the target has it).  Unit tested by tools/tests/test_fbscale.c. */
++#include "rb4r5_scale.h"
 +
-+          for (y = 0; y < (unsigned)fh; y++) {
-+               const unsigned short *srow = (const unsigned short *)
-+                    (scratch + (size_t)((y * ystep) >> 16) * spitch);
-+               unsigned int *drow = (unsigned int *)(dst + (size_t)y * fpitch);
-+               unsigned int xf = 0;
-+               for (x = 0; x < (unsigned)fw; x++) {
-+                    drow[x] = rgb565_to_rgb32( srow[xf >> 16] );
-+                    xf += xstep;
-+               }
-+          }
+ #ifdef USE_SYSFS
+ # include <sysfs/libsysfs.h>
+ #endif
+@@ -120,103 +124,87 @@
+ extern FBDev *dfb_fbdev;   /* defined further below */
+ 
+ /*
+- * ROTATION (Prime GO): software-rotate the logical layer surface into the
+- * physical framebuffer layout.
++ * Publish the logical layer surface into the physical framebuffer.
+  *
+  *   src  : logical surface buffer, sw x sh pixels, spitch bytes/row
+- *   dst  : physical fb buffer, fw x fh pixels, fpitch bytes/row
+- *   deg  : 90 = left (CCW), 270 = right (CW), 180 = upside down
++ *   d    : the physical destination - pixel format, pitch and rectangle
++ *   deg  : 0 = straight (the Pi 5), 90 = left, 270 = right, 180 = flipped
+  *
+- * Uses the process-global scratch buffer (shared->rot_scratch) so the
+- * in-place rotation is safe. 32bpp only.
++ * deg 0 with an RGB565 source - the Pi 5 case - is one pass per row through
++ * rb4r5_scale565(): scale to the destination rectangle and convert to the
++ * framebuffer's own format at the same time.  The rotating cases (Prime GO,
++ * Chromebit) go pixel by pixel via the process-global scratch buffer, so the
++ * rotation is safe in place; they draw at the origin and ignore a letterbox
++ * rectangle, which no rotated panel here needs.
+  */
+-/* convert RGB565 -> RGB32 (single pixel) */
+-static inline unsigned int
+-rgb565_to_rgb32( unsigned int px )
+-{
+-     unsigned int r = (px >> 11) & 0x1f;
+-     unsigned int g = (px >> 5)  & 0x3f;
+-     unsigned int b = px & 0x1f;
+-     r = (r << 3) | (r >> 2);
+-     g = (g << 2) | (g >> 4);
+-     b = (b << 3) | (b >> 2);
+-     return 0xff000000 | (r << 16) | (g << 8) | b;
++static void
++rb4r5_dst_for_fb( RB4R5Dst *d, FBDevShared *shared, int sw, int sh )
++{
++     /* real_var is read with a raw ioctl at init, so the LD_PRELOAD fb shim
++      * cannot lie to us about the panel the way it lies to rbp. */
++     const struct fb_var_screeninfo *v =
++          shared->real_var.xres ? &shared->real_var : &shared->current_var;
++
++     rb4r5_dst_init( d, v->bits_per_pixel,
++                     v->red.offset,   v->red.length,
++                     v->green.offset, v->green.length,
++                     v->blue.offset,  v->blue.length,
++                     shared->rot_fw, shared->rot_fh, shared->rot_fpitch,
++                     sw, sh, shared->rot_fit );
+ }
+ 
+ static void
+-fbdev_rotate_primary( unsigned char *src, int sw, int sh, int spitch,
+-                      unsigned char *dst, int fw, int fh, int fpitch,
+-                      int deg )
++fbdev_publish_frame( const unsigned char *src, int sw, int sh, int spitch,
++                     unsigned char *dst, const RB4R5Dst *d, int deg )
+ {
+-     FBDevShared *shared = dfb_fbdev->shared;
++     FBDevShared   *shared  = dfb_fbdev->shared;
+      unsigned char *scratch = shared->rot_scratch;
+-     unsigned int   x, y;
+      int src_bpp = (shared->rot_src_bpp >= 2) ? shared->rot_src_bpp : 4;
++     int x, y;
++
++     if (!src || !dst || sw <= 0 || sh <= 0 || spitch <= 0)
++          return;
++
++     if (deg == 0 && src_bpp == 2) {
++          rb4r5_scale565( src, sw, sh, spitch, dst, d );
 +          return;
 +     }
+ 
+-     if (!scratch || !src || !dst)
++     if (!scratch)
+           return;
+ 
+-     /* copy the whole logical buffer to scratch first (safe in-place) */
++     /* copy the whole logical buffer to scratch first (safe in place) */
+      memcpy( scratch, src, (size_t)sh * spitch );
+ 
+-     if (src_bpp == 2) {
+-          /* RGB16 source -> RGB32 fb: convert while rotating */
+-          for (y = 0; y < (unsigned)sh; y++) {
+-               const unsigned short *srow = (const unsigned short *)(scratch + y * spitch);
+-               for (x = 0; x < (unsigned)sw; x++) {
+-                    unsigned int *dp;
+-                    unsigned int  px = rgb565_to_rgb32( srow[x] );
+-                    switch (deg) {
+-                    case 90:
+-                         dp = (unsigned int *)(dst + (sw - 1 - x) * fpitch + y * 4);
+-                         break;
+-                    case 270:
+-                         dp = (unsigned int *)(dst + x * fpitch + (fw - 1 - y) * 4);
+-                         break;
+-                    case 180:
+-                         dp = (unsigned int *)(dst + (sh - 1 - y) * fpitch + (sw - 1 - x) * 4);
+-                         break;
+-                    default:
+-                         dp = (unsigned int *)(dst + y * fpitch + x * 4);
+-                         break;
+-                    }
+-                    dp[0] = px;
+-               }
+-          }
++     if (deg == 0 && src_bpp == 4 && d->bpp == 4 && sw == d->w && sh == d->h) {
++          for (y = 0; y < sh; y++)                        /* plain row copy */
++               memcpy( dst + (size_t)(d->y + y) * d->pitch + (size_t)d->x * 4,
++                       scratch + (size_t)y * spitch, (size_t)sw * 4 );
+           return;
+      }
+ 
+-     switch (deg) {
+-     case 90: /* left / counter-clockwise: dst(y, sw-1-x) = src(x,y) */
+-          for (y = 0; y < (unsigned)sh; y++) {
+-               const unsigned int *srow = (const unsigned int *)(scratch + y * spitch);
+-               for (x = 0; x < (unsigned)sw; x++) {
+-                    unsigned int *dp = (unsigned int *)(dst + (sw - 1 - x) * fpitch + y * 4);
+-                    dp[0] = srow[x];
+-               }
+-          }
+-          break;
+-     case 270: /* right / clockwise: dst(x, fw-1-y) = src(x,y) */
+-          for (y = 0; y < (unsigned)sh; y++) {
+-               const unsigned int *srow = (const unsigned int *)(scratch + y * spitch);
+-               for (x = 0; x < (unsigned)sw; x++) {
+-                    unsigned int *dp = (unsigned int *)(dst + x * fpitch + (fw - 1 - y) * 4);
+-                    dp[0] = srow[x];
+-               }
+-          }
+-          break;
+-     case 180:
+-          for (y = 0; y < (unsigned)sh; y++) {
+-               const unsigned int *srow = (const unsigned int *)(scratch + y * spitch);
+-               for (x = 0; x < (unsigned)sw; x++) {
+-                    unsigned int *dp = (unsigned int *)(dst + (sh - 1 - y) * fpitch + (sw - 1 - x) * 4);
+-                    dp[0] = srow[x];
++     for (y = 0; y < sh; y++) {
++          const unsigned char *srow = scratch + (size_t)y * spitch;
 +
-      if (src_bpp == 2) {
-           /* RGB16 source -> RGB32 fb: convert while rotating */
-           for (y = 0; y < (unsigned)sh; y++) {
-@@ -275,6 +296,14 @@
++          for (x = 0; x < sw; x++) {
++               unsigned char *p;
++               int dx, dy;
++
++               switch (deg) {
++               case 90:  dx = y;              dy = sw - 1 - x; break;
++               case 270: dx = d->fw - 1 - y;  dy = x;          break;
++               case 180: dx = sw - 1 - x;     dy = sh - 1 - y; break;
++               default:  dx = x;              dy = y;          break;
+                }
++               if (dx < 0 || dy < 0 || dx >= d->fw || dy >= d->fh)
++                    continue;
++
++               p = dst + (size_t)dy * d->pitch + (size_t)dx * d->bpp;
++               if (src_bpp == 2)
++                    rb4r5_store( p, d->fmt, ((const unsigned short *)srow)[x] );
++               else
++                    rb4r5_store_argb( p, d->fmt, ((const unsigned int *)srow)[x] );
+           }
+-          break;
+-     default: /* no rotation: plain copy */
+-          memcpy( dst, scratch, (size_t)sh * spitch );
+-          break;
+      }
+ }
+ 
+@@ -275,6 +263,14 @@
                                          DFBSurfaceFlipFlags         flags,
                                          CoreSurfaceBufferLock      *lock );
  
@@ -43,7 +191,7 @@
  
  static DisplayLayerFuncs primaryLayerFuncs = {
       .LayerDataSize      = primaryLayerDataSize,
-@@ -288,6 +317,7 @@
+@@ -288,6 +284,7 @@
       .SetRegion          = primarySetRegion,
       .RemoveRegion       = primaryRemoveRegion,
       .FlipRegion         = primaryFlipRegion,
@@ -51,7 +199,7 @@
  };
  
  /******************************************************************************/
-@@ -410,7 +440,12 @@
+@@ -410,7 +407,12 @@
       }
  
       /* should be closed automatically in children upon exec(...) */
@@ -65,7 +213,7 @@
       {
            D_PERROR( "Fusion/Init: Setting FD_CLOEXEC flag failed!\n" );
            goto error;
-@@ -565,7 +598,6 @@
+@@ -565,7 +567,6 @@
  
       dfb_fbdev->core   = core;
       dfb_fbdev->shared = shared;
@@ -73,7 +221,7 @@
  
       page_size = direct_pagesize();
  
-@@ -620,7 +652,6 @@
+@@ -620,7 +621,6 @@
                      "Could not disable console acceleration!\n" );
            goto error;
       }
@@ -81,7 +229,7 @@
  
       dfb_fbdev_var_to_mode( &shared->current_var,
                              &shared->current_mode );
-@@ -630,18 +661,25 @@
+@@ -630,18 +630,25 @@
        * The actual geometry comes from the layer region config at flip time,
        * here we only remember the physical fb geometry. */
       shared->rot_deg    = 0;
@@ -114,11 +262,42 @@
  
                 /* read the REAL fb geometry via raw syscall (bypasses the
                  * LD_PRELOAD shim that lies to rbp about the logical size) */
-@@ -668,7 +706,6 @@
+@@ -668,7 +675,37 @@
                      else
                           shared->rot_fpitch = shared->fix.line_length;
                 }
 -               { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"ROTINIT: real_fb=%dx%d pitch=%d (orig_var=%dx%d)\n",shared->rot_fw,shared->rot_fh,shared->rot_fpitch,shared->orig_var.xres,shared->orig_var.yres); fclose(f);} }
++
++               /* What the physical fb actually wants, and where the frame
++                * goes in it.  Nothing here is assumed: the vc4 fbdev
++                * emulation hands out RGB565 on some kernels and XRGB8888 on
++                * others, and "video=HDMI-A-1:1920x1080-32" changes it again.
++                * Writing the wrong width of pixel is not a subtle fault - it
++                * puts half the UI across the whole panel with the colours
++                * mangled - so the format is read, not guessed. */
++               {
++                    const char *fit = getenv( "RB_FB_FIT" );
++                    RB4R5Dst d;
++
++                    shared->rot_fit = (fit && (!strcmp( fit, "aspect" ) ||
++                                               !strcmp( fit, "keep" ))) ? 1 : 0;
++                    shared->rot_clear = 3;
++
++                    rb4r5_dst_for_fb( &d, shared,
++                                      shared->orig_var.xres ? (int)shared->orig_var.xres : 1280,
++                                      shared->orig_var.yres ? (int)shared->orig_var.yres : 800 );
++
++                    D_INFO( "FBDev/rb4r5: fb %dx%d %s (%d bpp, pitch %d) "
++                            "<- frame %dx%d at %d,%d %dx%d [%s]%s\n",
++                            shared->rot_fw, shared->rot_fh,
++                            rb4r5_fmt_name( d.fmt ),
++                            shared->real_var.bits_per_pixel, shared->rot_fpitch,
++                            shared->orig_var.xres, shared->orig_var.yres,
++                            d.x, d.y, d.w, d.h,
++                            shared->rot_fit ? "aspect" : "fill",
++                            d.guessed ? " NOTE: unrecognised pixel layout, assumed"
++                                      : "" );
++               }
  
                 /* logical layer geometry (shimmed): orig_var carries the
                  * logical xres/yres/bpp that rbp believes in. */
@@ -158,7 +337,7 @@
                 }
                 else
                      yofs = lock->offset / lock->pitch + config->source.y;
-@@ -1667,6 +1703,74 @@
+@@ -1667,6 +1703,76 @@
       return DFB_OK;
  }
  
@@ -176,26 +355,28 @@
 +     int sw  = config->width  ? config->width  : 1280;
 +     int sh  = config->height ? config->height : 800;
 +     int spitch = lock->pitch ? lock->pitch : shared->fix.line_length;
-+     int fw  = shared->rot_fw;
-+     int fh  = shared->rot_fh;
-+     int fpitch = shared->rot_fpitch;
-+     int idx = 0;
++     RB4R5Dst d;
 +
 +     if (!shared->rot_enable || !shared->rot_surface)
 +          return DFB_OK;
 +
-+     /* Always render into physical buffer 0 and keep the pan at 0.  The DRM
++     rb4r5_dst_for_fb( &d, shared, sw, sh );
++
++     /* The first frames black the whole panel: the console has usually left
++      * text on it, and an aspect fit leaves bars that nothing else writes. */
++     if (shared->rot_clear > 0) {
++          shared->rot_clear--;
++          rb4r5_clear( dfb_fbdev->framebuffer_base, &d );
++     }
++
++     /* Always draw into physical buffer 0 and keep the pan at 0.  The DRM
 +      * fbdev emulation on the Pi exposes a single buffer, and on the RK3288
 +      * the VOP ignored a panned one, so this is right on both.  The frame is
 +      * still read from rot_surface + lock->offset (DirectFB cycles its own
 +      * buffers); only the destination is pinned. */
-+     idx = 0;
-+
-+     fbdev_rotate_primary( (unsigned char*)shared->rot_surface + lock->offset,
-+                           sw, sh, spitch,
-+                           dfb_fbdev->framebuffer_base + idx * fh * fpitch,
-+                           fw, fh, fpitch,
-+                           shared->rot_deg );
++     fbdev_publish_frame( (const unsigned char*)shared->rot_surface + lock->offset,
++                          sw, sh, spitch,
++                          dfb_fbdev->framebuffer_base, &d, shared->rot_deg );
 +
 +     /* the pixels are already in the fb; panning just selects the buffer.
 +      * Don't propagate a pan error - the frame is written either way. */
@@ -233,7 +414,7 @@
  static DFBResult
  primaryFlipRegion( CoreLayer             *layer,
                     void                  *driver_data,
-@@ -1685,34 +1789,18 @@
+@@ -1685,34 +1791,18 @@
           !dfb_config->pollvsync_after)
            dfb_screen_wait_vsync( dfb_screens_at(DSCID_PRIMARY) );
  
@@ -280,7 +461,7 @@
            if (ret)
                 return ret;
       }
-@@ -1775,7 +1863,7 @@
+@@ -1775,7 +1865,7 @@
  
       var = &shared->current_var;
  
@@ -289,7 +470,7 @@
            var = &shared->real_var;   /* PATCH: use the REAL fb geometry (the
                                          LD_PRELOAD shim may lie to rbp) */
  
-@@ -2156,7 +2244,7 @@
+@@ -2156,7 +2246,7 @@
                 var.blue           = real.blue;
                 var.transp         = real.transp;
                 var.grayscale      = real.grayscale;
@@ -298,18 +479,20 @@
                      var.xres          = real.xres;
                      var.yres          = real.yres;
                      var.xres_virtual  = real.xres_virtual;
---- a/systems/fbdev/fbdev.h	2026-09-11 20:29:29.472224817 +0200
-+++ b/systems/fbdev/fbdev.h	2026-09-11 14:32:22.602349222 +0200
-@@ -108,6 +108,7 @@
+--- a/systems/fbdev/fbdev.h
++++ b/systems/fbdev/fbdev.h
+@@ -108,6 +108,9 @@
        *   rot_fpitch= physical fb line_length (e.g. 3200)
        *   rot_scratch = scratch buffer for the software rotation */
       int                      rot_deg;
 +     int                      rot_enable;   /* rb4r5: scale/convert even with deg 0 */
++     int                      rot_fit;      /* rb4r5: 0 = fill the panel, 1 = keep 16:10 */
++     int                      rot_clear;    /* rb4r5: frames left to black the whole fb */
       int                      rot_sw;
       int                      rot_sh;
       int                      rot_spitch;
---- a/systems/fbdev/fbdev_surface_pool.c	2026-09-11 20:29:29.472224817 +0200
-+++ b/systems/fbdev/fbdev_surface_pool.c	2026-09-11 16:07:46.601950386 +0200
+--- a/systems/fbdev/fbdev_surface_pool.c
++++ b/systems/fbdev/fbdev_surface_pool.c
 @@ -112,7 +112,7 @@
       ret_desc->caps              = CSPCAPS_PHYSICAL | CSPCAPS_VIRTUAL;
       ret_desc->access[CSAID_CPU] = CSAF_READ | CSAF_WRITE | CSAF_SHARED;
@@ -352,3 +535,133 @@
  
  
       D_DEBUG_AT( FBDev_SurfLock, "  -> offset %lu, pitch %d, addr %p, phys 0x%08lx\n",
+--- a/inputdrivers/linux_input/linux_input.c
++++ b/inputdrivers/linux_input/linux_input.c
+@@ -38,6 +38,25 @@
+ 
+ #include <linux/input.h>
+ 
++/*
++ * rb4r5: struct input_event lost its "time" member.
++ *
++ * Since kernel 4.16 the member only exists when the application has not asked
++ * for a 64-bit time_t; otherwise the timestamp lives in two __kernel_ulong_t
++ * fields.  Both variants define input_event_sec/input_event_usec, which is
++ * what the kernel headers tell userspace to use, so build the timeval from
++ * those.  Without this the driver does not compile against any current
++ * kernel headers:
++ *     linux_input.c:750: 'const struct input_event' has no member named 'time'
++ */
++#ifndef input_event_sec
++# define input_event_sec   time.tv_sec
++# define input_event_usec  time.tv_usec
++#endif
++#define RB_LEVT_TV(levt)                                            \
++     ((struct timeval){ .tv_sec  = (time_t)(levt)->input_event_sec, \
++                        .tv_usec = (suseconds_t)(levt)->input_event_usec })
++
+ #ifndef KEY_OK
+ /* Linux kernel 2.5.42+ defines additional keys in linux/input.h */
+ #include "input_fake.h"
+@@ -747,7 +766,7 @@
+                  DFBInputEvent            *devt )
+ {
+      devt->flags     = DIEF_TIMESTAMP;
+-     devt->timestamp = levt->time;
++     devt->timestamp = RB_LEVT_TV(levt);
+ 
+      switch (levt->type) {
+           case EV_KEY:
+@@ -2076,7 +2095,7 @@
+      int abs, rel;
+ 
+      devt->flags     = DIEF_TIMESTAMP | DIEF_AXISREL;
+-     devt->timestamp = levt->time;
++     devt->timestamp = RB_LEVT_TV(levt);
+      devt->type      = DIET_AXISMOTION;
+ 
+      switch (levt->code) {
+@@ -2169,9 +2188,9 @@
+ 
+           /* Check if button release is due. */
+           if (state->fsm_state == TOUCHPAD_FSM_DRAG_START &&
+-              timeout_passed( &state->timeout, &levt->time )) {
++              timeout_passed( &state->timeout, &RB_LEVT_TV(levt) )) {
+                devt->flags     = DIEF_TIMESTAMP;
+-               devt->timestamp = state->timeout; /* timeout of levt->time? */
++               devt->timestamp = state->timeout; /* timeout of RB_LEVT_TV(levt)? */
+                devt->type      = DIET_BUTTONRELEASE;
+                devt->button    = DIBI_FIRST;
+ 
+@@ -2191,28 +2210,28 @@
+      case TOUCHPAD_FSM_START:
+           if (touchpad_finger_landing( levt )) {
+                state->fsm_state = TOUCHPAD_FSM_MAIN;
+-               state->timeout = levt->time;
++               state->timeout = RB_LEVT_TV(levt);
+                timeout_add( &state->timeout, &timeout );
+           }
+           return 0;
+ 
+      case TOUCHPAD_FSM_MAIN:
+           if (touchpad_finger_moving( levt )) {
+-               if (1){//timeout_passed( &state->timeout, &levt->time )) {
++               if (1){//timeout_passed( &state->timeout, &RB_LEVT_TV(levt) )) {
+                     //timeout_clear( &state->timeout );
+                     return touchpad_translate( state, levt, devt );
+                }
+           }
+           else if (touchpad_finger_leaving( levt )) {
+-               if (!timeout_passed( &state->timeout, &levt->time )) {
++               if (!timeout_passed( &state->timeout, &RB_LEVT_TV(levt) )) {
+                     devt->flags     = DIEF_TIMESTAMP;
+-                    devt->timestamp = levt->time;
++                    devt->timestamp = RB_LEVT_TV(levt);
+                     devt->type      = DIET_BUTTONPRESS;
+                     devt->button    = DIBI_FIRST;
+ 
+                     touchpad_fsm_init( state );
+                     state->fsm_state = TOUCHPAD_FSM_DRAG_START;
+-                    state->timeout = levt->time;
++                    state->timeout = RB_LEVT_TV(levt);
+                     timeout_add( &state->timeout, &timeout );
+                     return 1;
+                }
+@@ -2223,9 +2242,9 @@
+           return 0;
+ 
+      case TOUCHPAD_FSM_DRAG_START:
+-          if (timeout_passed( &state->timeout, &levt->time )){
++          if (timeout_passed( &state->timeout, &RB_LEVT_TV(levt) )){
+                devt->flags     = DIEF_TIMESTAMP;
+-               devt->timestamp = state->timeout; /* timeout of levt->time? */
++               devt->timestamp = state->timeout; /* timeout of RB_LEVT_TV(levt)? */
+                devt->type      = DIET_BUTTONRELEASE;
+                devt->button    = DIBI_FIRST;
+ 
+@@ -2235,7 +2254,7 @@
+           else {
+                if (touchpad_finger_landing( levt )) {
+                     state->fsm_state = TOUCHPAD_FSM_DRAG_MAIN;
+-                    state->timeout = levt->time;
++                    state->timeout = RB_LEVT_TV(levt);
+                     timeout_add( &state->timeout, &timeout );
+                }
+           }
+@@ -2243,14 +2262,14 @@
+ 
+      case TOUCHPAD_FSM_DRAG_MAIN:
+           if (touchpad_finger_moving( levt )) {
+-               if (1){//timeout_passed( &state->timeout, &levt->time )) {
++               if (1){//timeout_passed( &state->timeout, &RB_LEVT_TV(levt) )) {
+                    //timeout_clear( &state->timeout );
+                     return touchpad_translate( state, levt, devt );
+                }
+           }
+           else if (touchpad_finger_leaving( levt )) {
+                devt->flags     = DIEF_TIMESTAMP;
+-               devt->timestamp = levt->time;
++               devt->timestamp = RB_LEVT_TV(levt);
+                devt->type      = DIET_BUTTONRELEASE;
+                devt->button    = DIBI_FIRST;
+ 

@@ -115,6 +115,7 @@ sudo python3 launch.py build       # shims, DirectFB, daemons, patched player
 sudo python3 launch.py run         # run and supervise it
 sudo python3 launch.py doctor      # check every subsystem
 sudo python3 launch.py verify      # screenshot it, and walk every FLX4 control
+sudo python3 launch.py fbtest      # test pattern: is the panel and its format right?
 ```
 
 ## Seeing it work
@@ -123,9 +124,14 @@ The screen belongs to the player, so there is nothing to look at over SSH — th
 launcher therefore takes its own screenshots:
 
 * three are saved automatically as it comes up — at 10 s, 30 s and 90 s after
-  every start — in `/var/log/rb4r5/screenshots/`;
+  every start — in `/var/log/rb4r5/screenshots/`. They are decoded using the
+  pixel format the driver reports, so a screenshot cannot make a working screen
+  look broken;
 * `sudo python3 launch.py screenshot` grabs one now, and `-n 5 -i 2` takes a
   burst while you work a control;
+* `sudo python3 launch.py fbtest` puts a colour-bar pattern on the panel with
+  no player involved at all — one photograph of it says whether the mode, the
+  edges and the pixel format are right ([docs/04](docs/04-display.md));
 * `sudo python3 launch.py verify` saves one, checks the frame really covers the
   whole panel (a letterboxed or top-left-corner frame is the classic symptom of
   a broken scale path), confirms audio is running through the FLX4, and then

@@ -168,3 +168,42 @@ become a fallback rather than the main path.
 | A tap selects when you meant to scroll | `tap_slop` too large | lower it |
 | Scrubbing a deck does nothing | the deck has no track loaded | load one first |
 | Multiple touches confuse it | expected: only the first contact is used | — |
+
+## When touches land on the wrong control
+
+Zones are defined in **normalised UI space** (0..1 of the RX3's 1280×800), and
+the daemon converts panel coordinates into that space. So a touch lands where
+it looks like it landed only if what the panel shows really is the UI.
+
+That matters because of the display bug in
+[04, F8](04-display.md): while the driver was writing 32-bit pixels into a
+16 bpp framebuffer, the visible picture was the **left half of the UI stretched
+over the whole panel**. Every touch then hit a control at roughly half the x it
+appeared to be at — which looks exactly like "touch does not work". If the
+screen is not showing the UI correctly, fix that first and re-test touch
+afterwards.
+
+Once the picture is right:
+
+```sh
+PI# python3 launch.py calibrate           # each touch prints its zone
+PI# python3 launch.py calibrate --raw     # every evdev event, for a dead panel
+```
+
+`calibrate` now reports how many evdev events arrived, not just how many
+touches it recognised, and distinguishes the three failures:
+
+* **no device at all** — it lists every `/dev/input/event*` with the reason it
+  was not taken as a touchscreen (no `ABS_MT_POSITION_X`, no `BTN_TOUCH`, …).
+  A 22″ touch monitor needs its own USB lead; the video cable does not carry
+  touch.
+* **events but no contacts** — the panel reports `ABS_MT_*` without
+  `BTN_TOUCH`; `--raw` output says which codes it does send.
+* **contacts but every one outside every zone** — the axes are swapped or
+  inverted: `touch.swap_xy`, `touch.invert_x`, `touch.invert_y`.
+
+Name a panel explicitly if the wrong device is picked:
+
+```sh
+PI# sudo python3 launch.py config --set touch.device=/dev/input/event5
+```

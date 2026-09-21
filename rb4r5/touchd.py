@@ -332,17 +332,58 @@ def run(cfg, once: bool = False) -> int:
     return TouchDaemon(cfg).run(once=once)
 
 
-def calibrate(cfg, seconds: float = 60.0) -> int:
+def why_no_touchscreen() -> list[str]:
+    """Every event device and why it is not the touchscreen.
+
+    "no touchscreen found" on its own is useless; a panel that the kernel sees
+    but we rejected looks exactly like a panel that is not plugged in.
+    """
+    lines = ["what the kernel reports under /dev/input:"]
+    found = inputs.devices()
+    if not found:
+        return lines + [
+            "  nothing at all - no /dev/input/event* devices.",
+            "  Check the USB cable of the panel (the touch side needs its own",
+            "  USB lead, the video cable does not carry it), and run this as",
+            "  root: the nodes are not readable otherwise.",
+        ]
+    for dev in found:
+        why = []
+        if dev["is_touchscreen"]:
+            why.append("TOUCHSCREEN" + (" (multitouch)" if dev["multitouch"]
+                                        else " (single touch)"))
+        else:
+            if inputs.ABS_MT_POSITION_X not in dev["axes"]:
+                why.append("no ABS_MT_POSITION_X")
+            if inputs.ABS_X not in dev["axes"]:
+                why.append("no ABS_X")
+            if inputs.BTN_TOUCH not in dev["keys"]:
+                why.append("no BTN_TOUCH")
+        lines.append(f"  {dev['path']:20} {dev['name'][:34]:34} "
+                     f"{', '.join(why) or 'not a pointer'}")
+    lines += [
+        "",
+        "If the panel is in that list as a TOUCHSCREEN, name it explicitly:",
+        "    sudo python3 launch.py config set touch.device /dev/input/eventN",
+        "If it is listed but not recognised, its driver reports neither",
+        "multitouch nor BTN_TOUCH; send this output and it can be handled.",
+    ]
+    return lines
+
+
+def calibrate(cfg, seconds: float = 60.0, raw: bool = False) -> int:
     """Print every touch with its normalised position and the zone it hits."""
     daemon = TouchDaemon(cfg)
     if not daemon.open_device():
-        raise util.Fail("no touchscreen found (see: rb4r5 doctor)")
+        print("\n".join(why_no_touchscreen()))
+        raise util.Fail("no touchscreen found")
     print(f"\nTouch the screen; each contact prints its position and zone.")
     print(f"Zones from {cfg.get('touch.zones_file')}:")
     print("\n".join(zones.describe(daemon.zone_map)))
     print(f"\nListening for {seconds:.0f}s (Ctrl-C to stop)...\n")
 
     hits = []
+    events = [0]
 
     def report(nx, ny, zone):
         name = zone.get("name", "?") if zone else "(no zone)"
@@ -358,18 +399,44 @@ def calibrate(cfg, seconds: float = 60.0) -> int:
     for name in ("send_key", "tap_key", "send_ctrl", "tap_ctrl", "rotate", "value"):
         setattr(keys, name, lambda *a, **k: True)
 
+    names = {inputs.ABS_MT_SLOT: "ABS_MT_SLOT",
+             inputs.ABS_MT_TRACKING_ID: "ABS_MT_TRACKING_ID",
+             inputs.ABS_MT_POSITION_X: "ABS_MT_POSITION_X",
+             inputs.ABS_MT_POSITION_Y: "ABS_MT_POSITION_Y",
+             inputs.ABS_X: "ABS_X", inputs.ABS_Y: "ABS_Y"}
+
     deadline = time.monotonic() + seconds
     try:
         while time.monotonic() < deadline:
             ready, _, _ = select.select([daemon.reader.fd], [], [], 0.5)
-            if ready:
-                daemon.handle_events(daemon.reader.read())
+            if not ready:
+                continue
+            batch = daemon.reader.read()
+            events[0] += len(batch)
+            if raw:
+                for etype, code, value in batch:
+                    if etype == inputs.EV_SYN:
+                        print("  --- SYN_REPORT")
+                    else:
+                        label = names.get(code, f"code {code}")
+                        print(f"  raw    type {etype} {label:20} = {value}")
+            daemon.handle_events(batch)
     except KeyboardInterrupt:
         pass
     finally:
         daemon.close_device()
-    print(f"\n{len(hits)} touches seen.")
-    if hits and all(h == "(no zone)" for h in hits):
+
+    print(f"\n{events[0]} evdev events, {len(hits)} touches seen.")
+    if not events[0]:
+        print("The device opened but sent nothing at all.  Either that is not "
+              "the touch panel,\nor its contacts are not reaching the "
+              "kernel.  Run with --raw and try again;\nif it stays silent:")
+        print("\n".join(why_no_touchscreen()))
+    elif not hits:
+        print("Events arrived but no contact was recognised - the panel may "
+              "report only\nABS_MT_* without BTN_TOUCH.  Run with --raw and "
+              "send the output.")
+    elif all(h == "(no zone)" for h in hits):
         print("Every touch fell outside every zone - check touch.swap_xy / "
               "invert_x / invert_y in the config.")
     return 0

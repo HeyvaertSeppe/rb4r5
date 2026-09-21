@@ -47,7 +47,10 @@ guessing.
 | The UI in the top-left corner, junk around it | the scale path is missing (same cause) | as above |
 | Text or `[ OK ]` lines flickering over the UI | `display.quiet_console` is 0, or `getty@tty1` came back | `launch.py config --set display.quiet_console=2`; `systemctl disable getty@tty1` |
 | The screen blanks after ten minutes | console blanking | `setup` adds `consoleblank=0`; check `cmdline.txt` |
-| Colours look wrong / the image is torn | the framebuffer is not 16 or 32 bpp | `launch.py doctor` prints the geometry; pin a mode with `display.force_mode` |
+| **Half the UI spread across the panel, olive-yellow background, lavender panels, white text still white** | the module was built before the framebuffer's pixel format was read from the driver: 32-bit pixels written into a 16 bpp framebuffer ([04, F8](04-display.md)) | `git pull`, then `sudo python3 launch.py build` and `run`. Confirm with `launch.py fbtest` first: the eight colour bars must come out in the printed order |
+| Colours look wrong in some other way | the framebuffer's layout is not one the driver recognises, or the panel is BGR | `sudo python3 launch.py fbtest` — photograph it and compare with the printed bar order; `launch.py doctor` prints the bitfields |
+| The picture is stretched horizontally | the RX3 UI is 16:10 and the panel is 16:9; "full screen" stretches it | `launch.py config --set display.fit=aspect` keeps the shape and adds black bars |
+| The image is torn | a frame is published while the panel is scanning it out | harmless on the Pi's single-buffer fbdev emulation; `display.force_mode` can pin a lower refresh |
 
 ## The firmware will not unpack
 
@@ -81,6 +84,12 @@ guessing.
 | `the soft-float cross compiler is missing` | wrong toolchain installed | `sudo apt install gcc-arm-linux-gnueabi libc6-dev-armel-cross` — *gnueabi*, not gnueabihf |
 | `<shim>.so references GLIBC_2.x` and the build stops | the shims were linked against the host glibc, not the RX3 one | the chroot is the sysroot; re-run `launch.py payload` then `build` |
 | `DirectFB NOT built: command failed` | the underlying error is above it, and in full in `/opt/rb4r5/work/dfb-build/make.log` | read that log; the first `error:` line is the real one |
+
+## The build fails, part two
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `'const struct input_event' has no member named 'time'` | DirectFB 1.4 predates the kernel 4.16 change that removes that member when the build asks for a 64-bit `time_t` | fixed in `directfb-pi5.patch`: it uses the `input_event_sec`/`input_event_usec` macros the kernel headers define for exactly this. `git pull`, then `build` |
 
 ## The player will not start
 

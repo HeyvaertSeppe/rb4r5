@@ -15,7 +15,7 @@ import os
 import re
 from pathlib import Path
 
-from . import util
+from . import fb, util
 
 FB_SYS = "/sys/class/graphics/fb0"
 
@@ -48,6 +48,15 @@ def fb_info(fbdev: str = "/dev/fb0") -> dict:
     if not info["height"]:
         # fbdev emulation usually has virtual == visible
         info["height"] = info["vheight"]
+
+    # sysfs is convenient but says nothing about the pixel layout, and its
+    # geometry can lag the current mode; the ioctls are the truth.
+    real = fb.screeninfo(fbdev)
+    if not real["error"] and real["width"]:
+        info.update(width=real["width"], height=real["height"],
+                    bpp=real["bpp"], stride=real["line_length"],
+                    fmt=real["fmt"], vheight=real["yres_virtual"] or info["vheight"])
+    info.setdefault("fmt", "")
     return info
 
 
@@ -83,9 +92,11 @@ def scale_note(cfg) -> str:
     ui_h = cfg.get("display.ui_height", 800)
     if not info["present"] or not info["width"]:
         return "framebuffer not available"
+    fmt = info.get("fmt") or f"{info['bpp']}bpp"
+    same = fmt == "RGB565"
     return (f"{ui_w}x{ui_h} RGB565 (RX3 UI) -> {info['width']}x{info['height']} "
-            f"@{info['bpp']}bpp ({info['name'] or 'fb0'}), scaled in the "
-            f"DirectFB fbdev driver")
+            f"{fmt} ({info['name'] or 'fb0'}), scaled in the DirectFB fbdev "
+            f"driver" + (" (no colour conversion needed)" if same else ""))
 
 
 # --------------------------------------------------------------------------
@@ -145,30 +156,18 @@ def restore_console() -> list[str]:
 
 
 def fb_dump(path: str, fbdev: str = "/dev/fb0") -> str:
-    """Save the current framebuffer as a PNG (needs Pillow) or raw BGRA.
+    """Save what is on screen as a PNG.
 
-    Handy for checking what the player is presenting over SSH, without a TV.
+    The pixels are read and converted according to the format the driver
+    reports (see rb4r5/fb.py), not a guess: a 16bpp framebuffer decoded as
+    32bpp - or the other way round - produces a picture that looks broken when
+    the screen is fine, which is worse than no screenshot at all.  No Pillow
+    needed either, so this works on a stock image.
     """
-    info = fb_info(fbdev)
-    if not info["present"]:
-        raise util.Fail(f"{fbdev} does not exist")
-    width, height, bpp = info["width"], info["height"], info["bpp"]
-    nbytes = width * height * (bpp // 8)
-    with open(fbdev, "rb") as handle:
-        data = handle.read(nbytes)
-    if len(data) < nbytes:
-        raise util.Fail(f"short read from {fbdev} ({len(data)}/{nbytes})")
-    try:
-        from PIL import Image  # optional
-    except ImportError:
-        Path(path).write_bytes(data)
-        return (f"wrote raw {width}x{height} {bpp}bpp to {path} "
-                f"(install python3-pil for PNG output)")
-    mode = "BGRA" if bpp == 32 else "BGR;16"
-    img = Image.frombuffer("RGBA" if bpp == 32 else "RGB",
-                           (width, height), data, "raw", mode, 0, 1)
-    img.convert("RGB").save(path)
-    return f"wrote {width}x{height} PNG to {path}"
+    width, height, rgb = fb.capture(fbdev)
+    if not path.lower().endswith(".png"):
+        path += ".png"
+    return fb.write_png(path, width, height, rgb)
 
 
 def fb_nonzero(fbdev: str = "/dev/fb0", sample: int = 400_000) -> int:

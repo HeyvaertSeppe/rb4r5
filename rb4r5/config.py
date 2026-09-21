@@ -41,6 +41,10 @@ DEFAULTS: dict = {
         "force_mode": None,
         "hdmi_port": 0,                  # Pi 5 has two: 0 = the one next to USB-C
         "rotate": "off",                 # DFB_ROTATE: off|left|right|180
+        # "fill" stretches the RX3's 1280x800 over the whole panel (what the
+        # RX3 itself looks like, and what "full screen" means); "aspect" keeps
+        # 16:10 and leaves black bars on a 16:9 screen.
+        "fit": "fill",
         "quiet_console": 2,              # 0 keep console, 1 quiet printk, 2 also detach fbcon
         "screenshot_on_start": True,     # save what the UI looks like as it starts
         "screenshot_delays": [10, 30, 90],

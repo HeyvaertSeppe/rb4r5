@@ -20,6 +20,10 @@ NEON=${NEON:-1}
 }
 
 cd "$BUILD"
+# pick up edits to the scaler header, which lives in the repo, not the tree
+if [ -n "${REPO:-}" ] && [ -f "$REPO/src/directfb/rb4r5_scale.h" ]; then
+    cp -f "$REPO/src/directfb/rb4r5_scale.h" systems/fbdev/rb4r5_scale.h
+fi
 FBDEV_CFLAGS=""
 if [ "$NEON" = 1 ]; then
     # softfp keeps the soft-float calling convention (no Tag_ABI_VFP_args), so

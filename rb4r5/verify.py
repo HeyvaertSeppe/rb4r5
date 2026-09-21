@@ -116,7 +116,8 @@ def check_display(cfg, result: Result, shots: Path) -> None:
                    f"{fb['dev']} does not exist - is vc4-kms-v3d enabled?")
         return
     result.add("display", "framebuffer", "pass",
-               f"{fb['width']}x{fb['height']} @{fb['bpp']}bpp ({fb['name']})")
+               f"{fb['width']}x{fb['height']} "
+               f"{fb.get('fmt') or str(fb['bpp']) + 'bpp'} ({fb['name']})")
 
     running = bool(util.pgrep_arg("/root/pdj/rbp"))
     result.add("display", "player process", "pass" if running else "fail",
@@ -159,7 +160,7 @@ def _fullscreen_probe(fb: dict) -> tuple[bool, str]:
     """Read the framebuffer's corners and centre; all-black corners mean the
     frame is not covering the panel."""
     width, height, bpp = fb["width"], fb["height"], fb["bpp"]
-    if not width or not height or bpp not in (16, 32):
+    if not width or not height or bpp not in (16, 24, 32):
         return False, "cannot sample this framebuffer"
     step = bpp // 8
     stride = fb["stride"] if fb["stride"] > 0 else width * step

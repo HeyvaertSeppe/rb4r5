@@ -121,11 +121,11 @@ In the order I would check them:
 0. **Run `sudo python3 launch.py verify`.** It is the fastest way to find out
    what is real: it screenshots the player, says whether the frame covers the
    panel, checks audio is running through the FLX4, and walks every control.
-1. **The display.** `RB_DFB_DEBUG=1 launch.py run`, then `/tmp/flipdbg.log`
-   should show `FLIP 0` and then `UPDATE` lines, and `launch.py fbdump` should
-   show the UI. This is inherited working code aimed at a new framebuffer; the
-   most likely surprise is the fbdev emulation's pitch or format differing from
-   what the driver assumes.
+1. **The display.** ~~The most likely surprise is the fbdev emulation's pitch
+   or format differing from what the driver assumes.~~ It was exactly that, and
+   it is now fixed — see the section below. `launch.py fbtest` answers the
+   question in one photograph, before the player is involved at all;
+   `RB_DFB_DEBUG=1 launch.py run` plus `/tmp/flipdbg.log` covers the rest.
 2. **The DirectFB build.** Our patch applies on top of PrimeBox's
    `directfb-full.diff`, which is not in this repository, so hunk offsets cannot
    be checked here. `patch -F3` is used and `.rej` files are left behind;
@@ -143,6 +143,47 @@ In the order I would check them:
    someone works it out, the zone map becomes a fallback rather than the
    main path.
 
+## What the first run on real hardware actually found
+
+Two things, both invisible on the build host, and worth recording because
+neither looked like its cause.
+
+**The framebuffer was 16 bpp, not 32.** `/dev/fb0` is the DRM fbdev emulation
+of `vc4-kms-v3d`, and its depth is a kernel decision, not a property of the
+hardware or the mode: RGB565 on some kernels, XRGB8888 on others, and settable
+from the kernel command line (`video=HDMI-A-1:1920x1080-32`). The publish path
+wrote 32-bit pixels regardless, so each write covered two screen pixels and
+each row ran into the next. What that looks like is *not* "wrong colours": it
+is half the UI stretched across the panel, an olive-yellow background where
+dark blue-grey should be, lavender panels, and white text that is still
+perfectly white. The pixel format is now read from the driver
+(`FBIOGET_VSCREENINFO`, via a raw syscall so the fb shim cannot lie about it),
+classified in `src/directfb/rb4r5_scale.h`, and the row write is clamped to the
+reported line length so a misdetection cannot corrupt anything. Seven layouts
+are handled; RGB565 is the fast one, because the source is RGB565 too and no
+conversion happens at all.
+
+The lesson worth carrying: **nothing about fbdev emulation is stable except
+what the ioctls say.** Not the depth, not the pitch, not the channel order.
+
+**DirectFB 1.4's input driver does not compile against current kernel
+headers.** `struct input_event` lost its `time` member in kernel 4.16 when the
+build asks for a 64-bit `time_t`; the driver uses `levt->time` fourteen times.
+The patch defines a `timeval` from the `input_event_sec`/`input_event_usec`
+macros that the kernel headers provide for precisely this, which works with
+both old and new headers.
+
+Both were found by cross-compiling the whole stack for `arm-linux-gnueabi`
+rather than natively for the build host — the native build is a weak proxy,
+because it exercises neither the NEON code nor the 32-bit headers. That
+cross build, and running the scaler's unit tests for armv7 under
+`qemu-arm-static`, are now the standard check:
+
+```sh
+apt install gcc-arm-linux-gnueabi libc6-dev-armel-cross qemu-user-static
+./tools/tests/run-all.sh        # includes the NEON tests under qemu
+```
+
 ## Things that will bite whoever works on this next
 
 * Two players fight over the subucom FIFOs and the screen; always check
@@ -156,3 +197,6 @@ In the order I would check them:
   without `memshim`'s `poll()` interception two threads spin a core each.
 * The engine reports no duration (and so refuses to play) if the
   `getTotalLength` quirk is ever applied. Do not apply it.
+* Touch zones are normalised to the *UI*, not the panel, so a display fault
+  makes touch look broken: every contact lands where the UI thinks it is, not
+  where it appears on a mis-scaled screen. Fix the picture first.

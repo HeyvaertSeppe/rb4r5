@@ -24,12 +24,25 @@ for src in src/shims/memshim.c src/shims/audioshim.c src/shims/keyshim.c; do
        -DSYS_mmap2=192 -DSYS_poll=168 "$src" && echo "  $src ok"
 done
 
+echo "== C: framebuffer publish path (src/directfb/rb4r5_scale.h)"
+cc -O2 -Wall -Wextra -o "$TMP/fbscale" tools/tests/test_fbscale.c
+"$TMP/fbscale" | tail -1
+if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1 && \
+   command -v qemu-arm-static >/dev/null 2>&1; then
+    # the same tests against the real NEON expander, which is what runs on the
+    # Pi: every RGB565 value through both channel orders, bit for bit
+    arm-linux-gnueabi-gcc -O2 -Wall -Wextra -march=armv7-a -mfpu=neon \
+        -mfloat-abi=softfp -static -o "$TMP/fbscale-neon" tools/tests/test_fbscale.c
+    qemu-arm-static "$TMP/fbscale-neon" | tail -1
+else
+    echo "  NEON path not checked (needs arm-linux-gnueabi-gcc and qemu-arm-static)"
+fi
+
 echo "== patch integrity"
 python3 - <<'PY'
 import re, sys
 bad = 0
-for path in ("src/directfb/directfb-pi5.patch",
-             "src/directfb/directfb-pi5-neon.patch"):
+for path in ("src/directfb/directfb-pi5.patch",):
     lines = open(path).read().split("\n")
     if lines and lines[-1] == "":
         lines.pop()

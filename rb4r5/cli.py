@@ -11,14 +11,13 @@ import json
 import os
 import signal
 import subprocess
-import time
 import sys
 import time
 from pathlib import Path
 
 from . import (__version__, audio, build, chroot, config, display, doctor,
-               firmware, keys, platform5, probe, provision, supervisor, touchd,
-               usbwatch, util, verify, zones)
+               fb, firmware, keys, platform5, probe, provision, supervisor,
+               touchd, usbwatch, util, verify, zones)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -222,7 +221,7 @@ def cmd_usbwatch(args, cfg) -> int:
 
 
 def cmd_calibrate(args, cfg) -> int:
-    return touchd.calibrate(cfg, seconds=args.seconds)
+    return touchd.calibrate(cfg, seconds=args.seconds, raw=args.raw)
 
 
 def cmd_probe(args, cfg) -> int:
@@ -297,6 +296,49 @@ def cmd_logs(args, cfg) -> int:
         return 1
     cmd = ["tail"] + (["-F"] if args.follow else ["-n", str(args.lines)]) + paths
     return subprocess.call(cmd)
+
+
+def cmd_fbtest(args, cfg) -> int:
+    """Put a test pattern on the panel, in the framebuffer's own format.
+
+    This takes rbp, the chroot, the shims and DirectFB out of the picture
+    entirely: if the pattern is right, the panel, the mode and the pixel
+    format are all right, and anything still wrong is above this layer.  If
+    the pattern itself is wrong, a photograph of it says exactly how.
+    """
+    util.require_root("writing to the framebuffer")
+    fbdev = cfg.get("display.fbdev", "/dev/fb0")
+    if util.pgrep_arg("/root/pdj/rbp") and not args.force:
+        raise util.Fail("the player is running and owns the screen - "
+                        "stop it first (launch.py stop), or pass --force")
+
+    info = fb.screeninfo(fbdev)
+    if info["error"]:
+        raise util.Fail(info["error"])
+    for line in fb.describe(fbdev):
+        print(line)
+    print()
+
+    pattern = fb.test_pattern(info,
+                              cfg.get("display.ui_width", 1280),
+                              cfg.get("display.ui_height", 800),
+                              aspect=args.aspect)
+    with open(fbdev, "wb") as handle:
+        handle.write(pattern)
+    print("\n".join(fb.legend(info)))
+    if args.png:
+        print(fb.write_png(args.png, info["width"], info["height"],
+                           fb.to_rgb(pattern, info)))
+    print(f"\nholding it for {args.seconds:.0f}s - photograph the screen now")
+    try:
+        time.sleep(max(0.0, float(args.seconds)))
+    except KeyboardInterrupt:
+        pass
+    if not args.keep:
+        with open(fbdev, "wb") as handle:
+            handle.write(b"\x00" * (info["line_length"] * info["height"]))
+        print("screen cleared")
+    return 0
 
 
 def cmd_fbdump(args, cfg) -> int:
@@ -477,7 +519,24 @@ def build_parser() -> argparse.ArgumentParser:
     usb.add_argument("--once", action="store_true")
     usb.set_defaults(func=cmd_usbwatch)
 
+    fbt = sub.add_parser("fbtest", help="test pattern on the panel: proves the "
+                                       "mode, the pixel format and the colours")
+    fbt.add_argument("--seconds", type=float, default=30,
+                     help="how long to hold the pattern (default 30)")
+    fbt.add_argument("--aspect", action="store_true",
+                     help="mark where the UI goes with RB_FB_FIT=aspect")
+    fbt.add_argument("--png", metavar="PATH",
+                     help="also save the pattern as a PNG to compare against")
+    fbt.add_argument("--keep", action="store_true",
+                     help="leave the pattern on screen afterwards")
+    fbt.add_argument("--force", action="store_true",
+                     help="write to the framebuffer even while the player runs")
+    fbt.set_defaults(func=cmd_fbtest)
+
     cal = sub.add_parser("calibrate", help="show which zone each touch hits")
+    cal.add_argument("--raw", action="store_true",
+                     help="also print every evdev event, for a panel that "
+                          "looks dead")
     cal.add_argument("--seconds", type=float, default=60.0)
     cal.set_defaults(func=cmd_calibrate)
 

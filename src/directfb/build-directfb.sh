@@ -8,10 +8,11 @@
 #   1. PrimeBox's directfb-full.diff  - soft-float/fbdev groundwork for this
 #      player on non-Pioneer hardware (serialized fb ioctls, forced real fb
 #      format, FRONTONLY fallback, the RGB565->RGB32 rotate/scale path)
-#   2. directfb-pi5.patch             - run the convert+scale path with rotation
-#      off, publish on UpdateRegion (not just FlipRegion), always write physical
-#      buffer 0, scale 1280x800 -> the real mode, no versioned fcntl()
-#   3. directfb-pi5-neon.patch        - NEON RGB565->XRGB8888 row expander
+#   2. directfb-pi5.patch + rb4r5_scale.h - run the convert+scale path with
+#      rotation off, publish on UpdateRegion (not just FlipRegion), always write
+#      physical buffer 0, scale 1280x800 -> the real mode in the fb's own pixel
+#      format (RGB565 or XRGB8888, whichever the kernel handed out - see
+#      rb4r5_scale.h), NEON row expander, no versioned fcntl()
 #
 # Runs on the Pi itself (or any machine with the armel cross toolchain).
 #
@@ -31,7 +32,7 @@ RX3=${RX3:-/opt/rb4r5/chroot}
 PRIMEBOX=${PRIMEBOX:-/opt/rb4r5/PrimeBox}
 DFBDIFF=${DFBDIFF:-$PRIMEBOX/tools/build-directfb/directfb-full.diff}
 OURPATCH=$REPO/src/directfb/directfb-pi5.patch
-NEONPATCH=$REPO/src/directfb/directfb-pi5-neon.patch
+SCALEHDR=$REPO/src/directfb/rb4r5_scale.h
 SYS=${SYS:-/opt/rb4r5/work/sysroot}
 BUILD=${BUILD:-/opt/rb4r5/work/dfb-build}
 OUT=${OUT:-/opt/rb4r5/work/dfb}
@@ -48,7 +49,7 @@ die() { echo "build-directfb: $*" >&2; exit 1; }
 [ -d "$RX3/lib" ]  || die "no RX3 userland at $RX3/lib (run: launch.py payload)"
 [ -f "$DFBDIFF" ]  || die "PrimeBox DirectFB diff not found: $DFBDIFF"
 [ -f "$OURPATCH" ] || die "our patch not found: $OURPATCH"
-[ -f "$NEONPATCH" ] || die "NEON patch not found: $NEONPATCH"
+[ -f "$SCALEHDR" ] || die "scaler header not found: $SCALEHDR"
 command -v ${CROSS}gcc >/dev/null || die "missing ${CROSS}gcc (apt install gcc-arm-linux-gnueabi)"
 
 echo "== 1. soft-float sysroot ($SYS)"
@@ -78,10 +79,8 @@ git clone -q "$DFBURL" "$BUILD" || die "cannot clone DirectFB from $DFBURL"
 cd "$BUILD"
 git checkout -q origin/directfb-1.4        # == 1.4.16
 patch -p1 --quiet -F3 < "$DFBDIFF"  || die "PrimeBox diff did not apply"
+cp -f "$SCALEHDR" systems/fbdev/rb4r5_scale.h
 patch -p1 --quiet -F3 < "$OURPATCH" || die "directfb-pi5.patch did not apply (see *.rej)"
-if [ "$NEON" = 1 ]; then
-    patch -p1 --quiet -F3 < "$NEONPATCH" || die "NEON patch did not apply"
-fi
 # PrimeBox's diff leaves a per-allocation debug write in the surface pool;
 # it is pure overhead here.  Harmless if the line is already gone.
 sed -i 's@^.*fopen("/tmp/dfbdig9.log".*$@/* rb4r5: debug log removed */@' \
@@ -155,6 +154,8 @@ make -j"$JOBS" LDFLAGS="$LDFLAGS" > "$BUILD/make.log" 2>&1 || {
 
 # The fbdev module gets the NEON flags; softfp (not hard) keeps the base
 # calling convention, so it stays link-compatible with the soft-float core.
+# That is what makes __ARM_NEON true in rb4r5_scale.h - without it the module
+# still works, just with the scalar row expander.
 if [ "$NEON" = 1 ]; then
     echo "== 4b. rebuild systems/fbdev with NEON"
     BASECFLAGS=$(sed -n 's/^CFLAGS = //p' systems/fbdev/Makefile)

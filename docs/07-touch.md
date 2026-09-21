@@ -220,3 +220,31 @@ Name a panel explicitly if the wrong device is picked:
 ```sh
 PI# sudo python3 launch.py config --set touch.device=/dev/input/event5
 ```
+
+## Browse lists: why tapping a playlist did nothing
+
+The engine has no "open the thing at this pixel". It has "turn the browse
+knob" and "press it". So a tap that only presses SELECT opens whatever was
+already highlighted — which is almost never the row you just touched, and
+looks exactly like touch not working at all.
+
+The `list` zone type fixes that. A tap works out which row was touched, turns
+the selector by the difference between that row and where the highlight is,
+and then presses it:
+
+```json
+{"name": "list", "rect": [0.00, 0.09, 1.00, 0.70],
+ "type": "list", "key": "selector", "select_key": "select", "rows": 9}
+```
+
+* **drag** still scrolls the list, and the tracked highlight follows;
+* **tap a row** moves the highlight there and opens it;
+* **long-press a row** says "the highlight is already here" and re-syncs
+  without sending anything — the repair when the controller's own knob has
+  moved it behind our back;
+* pressing BROWSE, BACK, SOURCE, MENU or TAG LIST puts the tracked highlight
+  back at the top, because those all open a fresh list.
+
+`rows` is how many rows the list shows on screen. If tapping consistently
+lands a row or two off, that number is wrong for your firmware's layout:
+count the rows on screen and set it.

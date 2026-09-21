@@ -96,6 +96,11 @@
 #define K_HPLEVEL     0x4406
 #define K_COLOR       0x509d
 #define K_FILTER      0x50a6
+/* Not an RX3 keycode: a note mapped to this opens the launcher's effect
+ * picker instead of going to the player.  The FLX4 has one FX knob and no
+ * way to see the list, so the picker is the missing half of that control. */
+#define K_OVERLAY_FX  0xf001
+
 #define K_BFXTYPE     0x448b
 #define K_BFXCH       0x448c
 #define K_BFX         0x448d
@@ -126,8 +131,11 @@ static int   opt_filter_init = 0;
 static const char *fifo_path = "/tmp/rb-ctrl.fifo";
 static const char *midi_dev  = NULL;
 static const char *map_file  = NULL;
+static const char *opt_overlay = "/tmp/rb-overlay.fifo";
 static float jog_ppr = 1800.0f;    /* jog pulses per revolution */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
+static int   jog_reverse = 0;      /* the platter turns the other way     */
+static float jog_scale = 1.0f;     /* how hard a turn pushes the engine   */
 
 static int fifo_fd = -1;
 
@@ -344,6 +352,8 @@ static void jog_delta(int midi_ch, int delta)
             s = &jogs[i];
     if (!s || delta == 0)
         return;
+    if (jog_reverse)
+        delta = -delta;
 
     long long t = now_ms();
     float dt = (float)(t - s->last_ms) / 1000.0f;
@@ -352,7 +362,10 @@ static void jog_delta(int midi_ch, int delta)
         dt = 0.0005f;
 
     s->vpos = (s->vpos + (unsigned int)delta) & 0xFFFFu;
-    float speed = (float)delta / jog_ppr / dt;
+    /* revolutions per second, which is what the engine's jog control wants;
+     * jog_scale is the tuning knob when a turn moves the platter too far or
+     * not far enough, and jog_ppr is the wheel's own resolution. */
+    float speed = (float)delta / jog_ppr / dt * jog_scale;
     if (speed > 8.0f) speed = 8.0f;
     if (speed < -8.0f) speed = -8.0f;
     s->moving = 1;
@@ -488,7 +501,7 @@ static struct notemap notemap[NMAP_MAX] = {
 
     /* ---- BEAT FX (ch 5, and ch 6 when the FX is assigned to CH2) ---- */
     { MC_FX1, 0x63, K_BFXTYPE,  CH_GLOBAL, "BEAT FX select" },
-    { MC_FX1, 0x64, K_BFXTYPE,  CH_GLOBAL, "SHIFT+BEAT FX select" },
+    { MC_FX1, 0x64, K_OVERLAY_FX, CH_GLOBAL, "SHIFT+BEAT FX select (picker)" },
     { MC_FX1, 0x4A, K_BEATPREV, CH_GLOBAL, "BEAT <" },
     { MC_FX1, 0x4B, K_BEATNEXT, CH_GLOBAL, "BEAT >" },
     { MC_FX1, 0x47, K_BFX,      CH_GLOBAL, "BEAT FX on/off" },
@@ -606,6 +619,25 @@ static int handle_fxch(int ch, int note)
 }
 
 /* ---------------- MIDI dispatch ---------------- */
+/* One line into the overlay daemon's command fifo.  Never blocks and never
+ * matters if nothing is listening: the picker is a convenience, and the
+ * controller must not stall because a daemon is not running. */
+static void overlay_command(const char *word)
+{
+    int fd = open(opt_overlay, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        if (opt_verbose)
+            logmsg("  (no overlay daemon on %s: %s)\n", opt_overlay,
+                   strerror(errno));
+        return;
+    }
+    if (write(fd, word, strlen(word)) < 0 || write(fd, "\n", 1) < 0) {
+        if (opt_verbose)
+            logmsg("  (overlay fifo write failed: %s)\n", strerror(errno));
+    }
+    close(fd);
+}
+
 static void handle_note(int ch, int note, int on)
 {
     if (opt_sniff) {
@@ -627,6 +659,14 @@ static void handle_note(int ch, int note, int on)
         int sch;
         if (notemap[i].ch != ch || notemap[i].note != note || !notemap[i].key)
             continue;
+        if (notemap[i].key == K_OVERLAY_FX) {
+            if (on)
+                overlay_command("fx");
+            if (opt_verbose)
+                logmsg("  %s -> effect picker %s\n", notemap[i].name,
+                       on ? "toggle" : "(release)");
+            return;
+        }
         sch = notemap[i].send_ch;
         if (sch == 0)
             sch = (ch == MC_DECK1) ? 1 : 2;
@@ -777,7 +817,7 @@ int main(int argc, char **argv)
 
     /* -l is handled after the whole option list, so `-l -m map.conf` and
      * `-m map.conf -l` behave the same. */
-    while ((opt = getopt(argc, argv, "vsld:f:m:J:F")) != -1) {
+    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:RF")) != -1) {
         switch (opt) {
         case 'v': opt_verbose = 1; break;
         case 's': opt_sniff = 1; opt_verbose = 1; break;
@@ -785,11 +825,15 @@ int main(int argc, char **argv)
         case 'f': fifo_path = optarg; break;
         case 'm': map_file = optarg; break;
         case 'J': jog_ppr = (float)atof(optarg); break;
+        case 'R': jog_reverse = 1; break;
+        case 'S': jog_scale = (float)atof(optarg); break;
+        case 'O': opt_overlay = optarg; break;
         case 'F': opt_filter_init = 1; break;
         case 'l': opt_list = 1; break;
         default:
             fprintf(stderr, "usage: %s [-v] [-s] [-l] [-d dev] [-f fifo] "
-                            "[-m mapfile] [-J jog_ppr] [-F]\n", argv[0]);
+                            "[-m mapfile] [-J jog_ppr] [-S jog_scale] [-R] "
+                            "[-O overlayfifo] [-F]\n", argv[0]);
             return 2;
         }
     }
@@ -804,8 +848,9 @@ int main(int argc, char **argv)
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
 
-    logmsg("flx4-bridge: %s -> %s (jog %g pulses/rev)\n",
-           opt_sniff ? "SNIFF (no output)" : "bridge", fifo_path, (double)jog_ppr);
+    logmsg("flx4-bridge: %s -> %s (jog %g pulses/rev, scale %g%s)\n",
+           opt_sniff ? "SNIFF (no output)" : "bridge", fifo_path,
+           (double)jog_ppr, (double)jog_scale, jog_reverse ? ", reversed" : "");
 
     if (!opt_sniff) {
         fifo_fd = open(fifo_path, O_RDWR | O_NONBLOCK);

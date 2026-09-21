@@ -11,6 +11,11 @@ works on any panel size.  Types:
     key     press on touch-down, release on touch-up      (key, ch)
     scroll  vertical drag turns the browse knob;
             a tap sends `tap_key`                         (key, tap_key, ch)
+    list    a browse list: drag scrolls it, and a tap on a
+            row moves the highlight onto that row and
+            opens it.  A long press says "the highlight is
+            already here" and re-syncs without sending
+            anything                                      (key, select_key, rows)
     jog     horizontal drag scrubs a deck                 (ch)
     value   drag sets a 10-bit value (faders, EQ, filter)  (key, ch, op, axis)
     none    ignore touches here
@@ -50,9 +55,14 @@ DEFAULT = {
         # --- the big middle area: browse list / menus ----------------------
         # A vertical drag turns the browse knob (the only way the engine can
         # move a selection); a tap is SELECT.
+        # Tapping a row has to MOVE the highlight onto it first: the engine
+        # has no "open the thing at this pixel", only "turn the knob" and
+        # "press it".  Tapping and pressing select alone opens whatever was
+        # already highlighted, which is why tapping a playlist appeared to do
+        # nothing (docs/07-touch.md).
         {"name": "list", "rect": [0.00, 0.09, 1.00, 0.70],
-         "type": "scroll", "key": "selector", "tap_key": "select",
-         "invert": False},
+         "type": "list", "key": "selector", "select_key": "select",
+         "rows": 9, "invert": False},
 
         # --- waveform row: scrub each deck ---------------------------------
         {"name": "deck1-scrub", "rect": [0.00, 0.70, 0.50, 0.82],
@@ -107,6 +117,9 @@ def save_default(path: str | Path) -> bool:
     return util.write_text(path, json.dumps(DEFAULT, indent=2) + "\n")
 
 
+VALID_TYPES = ("key", "scroll", "list", "jog", "value", "none")
+
+
 def validate(data: dict) -> list[str]:
     problems = []
     zones = data.get("zones")
@@ -127,7 +140,7 @@ def validate(data: dict) -> list[str]:
         if kind not in VALID_TYPES:
             problems.append(f"zone {label}: unknown type '{kind}' "
                             f"(one of {sorted(VALID_TYPES)})")
-        if kind in ("key", "scroll", "value") and not zone.get("key"):
+        if kind in ("key", "scroll", "list", "value") and not zone.get("key"):
             problems.append(f"zone {label}: type '{kind}' needs a 'key'")
     return problems
 

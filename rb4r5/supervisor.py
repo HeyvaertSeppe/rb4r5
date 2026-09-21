@@ -25,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import audio, chroot, config, display, platform5, util
+from . import audio, chroot, config, display, overlay, platform5, util
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -218,7 +218,11 @@ class Supervisor:
             bridge = cfg.bindir / "flx4-bridge"
             if bridge.exists():
                 argv = [str(bridge), "-f", config.FIFO_CTRL,
-                        "-J", str(cfg.get("controller.jog_ppr", 1800))]
+                        "-J", str(cfg.get("controller.jog_ppr", 1800)),
+                        "-S", str(cfg.get("controller.jog_scale", 1.0)),
+                        "-O", overlay.CMD_FIFO]
+                if cfg.get("controller.jog_reverse"):
+                    argv.append("-R")
                 if cfg.get("controller.filter_init", True):
                     argv.append("-F")
                 if cfg.get("controller.verbose"):
@@ -234,6 +238,11 @@ class Supervisor:
         if cfg.get("touch.enabled", True):
             self.children.append(Child(
                 "rbtouchd", [python, launcher, "touchd"], logs / "touchd.log"))
+
+        if cfg.get("overlay.enabled", True):
+            self.children.append(Child(
+                "rboverlay", [python, launcher, "overlay"],
+                logs / "overlay.log"))
 
         if cfg.get("keyboard.enabled", True):
             rbkeyd = cfg.bindir / "rbkeyd"
@@ -275,6 +284,42 @@ class Supervisor:
             elif child.name == "rbp":
                 time.sleep(1.0)
 
+    # -- the boot splash ---------------------------------------------------
+    def splash_until_ready(self) -> None:
+        """Cover the screen while the player comes up behind it.
+
+        Nothing is delayed to make this work: the splash is drawn by the
+        overlay daemon straight into the framebuffer while rbp starts, loads
+        and draws underneath it.  The daemon takes it down when the player's
+        own pixels appear - it fingerprints the area it painted and watches
+        for it to change - so the hand-off happens when the UI is really
+        there, not on a timer.
+        """
+        if not (self.cfg.get("overlay.enabled", True) and
+                self.cfg.get("overlay.splash", True)):
+            return
+        steps = [(0.10, "starting the engine"),
+                 (0.35, "opening the audio device"),
+                 (0.60, "loading the library"),
+                 (0.85, "drawing the interface")]
+        ceiling = float(self.cfg.get("overlay.splash_max_seconds", 75.0))
+
+        def feed():
+            started = time.monotonic()
+            for index, (progress, message) in enumerate(steps):
+                while not overlay.command(f"splash {progress:.2f} {message}"):
+                    time.sleep(0.3)          # the daemon is not listening yet
+                    if time.monotonic() - started > ceiling:
+                        return
+                # hold each step long enough to read, then move on
+                deadline = started + (index + 1) * 2.5
+                while time.monotonic() < deadline:
+                    if not overlay.read_state().get("modal"):
+                        return               # the player got there first
+                    time.sleep(0.25)
+
+        threading.Thread(target=feed, daemon=True).start()
+
     def stop_all(self) -> None:
         for child in reversed(self.children):
             child.stop()
@@ -297,6 +342,7 @@ class Supervisor:
         self.stop_stale()
         self.prepare_system()
         self.build_children()
+        self.splash_until_ready()
 
         signals = {}
 

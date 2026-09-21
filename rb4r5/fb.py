@@ -132,7 +132,7 @@ def describe(fbdev: str = "/dev/fb0") -> list[str]:
 
 
 def frame_rect(info: dict, ui_w: int = 1280, ui_h: int = 800,
-               aspect: bool = True) -> tuple[int, int, int, int]:
+               aspect: bool = True, reserve_top: int = 0) -> tuple[int, int, int, int]:
     """Where the player's frame lands in the framebuffer: (x, y, w, h).
 
     The same arithmetic as rb4r5_dst_init() in src/directfb/rb4r5_scale.h, and
@@ -141,16 +141,18 @@ def frame_rect(info: dict, ui_w: int = 1280, ui_h: int = 800,
     of the black bars.
     """
     fw, fh = info.get("width", 0), info.get("height", 0)
-    if not (aspect and ui_w > 0 and ui_h > 0 and fw > 0 and fh > 0):
-        return 0, 0, fw, fh
+    top = reserve_top if 0 < reserve_top < fh else 0
+    avail = fh - top
+    if not (aspect and ui_w > 0 and ui_h > 0 and fw > 0 and avail > 0):
+        return 0, top, fw, max(0, avail)
     by_h = fw * ui_h
-    by_w = fh * ui_w
+    by_w = avail * ui_w
     if by_h > by_w:                     # height limited
-        h, w = fh, by_w // ui_h
+        h, w = avail, by_w // ui_h
     else:                               # width limited
         w, h = fw, by_h // ui_w
-    w, h = min(w, fw), min(h, fh)
-    return (fw - w) // 2, (fh - h) // 2, w, h
+    w, h = min(w, fw), min(h, avail)
+    return (fw - w) // 2, top + (avail - h) // 2, w, h
 
 
 # --------------------------------------------------------------------------

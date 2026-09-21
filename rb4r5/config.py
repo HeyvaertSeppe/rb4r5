@@ -48,10 +48,24 @@ DEFAULTS: dict = {
         # "bilinear" (default) interpolates when scaling 1280x800 up to the
         # panel; "nearest" duplicates pixels, which is faster but looks coarse.
         "scale": "bilinear",
+        # The RX3 has a row of buttons above its screen; on a touch panel they
+        # live in a strip at the top that the player is kept out of.
+        "top_bar": True,
+        "top_bar_height": 0,             # pixels, 0 = 8% of the panel
         "quiet_console": 2,              # 0 keep console, 1 quiet printk, 2 also detach fbcon
         "screenshot_on_start": True,     # save what the UI looks like as it starts
         "screenshot_delays": [10, 30, 90],
         "blank_timeout": 0,              # console blanking, 0 = never
+    },
+    # ---- overlay (what the launcher draws itself) ---------------------------
+    "overlay": {
+        "enabled": True,
+        "buttons_file": "/etc/rb4r5/top-bar.json",
+        "fx_file": "/etc/rb4r5/fx-list.json",
+        "splash": True,                  # boot screen while the player loads
+        "splash_min_seconds": 2.0,       # never flash past too fast to read
+        "splash_max_seconds": 75.0,      # give up waiting and show the player
+        "nudge_after_picker": False,
     },
     # ---- audio -------------------------------------------------------------
     "audio": {
@@ -73,6 +87,11 @@ DEFAULTS: dict = {
         "enabled": True,
         "name": "FLX4",                  # ALSA card name fragment to look for
         "jog_ppr": 1800,                 # jog pulses per revolution
+        # Turn these two if the platter moves the wrong way or by the wrong
+        # amount: reverse flips the direction, scale multiplies how far a
+        # turn pushes the deck (0.5 = half as far, 2 = twice).
+        "jog_reverse": False,
+        "jog_scale": 1.0,
         "filter_init": True,             # select FILTER as the colour FX type
         "map_file": "/etc/rb4r5/flx4-map.conf",
         "verbose": False,

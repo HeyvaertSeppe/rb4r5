@@ -128,7 +128,7 @@ int
 main( int argc, char **argv )
 {
      const char *dev = "/dev/fb0", *path = NULL;
-     int aspect = 1, filter = 1, seconds = 30, keep = 0;
+     int aspect = 1, filter = 1, seconds = 30, keep = 0, reserve = 0;
      struct fb_var_screeninfo var;
      struct fb_fix_screeninfo fix;
      RB4R5Dst d;
@@ -136,7 +136,7 @@ main( int argc, char **argv )
      size_t maplen;
      int fd, opt;
 
-     while ((opt = getopt( argc, argv, "d:f:asnt:kh" )) != -1) {
+     while ((opt = getopt( argc, argv, "d:f:asnt:r:kh" )) != -1) {
           switch (opt) {
           case 'd': dev = optarg; break;
           case 'f': path = optarg; break;
@@ -144,10 +144,12 @@ main( int argc, char **argv )
           case 's': aspect = 0; break;
           case 'n': filter = 0; break;
           case 't': seconds = atoi( optarg ); break;
+          case 'r': reserve = atoi( optarg ); break;
           case 'k': keep = 1; break;
           default:
                fprintf( stderr, "usage: %s [-d fbdev] [-f frame.raw] "
-                                "[-a|-s] [-n] [-t seconds] [-k]\n", argv[0] );
+                                "[-a|-s] [-n] [-t seconds] [-r rows] [-k]\n",
+                                argv[0] );
                return 2;
           }
      }
@@ -187,7 +189,7 @@ main( int argc, char **argv )
                      (int)var.green.offset, (int)var.green.length,
                      (int)var.blue.offset,  (int)var.blue.length,
                      (int)var.xres, (int)var.yres, (int)fix.line_length,
-                     UI_W, UI_H, aspect, filter );
+                     UI_W, UI_H, reserve, aspect, filter );
 
      printf( "%s: %ux%u %s (%u bpp, pitch %u)%s\n", dev, var.xres, var.yres,
              rb4r5_fmt_name( d.fmt ), var.bits_per_pixel, fix.line_length,

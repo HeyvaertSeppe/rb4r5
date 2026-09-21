@@ -75,13 +75,41 @@ check("button press/release", kinds,
       [("send_key", "play", 2, True), ("send_key", "play", 2, False)])
 
 # ---------------------------------------------------------------- tap in list
+# A tap on a browse list has to move the highlight onto the row that was
+# touched before opening it: pressing select alone opens whatever happened to
+# be highlighted, which is why tapping a playlist looked like it did nothing.
 sent.clear()
 dae = daemon()
-touch_at(dae, 500, 400)          # inside the 'list' zone
+dae.highlight["list"] = 0        # the highlight starts at the top
+touch_at(dae, 500, 400)          # inside the 'list' zone, part way down
 move_to(dae, 502, 401)           # tiny movement, still a tap
 release(dae)
-check("tap in list -> select", [s[0] for s in sent], ["tap_key"])
-check("tap key", sent[0][1][0], "select")
+steps = [s for s in sent if s[0] == "rotate"]
+check("tap in list steps the highlight", len(steps) > 0, True)
+check("tap in list turns the selector", steps[0][1][0], "selector")
+check("tap in list then opens it", sent[-1][0], "tap_key")
+check("tap in list opens with select", sent[-1][1][0], "select")
+
+# tapping the row that is already highlighted just opens it
+sent.clear()
+dae = daemon()
+row = dae.row_of(dae.zone_map["zones"][6], 400 / 1000)
+dae.highlight["list"] = row
+touch_at(dae, 500, 400)
+release(dae)
+check("tapping the highlighted row sends no steps",
+      [s[0] for s in sent], ["tap_key"])
+
+# a long press says "the highlight is already here" and sends nothing
+sent.clear()
+dae = daemon()
+dae.hold_ms = 10
+touch_at(dae, 500, 400)
+time.sleep(0.05)
+release(dae)
+check("long press re-syncs silently", sent, [])
+check("long press moved the tracked row",
+      dae.highlight["list"], dae.row_of(dae.zone_map["zones"][6], 400 / 1000))
 
 # ---------------------------------------------------------------- scroll
 sent.clear()
@@ -120,9 +148,12 @@ check("jog stop sent at release", jogs[-1][1][3], 0.0)
 check("jogtouch released", any(s[0] == "send_ctrl" and
                                s[1][2] == keys.OP_RELEASE for s in sent), True)
 
-# ---------------------------------------------------------------- long press in list
+# ------------------------------------------------------- long press on a scroll
+# (the browse-knob zones keep the old rule: too slow to be a tap = no key)
 sent.clear()
 dae = daemon(touch__tap_ms=10)
+dae.zone_map["zones"][6] = dict(dae.zone_map["zones"][6], type="scroll",
+                                tap_key="select")
 touch_at(dae, 500, 400)
 time.sleep(0.05)
 release(dae)

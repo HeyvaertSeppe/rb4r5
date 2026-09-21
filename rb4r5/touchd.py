@@ -20,7 +20,7 @@ import struct
 import time
 from pathlib import Path
 
-from . import config, fb, inputs, keys, util, zones
+from . import config, fb, inputs, keys, overlay, util, zones
 
 
 class Contact:
@@ -67,6 +67,8 @@ class TouchDaemon:
         self.pending = {}          # axis values within the current SYN frame
         self.btn_touch = None
         self.on_zone = None        # callback for `calibrate`
+        self.highlight: dict[str, int] = {}     # zone name -> highlighted row
+        self.hold_ms = float(cfg.get("touch.hold_ms", 600))
 
     def _frame_fractions(self) -> tuple[float, float, float, float]:
         """Where the UI sits on the panel, as fractions of the panel.
@@ -77,11 +79,11 @@ class TouchDaemon:
         of the way across the UI.  Everything below works in UI coordinates,
         so the conversion happens once, here.
         """
-        aspect = str(self.cfg.get("display.fit", "aspect")) != "fill"
-        info = fb.screeninfo(self.cfg.get("display.fbdev", "/dev/fb0"))
+        layout = overlay.Layout(self.cfg)
+        info = layout.info
         if info.get("error") or not info.get("width"):
             return 0.0, 0.0, 1.0, 1.0          # no framebuffer: assume it fills
-        x, y, w, h = fb.frame_rect(info, self.ui_w, self.ui_h, aspect)
+        x, y, w, h = layout.frame
         fw, fh = info["width"], info["height"]
         if not (fw and fh and w and h):
             return 0.0, 0.0, 1.0, 1.0
@@ -178,6 +180,10 @@ class TouchDaemon:
         if kind == "key":
             keys.send_key(zone["key"], zone.get("ch", 1), True)
             self.log(f"{zone['name']}: press {zone['key']} ch{zone.get('ch', 1)}")
+            # entering or leaving a list puts the highlight back at the top
+            if str(zone["key"]).lower() in ("browse", "back", "source", "menu",
+                                            "taglist", "usb1", "rekordbox"):
+                self.highlight = {}
         elif kind == "jog":
             keys.tap_ctrl("jogtouch", zone.get("ch", 1))
             self.log(f"{zone['name']}: jog touch deck {zone.get('ch', 1)}")
@@ -196,7 +202,7 @@ class TouchDaemon:
         if not zone:
             return
         kind = zone.get("type", "key")
-        if kind == "scroll":
+        if kind in ("scroll", "list"):
             # Vertical drag turns the browse knob.  Dragging down moves the
             # highlight down, which is a clockwise turn (+1) - docs/07.
             contact.accum += -dy if zone.get("invert") else dy
@@ -205,6 +211,7 @@ class TouchDaemon:
                 direction = 1 if contact.accum > 0 else -1
                 contact.accum -= direction * step
                 keys.rotate(zone["key"], zone.get("ch", 1), direction)
+                self.moved_highlight(zone, direction)
             if abs(dy) > 0:
                 self.log(f"{zone['name']}: scroll dy={dy:+.3f}")
         elif kind == "jog":
@@ -220,6 +227,52 @@ class TouchDaemon:
         elif kind == "value":
             self.emit_value(zone, nx, ny)
 
+    # -- browse lists ------------------------------------------------------
+    def rows_in(self, zone: dict) -> int:
+        return max(2, int(zone.get("rows", 9)))
+
+    def row_of(self, zone: dict, ny: float) -> int:
+        """Which row of the list a touch landed on."""
+        top, bottom = zone["rect"][1], zone["rect"][3]
+        span = max(1e-6, bottom - top)
+        row = int((ny - top) / span * self.rows_in(zone))
+        return max(0, min(row, self.rows_in(zone) - 1))
+
+    def moved_highlight(self, zone: dict, direction: int) -> None:
+        """Follow the highlight as our own scrolling moves it.
+
+        The engine will not say where the highlight is, so it is tracked: each
+        step we send moves it one row until it reaches the end of the visible
+        list, at which point the list scrolls under it and the row stops
+        changing.  A long press on a row re-syncs this when something else
+        (the controller's knob) has moved it behind our back.
+        """
+        if zone.get("type") != "list":
+            return
+        name = zone.get("name", "list")
+        at = self.highlight.get(name, 0) + direction
+        self.highlight[name] = max(0, min(at, self.rows_in(zone) - 1))
+
+    def list_release(self, zone: dict, contact, held_ms: float) -> None:
+        name = zone.get("name", "list")
+        if contact.moved > self.tap_slop:
+            return                                  # it was a scroll, not a tap
+        row = self.row_of(zone, contact.start_ny)
+        if held_ms >= self.hold_ms:
+            self.highlight[name] = row
+            self.log(f"{name}: highlight re-synced to row {row}")
+            return
+        delta = row - self.highlight.get(name, 0)
+        step = 1 if delta > 0 else -1
+        for _ in range(abs(delta)):
+            keys.rotate(zone["key"], zone.get("ch", 1), step)
+            time.sleep(0.008)
+        self.highlight[name] = row
+        if delta:
+            time.sleep(0.05)                        # let the highlight land
+        keys.tap_key(zone.get("select_key", "select"), zone.get("ch", 1))
+        self.log(f"{name}: row {row} ({delta:+d} step(s)) then select")
+
     def up(self) -> None:
         contact = self.contact
         if not contact.active:
@@ -233,6 +286,8 @@ class TouchDaemon:
             elif kind == "jog":
                 keys.rotate("jog", zone.get("ch", 1), 0, 0.0, 0)
                 keys.send_ctrl("jogtouch", zone.get("ch", 1), keys.OP_RELEASE)
+            elif kind == "list":
+                self.list_release(zone, contact, held_ms)
             elif kind == "scroll":
                 if contact.moved <= self.tap_slop and held_ms <= self.tap_ms:
                     tap = zone.get("tap_key")
@@ -318,6 +373,9 @@ class TouchDaemon:
             # only the press decides the zone.
             if not inside:
                 self.log(f"touch at {nx:.3f},{ny:.3f} is off the picture")
+                return
+            if overlay.modal_up():
+                # the effect picker or the splash owns the screen
                 return
             self.down(nx, ny)
             self.publish_state(True, nx, ny)

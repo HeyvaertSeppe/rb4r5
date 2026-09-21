@@ -308,6 +308,19 @@ def umount_binds(cfg) -> list[str]:
     return notes
 
 
+def top_bar_rows(cfg) -> int:
+    """How many rows the button bar takes, or 0 when it is off."""
+    if not cfg.get("display.top_bar", True) or not cfg.get("overlay.enabled", True):
+        return 0
+    from . import fb                                    # local: keeps import order simple
+    wanted = int(cfg.get("display.top_bar_height", 0) or 0)
+    if wanted > 0:
+        return wanted
+    info = fb.screeninfo(cfg.get("display.fbdev", "/dev/fb0"))
+    height = info.get("height", 0)
+    return max(48, round(height * 0.08)) if height else 0
+
+
 def player_env(cfg, audio_env: dict) -> dict:
     """The environment rbp runs with (shims, display, audio, touch)."""
     preload = ":".join(f"/usr/lib/{name}" for name in
@@ -319,6 +332,9 @@ def player_env(cfg, audio_env: dict) -> dict:
         # 1280x800 frame on the panel (docs/04-display.md)
         "RB_FB_FIT": str(cfg.get("display.fit", "aspect")),
         "RB_FB_SCALE": str(cfg.get("display.scale", "bilinear")),
+        # rows at the top of the panel the player must not draw into: the
+        # launcher's button bar lives there (rb4r5/overlay.py)
+        "RB_FB_TOP": str(top_bar_rows(cfg)),
         "HOME": "/root",
         "TERM": "linux",
     }

@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 from . import (__version__, audio, build, chroot, config, display, doctor,
-               fb, firmware, keys, platform5, probe, provision, supervisor,
-               touchd, usbwatch, util, verify, zones)
+               fb, firmware, keys, overlay, platform5, probe, provision,
+               supervisor, touchd, usbwatch, util, verify, zones)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -298,6 +298,29 @@ def cmd_logs(args, cfg) -> int:
     return subprocess.call(cmd)
 
 
+def cmd_overlay(args, cfg) -> int:
+    """The daemon that owns the button bar, the picker and the splash."""
+    util.require_root("drawing on the framebuffer")
+    if args.splash is not None:
+        ok = overlay.command(f"splash {args.splash} {args.message or ''}")
+        print("sent" if ok else f"no overlay daemon on {overlay.CMD_FIFO}")
+        return 0 if ok else 1
+    if args.fx:
+        ok = overlay.command("fx")
+        print("sent" if ok else f"no overlay daemon on {overlay.CMD_FIFO}")
+        return 0 if ok else 1
+    if args.preview:
+        over = overlay.Overlay(cfg)
+        base = Path(args.preview)
+        util.ensure_dir(base)
+        print(over.draw_bar(target=False).to_png(str(base / "top-bar.png")))
+        print(over.draw_picker(target=False).to_png(str(base / "fx-picker.png")))
+        print(over.draw_splash(0.6, "loading the library",
+                               target=False).to_png(str(base / "splash.png")))
+        return 0
+    return overlay.run(cfg)
+
+
 def cmd_fbtest(args, cfg) -> int:
     """Put a test pattern on the panel, in the framebuffer's own format.
 
@@ -545,6 +568,18 @@ def build_parser() -> argparse.ArgumentParser:
                                           "supervisor)")
     usb.add_argument("--once", action="store_true")
     usb.set_defaults(func=cmd_usbwatch)
+
+    ov = sub.add_parser("overlay", help="the top button bar, the effect "
+                                       "picker and the boot splash")
+    ov.add_argument("--fx", action="store_true",
+                    help="open or close the effect picker on a running daemon")
+    ov.add_argument("--splash", type=float, metavar="PROGRESS",
+                    help="show the splash at this progress (0..1)")
+    ov.add_argument("--message", help="with --splash: the line under the bar")
+    ov.add_argument("--preview", metavar="DIR",
+                    help="render the three surfaces to PNGs instead of the "
+                         "panel, to see them without a screen")
+    ov.set_defaults(func=cmd_overlay)
 
     fbt = sub.add_parser("fbtest", help="test pattern on the panel: proves the "
                                        "mode, the pixel format and the colours")

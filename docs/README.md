@@ -14,6 +14,7 @@
 | [09-launcher](09-launcher.md) | Every command, the config file, the boot service |
 | [10-troubleshooting](10-troubleshooting.md) | Symptom → cause → fix |
 | [11-porting-notes](11-porting-notes.md) | What changed from the Chromebit port, what is unverified |
+| [12-overlay](12-overlay.md) | The top button bar, the effect picker and the boot splash |
 
 Conventions:
 

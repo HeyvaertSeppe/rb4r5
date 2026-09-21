@@ -105,12 +105,12 @@ test_classify( void )
      CHECK( rb4r5_classify( 8, 0,3, 3,3, 6,2 ) == RB_DST_UNKNOWN, "8bpp" );
 
      /* an unrecognised layout still draws, at the usual depth, and says so */
-     rb4r5_dst_init( &d, 32, 8,8, 16,8, 24,8, 64, 32, 256, 32, 16, 0 , 0);
+     rb4r5_dst_init( &d, 32, 8,8, 16,8, 24,8, 64, 32, 256, 32, 16, 0, 0, 0);
      CHECK( d.guessed == 1, "odd 32bpp layout should be flagged" );
      CHECK( d.fmt == RB_DST_XRGB8888 && d.bpp == 4, "fallback fmt/bpp" );
 
      /* bytes per pixel follows the format, not the reported depth */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0 , 0);
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0, 0, 0);
      CHECK( d.bpp == 2 && d.fmt == RB_DST_RGB565, "16bpp -> 2 bytes" );
      CHECK( d.guessed == 0, "RGB565 is not a guess" );
 }
@@ -123,28 +123,41 @@ test_fit( void )
 
      printf("destination rectangle\n");
      /* fill: the whole panel, which is what "full screen" means here */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0 , 0);
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0, 0, 0);
      CHECK( d.x == 0 && d.y == 0 && d.w == 1920 && d.h == 1080,
             "fill 1920x1080: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
      /* aspect: 16:10 centred on a 16:9 panel, bars left and right */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 1 , 0);
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 1920, 1080, 3840, 1280, 800, 0, 1, 0);
      CHECK( d.w == 1728 && d.h == 1080 && d.x == 96 && d.y == 0,
             "aspect 1920x1080: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
      /* aspect: the 2880x1620 panel this was first run on */
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 2880, 1620, 5760, 1280, 800, 1, 1 );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 2880, 1620, 5760, 1280, 800, 0, 1, 1);
      CHECK( d.w == 2592 && d.h == 1620 && d.x == 144 && d.y == 0,
             "aspect 2880x1620: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
      /* aspect: 16:10 on a 4:3 panel, bars top and bottom */
-     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1024, 768, 4096, 1280, 800, 1 , 0);
+     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1024, 768, 4096, 1280, 800, 0, 1, 0);
      CHECK( d.w == 1024 && d.h == 640 && d.x == 0 && d.y == 64,
             "aspect 1024x768: %d,%d %dx%d", d.x, d.y, d.w, d.h );
 
+     /* a strip reserved at the top for the button bar: the picture goes
+      * below it, and clearing must leave it alone */
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 2880, 1620, 5760, 1280, 800,
+                     130, 1, 1 );
+     CHECK( d.y == 130 && d.h == 1490 && d.reserved == 130,
+            "reserved 130 rows: y=%d h=%d reserved=%d", d.y, d.h, d.reserved );
+     CHECK( d.w == 2384 && d.x == 248,
+            "reserved 130 rows, aspect: %dx%d at %d", d.w, d.h, d.x );
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 2880, 1620, 5760, 1280, 800,
+                     130, 0, 1 );
+     CHECK( d.y == 130 && d.h == 1490 && d.w == 2880,
+            "reserved 130 rows, fill: %dx%d at %d,%d", d.w, d.h, d.x, d.y );
+
      /* a line length too short for the mode clamps the width - a row must
       * never be allowed to run into the next one */
-     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1920, 1080, 3840, 1280, 800, 0 , 0);
+     rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1920, 1080, 3840, 1280, 800, 0, 0, 0);
      CHECK( d.fw == 960 && d.w == 960, "pitch clamp: fw=%d w=%d", d.fw, d.w );
 }
 
@@ -188,7 +201,7 @@ test_scale( int bits, int ro, int rl, int go, int gl, int bo, int bl,
             fw, fh, aspect ? "(aspect)" : "(fill)");
 
      rb4r5_dst_init( &d, bits, ro,rl, go,gl, bo,bl,
-                     fw, fh, fw * ((bits + 7) / 8), SW, SH, aspect , 0);
+                     fw, fh, fw * ((bits + 7) / 8), SW, SH, 0, aspect, 0 );
      fbsize = (size_t)d.pitch * d.fh;
      fb = malloc( fbsize );
      memset( fb, 0xa5, fbsize );
@@ -274,13 +287,13 @@ test_known_colours( void )
      for (i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
           src[0] = src[1] = src[2] = src[3] = t[i].in;
 
-          rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 4, 2, 8, 2, 2, 0 , 0);
+          rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 4, 2, 8, 2, 2, 0, 0, 0);
           memset( fb, 0, sizeof(fb) );
           rb4r5_scale565( (unsigned char *)src, 2, 2, 4, fb, &d );
           CHECK( *(unsigned short *)fb == t[i].rgb565,
                  "RGB565 0x%04x -> 0x%04x", t[i].in, *(unsigned short *)fb );
 
-          rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 4, 2, 16, 2, 2, 0 , 0);
+          rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 4, 2, 16, 2, 2, 0, 0, 0);
           memset( fb, 0, sizeof(fb) );
           rb4r5_scale565( (unsigned char *)src, 2, 2, 4, fb, &d );
           CHECK( *(unsigned int *)fb == t[i].xrgb,
@@ -320,19 +333,19 @@ test_refuses_bad_geometry( void )
      printf("bad geometry\n");
      memset( src, 0xff, sizeof(src) );
 
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 , 0);
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0, 0, 0);
      d.w = 64;                            /* wider than the framebuffer */
      memset( fb, 0, sizeof(fb) );
      rb4r5_scale565( (unsigned char *)src, 8, 8, 16, fb, &d );
      CHECK( fb[0] == 0 && fb[63] == 0, "oversized rectangle must draw nothing" );
 
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 , 0);
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0, 0, 0);
      d.y = 8;                             /* starts past the last row */
      memset( fb, 0, sizeof(fb) );
      rb4r5_scale565( (unsigned char *)src, 8, 8, 16, fb, &d );
      CHECK( fb[0] == 0, "off-screen rectangle must draw nothing" );
 
-     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0 , 0);
+     rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, 32, 8, 64, 8, 8, 0, 0, 0);
      memset( fb, 0, sizeof(fb) );
      rb4r5_scale565( NULL, 8, 8, 16, fb, &d );
      rb4r5_scale565( (unsigned char *)src, 0, 8, 16, fb, &d );
@@ -388,7 +401,7 @@ test_bilinear( void )
 
      printf("bilinear: 1280x800 -> 1920x1080 against a floating point reference\n");
      rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 1920, 1080, 1920 * 4,
-                     SW, SH, 0, 1 );
+                     SW, SH, 0, 0, 1);
      fb = malloc( (size_t)d.pitch * d.fh );
      memset( fb, 0xa5, (size_t)d.pitch * d.fh );
      rb4r5_scale565( (const unsigned char *)src, SW, SH, spitch, fb, &d );
@@ -450,7 +463,7 @@ test_bilinear_identity( void )
 
      printf("bilinear: a 1:1 scale is bit exact\n");
      rb4r5_dst_init( &d, 16, 11,5, 5,6, 0,5, SW, SH, SW * 2,
-                     SW, SH, 0, 1 );
+                     SW, SH, 0, 0, 1);
      fb = malloc( (size_t)d.pitch * d.fh );
      memset( fb, 0xa5, (size_t)d.pitch * d.fh );
      rb4r5_scale565( (const unsigned char *)src, SW, SH, spitch, fb, &d );
@@ -491,7 +504,7 @@ test_bilinear_gradient( void )
      for (int filter = 0; filter <= 1; filter++) {
           unsigned int previous = 0, seen = 0;
           rb4r5_dst_init( &d, 32, 16,8, 8,8, 0,8, 512, 64, 512 * 4,
-                          64, 8, 0, filter );
+                          64, 8, 0, 0, filter );
           fb = malloc( (size_t)d.pitch * d.fh );
           rb4r5_scale565( (const unsigned char *)src, 64, 8, spitch, fb, &d );
           for (x = 0; x < d.fw; x++) {

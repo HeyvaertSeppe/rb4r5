@@ -55,6 +55,7 @@ typedef struct {
      int pitch;          /* physical line length in bytes               */
      int x, y, w, h;     /* destination rectangle the frame is drawn in */
      int filter;         /* 0 = nearest neighbour, 1 = bilinear         */
+     int reserved;       /* rows at the top the frame must not touch     */
      int guessed;        /* the bitfields were not recognised           */
 } RB4R5Dst;
 
@@ -98,16 +99,20 @@ rb4r5_classify( int bits, int ro, int rl, int go, int gl, int bo, int bl )
 
 /*
  * Work out where in the framebuffer a sw x sh frame goes.
- *   aspect == 0: stretch to fill the whole panel (what the RX3 does on its
- *                own 16:10 screen, and what "full screen" means here)
- *   aspect != 0: keep 16:10, centre it, leave black bars
+ *   reserve_top: rows at the top of the panel the frame must keep clear.
+ *                The launcher draws the RX3's above-the-screen buttons there
+ *                and the player must never write over them.
+ *   aspect == 0: stretch to fill what is left
+ *   aspect != 0: keep the source's shape, centre it, leave black bars
  */
 static void
 rb4r5_dst_init( RB4R5Dst *d, int bits,
                 int ro, int rl, int go, int gl, int bo, int bl,
                 int fw, int fh, int pitch, int sw, int sh,
-                int aspect, int filter )
+                int reserve_top, int aspect, int filter )
 {
+     int top, avail;
+
      memset( d, 0, sizeof(*d) );
      d->filter = filter ? 1 : 0;
 
@@ -131,11 +136,15 @@ rb4r5_dst_init( RB4R5Dst *d, int bits,
      if (d->fw * d->bpp > d->pitch)
           d->fw = d->pitch / d->bpp;
 
-     if (aspect && sw > 0 && sh > 0 && d->fw > 0 && d->fh > 0) {
-          long by_h = (long)d->fw * sh;     /* fw/sw vs fh/sh, cross multiplied */
-          long by_w = (long)d->fh * sw;
+     top   = (reserve_top > 0 && reserve_top < d->fh) ? reserve_top : 0;
+     avail = d->fh - top;
+     d->reserved = top;
+
+     if (aspect && sw > 0 && sh > 0 && d->fw > 0 && avail > 0) {
+          long by_h = (long)d->fw * sh;     /* fw/sw vs avail/sh, crossed */
+          long by_w = (long)avail * sw;
           if (by_h > by_w) {                /* height limited: full height */
-               d->h = d->fh;
+               d->h = avail;
                d->w = (int)(by_w / sh);
           }
           else {                            /* width limited: full width */
@@ -143,13 +152,14 @@ rb4r5_dst_init( RB4R5Dst *d, int bits,
                d->h = (int)(by_h / sw);
           }
           if (d->w > d->fw) d->w = d->fw;
-          if (d->h > d->fh) d->h = d->fh;
+          if (d->h > avail)  d->h = avail;
           d->x = (d->fw - d->w) / 2;
-          d->y = (d->fh - d->h) / 2;
+          d->y = top + (avail - d->h) / 2;
      }
      else {
           d->w = d->fw;
-          d->h = d->fh;
+          d->h = avail;
+          d->y = top;
      }
 }
 
@@ -160,7 +170,10 @@ rb4r5_clear( unsigned char *dst, const RB4R5Dst *d )
      int y;
      if (!dst || d->pitch <= 0)
           return;
-     for (y = 0; y < d->fh; y++)
+     /* from d->reserved down: whatever is above it belongs to the launcher's
+      * button bar, and blacking it would take the bar off the screen every
+      * time the player restarts its layer */
+     for (y = d->reserved; y < d->fh; y++)
           memset( dst + (size_t)y * d->pitch, 0, (size_t)d->fw * d->bpp );
 }
 

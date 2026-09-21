@@ -70,11 +70,58 @@ no-vt-switching
 """
 
 
+# --------------------------------------------------------------------------
+# paths, as the chroot sees them
+# --------------------------------------------------------------------------
+def inside(root, path: str) -> Path:
+    """Resolve an in-chroot absolute path the way the kernel does inside it.
+
+    An absolute symlink inside a chroot points at the CHROOT's root, not the
+    host's.  Python does not know that, so `root / "usr/lib/fbshim.so"` can
+    follow `usr/lib -> /lib` straight out of the runtime and land on a host
+    file.  A shim installed that way is written outside the chroot, found by
+    every check that looks from the host, and still invisible to the player -
+    which then says only `cannot be preloaded` and runs without it.
+
+    Use this for anything the player will open by an absolute path.
+    """
+    return _walk(Path(root), path)[0]
+
+
+def trail(root, path: str) -> list[str]:
+    """The symlinks `inside()` followed, for when the answer needs explaining."""
+    return _walk(Path(root), path)[1]
+
+
+def _walk(root: Path, path: str) -> tuple[Path, list[str]]:
+    here = root
+    rest = [part for part in path.split("/") if part and part != "."]
+    hops = []
+    while rest:
+        part = rest.pop(0)
+        if part == "..":
+            here = root if here == root else here.parent
+            continue
+        here = here / part
+        if not here.is_symlink():
+            continue
+        if len(hops) > 40:
+            hops.append(f"{here}: too many symlinks")
+            break
+        target = os.readlink(here)
+        hops.append(f"{here} -> {target}")
+        pieces = [part for part in target.split("/") if part and part != "."]
+        here = root if target.startswith("/") else here.parent
+        rest = pieces + rest
+    return here, hops
+
+
 def status(cfg) -> dict:
     """What is present, what is missing, what is mounted."""
     root = cfg.chroot
-    missing = [rel for rel in REQUIRED if not (root / rel).exists()]
-    absent_optional = [rel for rel in OPTIONAL if not (root / rel).exists()]
+    missing = [rel for rel in REQUIRED if not inside(root, rel).exists()]
+    absent_optional = [rel for rel in OPTIONAL
+                       if not inside(root, rel).exists()]
     mounts = {name: util.is_mountpoint(root / name) for name in BIND_MOUNTS}
     return {
         "root": root,
@@ -201,11 +248,13 @@ def install_runtime_bits(cfg, repo: Path) -> list[str]:
     shim_src = work / "shims"
     for name in ("memshim.so", "fbshim.so", "audioshim.so", "keyshim.so"):
         src = shim_src / name
+        # where the PLAYER will open it from, not where the host thinks it is
+        dst = inside(root, f"usr/lib/{name}")
         if src.exists():
-            util.ensure_dir(root / "usr/lib")
-            shutil.copy2(src, root / "usr/lib" / name)
+            util.ensure_dir(dst.parent)
+            shutil.copy2(src, dst)
             notes.append(f"installed usr/lib/{name}")
-        elif not (root / "usr/lib" / name).exists():
+        elif not dst.exists():
             notes.append(f"MISSING {name} (run: launch.py build)")
 
     dfb = work / "dfb/lib"
@@ -213,16 +262,17 @@ def install_runtime_bits(cfg, repo: Path) -> list[str]:
         for src in dfb.rglob("*"):
             if src.is_dir():
                 continue
-            dst = root / "usr/lib" / src.relative_to(dfb)
+            dst = inside(root, f"usr/lib/{src.relative_to(dfb)}")
             util.ensure_dir(dst.parent)
             shutil.copy2(src, dst)
         notes.append("installed the rebuilt DirectFB 1.4.16 stack")
 
     player = work / "rbp-pi5"
     if player.exists():
-        util.ensure_dir(root / "root/pdj")
-        shutil.copy2(player, root / "root/pdj/rbp")
-        os.chmod(root / "root/pdj/rbp", 0o755)
+        target = inside(root, "root/pdj/rbp")
+        util.ensure_dir(target.parent)
+        shutil.copy2(player, target)
+        os.chmod(target, 0o755)
         notes.append("installed root/pdj/rbp (patched)")
     return notes
 
@@ -369,7 +419,7 @@ MODULE_MARKERS = {
 
 def module_report(cfg) -> dict:
     """What display driver is installed, and is it the one we last built?"""
-    installed = cfg.chroot / FBDEV_MODULE
+    installed = inside(cfg.chroot, FBDEV_MODULE)
     staged = cfg.work / "dfb/lib/directfb-1.4-6/systems/libdirectfb_fbdev.so"
     out = {"installed": str(installed), "staged": str(staged),
            "present": installed.exists(), "staged_present": staged.exists(),
@@ -422,10 +472,11 @@ def shim_report(cfg) -> list[dict]:
     from . import build                                  # local: cycle-free
 
     root = cfg.chroot
-    search = [root / "lib", root / "usr/lib"]
+    search = [inside(root, "lib"), inside(root, "usr/lib")]
     out = []
     for name in SHIM_NAMES:
-        path = root / "usr/lib" / name
+        # the path the player opens, resolved as the chroot resolves it
+        path = inside(root, f"usr/lib/{name}")
         entry = {"name": name, "path": str(path), "present": path.exists(),
                  "size": 0, "arm": False, "needed": [], "missing": [],
                  "ok": False}
@@ -449,10 +500,14 @@ def shim_report(cfg) -> list[dict]:
 
 def shim_lines(cfg) -> list[str]:
     lines = []
+    root = cfg.chroot
     for entry in shim_report(cfg):
+        hops = trail(root, f"usr/lib/{entry['name']}")
         if not entry["present"]:
             lines.append(f"{entry['name']:14} MISSING from "
                          f"{entry['path']} (run: launch.py build)")
+            for hop in hops:
+                lines.append(f"{'':14}   /usr/lib is {hop}")
             continue
         state = "ok " if entry["ok"] else "NO "
         detail = f"{entry['size']} bytes"
@@ -471,3 +526,79 @@ def shims_loadable(cfg) -> tuple[bool, list[str]]:
     report = shim_report(cfg)
     bad = [entry for entry in report if not entry["ok"]]
     return (not bad), [entry["name"] for entry in bad]
+
+
+def shim_probe(cfg) -> list[str]:
+    """Ask the chroot's own loader to preload each shim, and report what it says.
+
+    Static checks say a file is present, is ARM, and needs only libraries that
+    exist.  They cannot say whether ld.so will take it - and when it will not,
+    it says so once into the player's log and runs the player anyway.  So this
+    does what the player does: it runs the RX3's own loader, inside the
+    chroot, with one shim preloaded, and prints what comes back.
+
+    It also prints how `/usr/lib/<shim>` resolves from inside the chroot,
+    because the usual reason a present, valid shim "cannot be opened" is that
+    the player and the host are not looking at the same file at all.
+    """
+    root = cfg.chroot
+    loader = "/lib/ld-linux.so.3"
+    lines = [f"chroot {root}", f"loader {loader}", ""]
+
+    lines.append("where each shim really is, resolved as the chroot resolves it:")
+    for name in SHIM_NAMES:
+        rel = f"usr/lib/{name}"
+        path = inside(root, rel)
+        for hop in trail(root, rel):
+            lines.append(f"    via {hop}")
+        naive = root / rel
+        try:
+            stat = path.lstat()
+            lines.append(f"  {name:14} {stat.st_size:8d} bytes  "
+                         f"mode {stat.st_mode & 0o7777:04o}  uid {stat.st_uid}"
+                         f"  at {path}")
+        except OSError as exc:
+            lines.append(f"  {name:14} NOT THERE at {path} ({exc.strerror})")
+        if path != naive:
+            lines.append(f"  {'':14} the host path {naive} is a DIFFERENT file - "
+                         "the player cannot see it")
+
+    if not inside(root, loader).exists():
+        lines.append(f"\nthere is no {loader} in the chroot, so nothing can "
+                     "be loaded at all")
+        return lines
+
+    # Something harmless to load the shims into.  The player is started the
+    # same way (the loader invoked explicitly), so this is the real path.
+    target = None
+    for candidate, args in (("/usr/bin/env", []), ("/bin/true", []),
+                            ("/bin/sh", ["-c", ":"]), ("/lib/libc.so.6", [])):
+        if inside(root, candidate).exists():
+            target = (candidate, args)
+            break
+    if target is None:
+        lines.append("\nthe chroot has no harmless program to load them into, "
+                     "so only the paths above can be checked here")
+        return lines
+
+    lines.append(f"\nasking the loader to preload each one into {target[0]} "
+                 "(this is exactly what the player does):")
+    for name in SHIM_NAMES:
+        proc = util.run(["chroot", str(root), loader, target[0]] + target[1],
+                        check=False, timeout=15,
+                        env={"LD_PRELOAD": f"/usr/lib/{name}"})
+        blob = (proc.stdout or "").strip()
+        refused = [line for line in blob.splitlines()
+                   if "cannot be preloaded" in line]
+        if refused:
+            lines.append(f"  {name:14} REFUSED: {refused[0].strip()}")
+        elif proc.returncode == 124:
+            # it loaded, and its constructor is off doing its job
+            lines.append(f"  {name:14} accepted (and kept running)")
+        elif proc.returncode != 0:
+            first = blob.splitlines()[0] if blob else "(silent)"
+            lines.append(f"  {name:14} the loader exited "
+                         f"{proc.returncode}: {first}")
+        else:
+            lines.append(f"  {name:14} accepted")
+    return lines

@@ -299,6 +299,17 @@ def cmd_logs(args, cfg) -> int:
     return subprocess.call(cmd)
 
 
+def cmd_shimtest(args, cfg) -> int:
+    """Ask the chroot's loader whether it will preload each shim, and why not."""
+    util.require_root("running the chroot's loader")
+    for line in chroot.shim_lines(cfg):
+        print("  " + line)
+    print()
+    for line in chroot.shim_probe(cfg):
+        print(line)
+    return 0
+
+
 def cmd_subucom(args, cfg) -> int:
     """The panel link: drain it, watch it, or work out what a control lights."""
     util.require_root("reading the panel link")
@@ -625,6 +636,10 @@ def build_parser() -> argparse.ArgumentParser:
                                           "supervisor)")
     usb.add_argument("--once", action="store_true")
     usb.set_defaults(func=cmd_usbwatch)
+
+    shimt = sub.add_parser("shimtest", help="ask the chroot's loader whether "
+                                           "it will preload each shim")
+    shimt.set_defaults(func=cmd_shimtest)
 
     panel = sub.add_parser("subucom", help="the panel link: drain it, and "
                                           "decode what it lights")

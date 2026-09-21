@@ -141,6 +141,30 @@ the shims use raw syscalls rather than library calls for exactly this reason
 (`clock_gettime` lives in `librt` on glibc 2.13, so the shims call
 `SYS_clock_gettime` directly).
 
+### When the doctor says `ok` and the loader still says no
+
+Then the two are not looking at the same file. `doctor` stats
+`<chroot>/usr/lib/fbshim.so` from the host; the player opens
+`/usr/lib/fbshim.so` from *inside* the chroot. Those are the same file only
+while nothing along the path is a symlink — and an **absolute** symlink inside
+a chroot points at the chroot's root, not the host's. A rootfs that ships
+`usr/lib -> /lib` therefore sends `shutil.copy2` to the *host's* `/lib`, where
+every check from the host then finds it, and where the player never can.
+
+`rb4r5/chroot.py:inside()` resolves in-chroot paths the way the kernel does,
+and installation, the doctor and the stale-driver check all go through it, so
+a shim is written where the player will look for it. To see the resolution
+yourself:
+
+```
+sudo python3 launch.py shimtest
+```
+
+It prints where each shim really is, every symlink it followed to get there,
+and then runs the RX3's own loader inside the chroot with one shim preloaded —
+the same explicit-loader invocation the player is started with — so the answer
+comes from `ld.so` rather than from an inference about it.
+
 ## The player keeps dying
 
 `rbp exited (-6); restarting in 5s` is a number, so the supervisor now prints

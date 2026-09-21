@@ -263,3 +263,135 @@ def describe(cfg) -> list[str]:
         lines.append("routing: master -> ch 1/2 (stereo sink; no headphone cue)")
     lines.extend(f"note: {note}" for note in chosen["notes"])
     return lines
+
+
+# --------------------------------------------------------------------------
+# is anything actually coming out?
+# --------------------------------------------------------------------------
+LEVELS_FILE = "/tmp/rb-levels.dat"
+
+
+def live_levels() -> dict:
+    """What audioshim last measured, or why there is nothing to measure."""
+    import struct
+    from pathlib import Path
+
+    out = {"present": False, "seq": 0, "left": 0.0, "right": 0.0,
+           "phones": 0.0, "note": ""}
+    try:
+        blob = Path(LEVELS_FILE).read_bytes()
+    except OSError:
+        out["note"] = (f"{LEVELS_FILE} does not exist: the player has not "
+                       "written a single audio period.  Either it is not "
+                       "running, or nothing is playing, or the shim is an "
+                       "old build (run: launch.py build)")
+        return out
+    if len(blob) < 20:
+        out["note"] = f"{LEVELS_FILE} is too short to read"
+        return out
+    seq, left, right, phones, full = struct.unpack("<5i", blob[:20])
+    full = full or 8388607
+    out.update(present=True, seq=seq, left=left / full, right=right / full,
+               phones=phones / full)
+    return out
+
+
+def watch_levels(seconds: float = 6.0) -> int:
+    """Print the master level as the player produces it.
+
+    This is the quickest way to split "the player is making no sound" from
+    "the sound is not reaching the speakers": if these numbers move, the
+    engine is producing audio and the problem is downstream.
+    """
+    import time
+
+    first = live_levels()
+    if not first["present"]:
+        print(first["note"])
+        return 1
+    print(f"reading {LEVELS_FILE} for {seconds:.0f}s "
+          f"(the player writes it ~20x a second)\n")
+    start = time.monotonic()
+    seen, moved, last_seq = 0, 0, first["seq"]
+    peak = 0.0
+    while time.monotonic() - start < seconds:
+        now = live_levels()
+        if now["seq"] != last_seq:
+            seen += 1
+            last_seq = now["seq"]
+            level = max(now["left"], now["right"])
+            peak = max(peak, level)
+            if level > 0.0005:
+                moved += 1
+            bars = int(level * 40)
+            print(f"  L {now['left']:5.3f}  R {now['right']:5.3f}  "
+                  f"{'#' * bars}")
+        time.sleep(0.1)
+
+    print()
+    if not seen:
+        print("  the counter never moved: the player is not writing audio "
+              "periods at all.\n  It is either stopped, or stuck.")
+        return 1
+    if not moved:
+        print(f"  {seen} periods went past and every one was silent.\n"
+              "  The engine IS running its audio loop - so the deck is not "
+              "playing, the\n  channel fader/trim is down, or the track is "
+              "not loaded.")
+        return 1
+    print(f"  {moved} of {seen} periods carried audio, peak "
+          f"{peak * 100:.0f}% of full scale.\n"
+          "  The engine is producing sound.  If you cannot hear it, the "
+          "problem is\n  between here and the speakers: check `launch.py "
+          "audio --test`.")
+    return 0
+
+
+def test_tone(cfg, seconds: float = 2.0, hz: float = 440.0) -> int:
+    """Play a tone on the chosen device, with the player out of the way.
+
+    If this is audible the device, the channel mapping and the volume are all
+    fine, and anything still silent is the player's side.  If it is not, the
+    device is the problem and no amount of work on the player will help.
+    """
+    import math
+    import struct
+    import subprocess
+
+    chosen = select(cfg)
+    device = chosen["device"]
+    channels = int(chosen["channels"])
+    rate = int(chosen["rate"])
+    if not device:
+        raise util.Fail("no audio device chosen - see `launch.py audio`")
+
+    if not util.have("aplay"):
+        raise util.Fail("aplay is missing (apt install alsa-utils)")
+
+    frames = int(rate * seconds)
+    samples = bytearray()
+    for index in range(frames):
+        value = int(0.25 * 8388607 * math.sin(2 * math.pi * hz * index / rate))
+        for channel in range(channels):
+            # channels 1/2 are master, 3/4 the headphones on an FLX4: put the
+            # tone on both so either pair proves itself
+            samples += struct.pack("<i", value)[0:3]
+
+    print(f"playing a {hz:.0f} Hz tone for {seconds:.0f}s on {device} "
+          f"({channels} channels, {rate} Hz, S24_3LE)")
+    proc = subprocess.run(
+        ["aplay", "-D", device, "-f", "S24_3LE", "-r", str(rate),
+         "-c", str(channels), "-t", "raw", "-"],
+        input=bytes(samples), capture_output=True)
+    if proc.returncode != 0:
+        print(proc.stderr.decode(errors="replace").strip())
+        print("\n  aplay could not play it, so the player cannot either.\n"
+              "  That message is the real problem: a busy device means "
+              "something else\n  has it open (stop the player first), and a "
+              "format error means the\n  channel count or format is wrong "
+              "for this card.")
+        return 1
+    print("\n  If you heard that, the device is fine and the silence is on "
+          "the player's\n  side: check `launch.py audio --levels` while a "
+          "track plays.")
+    return 0

@@ -354,6 +354,32 @@ class Supervisor:
             os.execv(sys.executable, argv)
 
     # -- the boot splash ---------------------------------------------------
+    def show_splash_now(self) -> None:
+        """Put the splash up from this process, before any daemon exists.
+
+        Waiting for the overlay daemon to start and then asking it to draw
+        means the screen stays black for however long that takes - and if the
+        daemon fails to start, for ever.  Drawing it here costs one pass over
+        the framebuffer and happens before the chroot is even mounted, so the
+        screen is never black while there is something to say.  The daemon
+        takes it over when it comes up.
+        """
+        if not (self.cfg.get("overlay.enabled", True) and
+                self.cfg.get("overlay.splash", True)):
+            return
+        try:
+            over = overlay.Overlay(self.cfg)
+            if not over.layout.fw:
+                return
+            over.hold_screen(True)      # the player must not paint over it
+            over.mode = "splash"
+            over.write_state()
+            over.draw_splash(0.03, "starting")
+            util.info("splash up; the player loads behind it")
+        except Exception as exc:                          # noqa: BLE001
+            util.warn(f"could not draw the splash ({exc}); carrying on")
+
+
     def splash_until_ready(self) -> None:
         """Cover the screen while the player comes up behind it.
 
@@ -409,6 +435,7 @@ class Supervisor:
     def run(self, foreground: bool = True, force: bool = False) -> int:
         self.preflight(strict=not force)
         self.stop_stale()
+        self.show_splash_now()          # before anything slow happens
         self.prepare_system()
         self.build_children()
         self.splash_until_ready()

@@ -169,3 +169,67 @@ two columns, green to about -12 dBFS, amber above that, red over the line at
 
 It needs the black bar to live in, so it appears with `display.fit=aspect`
 (the default) and not with `fill`. `overlay.meter=false` turns it off.
+
+## Why the song played too fast, and the seconds counted too fast with it
+
+The player's transport is clocked by `snd_pcm_writei`. The deck plays, and the
+time display counts, at **exactly the rate that call returns at** — there is no
+other clock. So anything that lets it return early makes the music run fast
+and the seconds run fast with it, in perfect step, which is what made it look
+like a timing bug rather than an audio one.
+
+Two things let it return early.
+
+**A failed write reported as a success.** If the device refused the audio,
+the shim retried once and then returned "wrote it all" anyway. The engine was
+told it had output when it had none, and raced through the track at whatever
+speed the CPU managed. Now the whole period is written, underruns recover, and
+a device that has genuinely stopped taking audio is marked dead and said so in
+`rbp.log`.
+
+**The streams with nothing behind them.** The engine writes several streams —
+master, headphones, booth — and only master goes to hardware. The others were
+mixed in memory and returned instantly. If the engine clocks itself off any of
+them, nothing was pacing it at all.
+
+So every stream now goes through a governor (`src/shims/rate_gate.h`): it may
+run at real time, never faster. A stream the hardware already paces never
+trips it, because it is never ahead; a stream with nothing behind it comes out
+at real time anyway. A device that is genuinely slow is allowed to be slow —
+the engine catches up its deficit and is then governed again — and a stall of
+more than two seconds restarts the clock rather than sprinting to make up for
+it.
+
+It reports itself every five seconds, which is what to look for in `rbp.log`:
+
+```
+audioshim: the master stream has written 60.0s of audio in 60.1s of real time (1.00x)
+audioshim: the headphone stream has written 60.0s of audio in 60.0s of real time (1.00x) [governed]
+```
+
+Anything other than about `1.00x` there is the transport running wrong, and
+the stream named is the one doing it.
+
+## Finding out where the silence is
+
+Two commands, and between them they say which half of the problem it is:
+
+```sh
+sudo python3 launch.py stop
+sudo python3 launch.py audio --test      # a tone straight at the device
+sudo python3 launch.py run
+sudo python3 launch.py audio --levels    # what the player is producing
+```
+
+* **The tone plays but the player is silent** — the device, the channel
+  mapping and the volume are all fine, so the problem is the player's side:
+  check `--levels`.
+* **The tone does not play** — `aplay`'s own error is the real problem. "Device
+  busy" means something still has it open; a format error means the channel
+  count or format is wrong for this card.
+* **`--levels` never moves** — the player is not writing audio periods at all.
+* **`--levels` moves but every period is silent** — the engine's audio loop is
+  running, so the deck is not playing, the fader or trim is down, or no track
+  is loaded.
+* **`--levels` shows audio and you hear nothing** — it is between the shim and
+  the speakers: the `audioshim:` lines in `rbp.log` say what the device did.

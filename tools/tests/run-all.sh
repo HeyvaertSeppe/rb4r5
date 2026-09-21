@@ -38,6 +38,10 @@ else
     echo "  NEON path not checked (needs arm-linux-gnueabi-gcc and qemu-arm-static)"
 fi
 
+echo "== C: the audio rate governor (src/shims/rate_gate.h)"
+cc -O2 -Wall -Wextra -o "$TMP/rategate" tools/tests/test_rate_gate.c
+"$TMP/rategate" | tail -1
+
 echo "== patch integrity"
 python3 - <<'PY'
 import re, sys

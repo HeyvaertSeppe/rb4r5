@@ -486,12 +486,27 @@ def cmd_config(args, cfg) -> int:
 
 
 def cmd_audio(args, cfg) -> int:
+    if args.levels:
+        return audio.watch_levels(seconds=args.seconds)
+    if args.test:
+        util.require_root("opening the audio device")
+        if util.pgrep_arg("/root/pdj/rbp"):
+            raise util.Fail("the player has the device open - stop it first "
+                            "(launch.py stop), then try again")
+        return audio.test_tone(cfg, seconds=args.seconds)
     for line in audio.describe(cfg):
         print(line)
     if args.env:
         print()
         for key, value in audio.env(cfg).items():
             print(f"{key}={value}")
+    print()
+    levels = audio.live_levels()
+    if levels["present"]:
+        print(f"the player last reported L {levels['left']:.3f} "
+              f"R {levels['right']:.3f} (period {levels['seq']})")
+    elif levels["note"]:
+        print(levels["note"])
     return 0
 
 
@@ -729,6 +744,12 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_cmd.set_defaults(func=cmd_config)
 
     aud = sub.add_parser("audio", help="show the audio devices and the choice")
+    aud.add_argument("--levels", action="store_true",
+                     help="watch what the player is actually producing")
+    aud.add_argument("--test", action="store_true",
+                     help="play a tone on the chosen device, player stopped")
+    aud.add_argument("--seconds", type=float, default=6.0,
+                     help="how long to watch or play (default 6)")
     aud.add_argument("--env", action="store_true",
                      help="also print the environment the shim gets")
     aud.set_defaults(func=cmd_audio)

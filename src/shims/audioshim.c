@@ -52,6 +52,9 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <time.h>
+
+/* the rate governor, shared with tools/tests/test_rate_gate.c */
+#include "rate_gate.h"
 #include <sys/syscall.h>
 
 /* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13 */
@@ -608,6 +611,29 @@ int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
     return 0;   /* the streams are already muxed into one device here */
 }
 
+/* Say how each stream is doing against the clock, because "the song plays too
+ * fast" is a ratio and this is where the ratio is known. */
+static void pace_report(struct pace *p, snd_pcm_uframes_t frames)
+{
+    static long long last = 0;
+    long long now = rb4r5_now_us();
+    unsigned int rate = g_rate ? g_rate : 44100;
+
+    (void)frames;
+    if (last == 0) last = now;
+    if (now - last < 5000000)
+        return;
+    last = now;
+    if (p->started && now > p->t0_us) {
+        double elapsed = (double)(now - p->t0_us) / 1000000.0;
+        double audio = (double)p->frames / (double)rate;
+        alog("audioshim: %s has written %.1fs of audio in %.1fs of real time "
+             "(%.2fx)%s\n", p->name, audio, elapsed,
+             elapsed > 0.01 ? audio / elapsed : 0.0,
+             p->slept_us ? " [governed]" : "");
+    }
+}
+
 /* peak L, peak R, peak headphones, all 0..2^23, plus a counter so a reader
  * can tell a stalled engine from a silent one. */
 static void publish_levels(int32_t left, int32_t right, int32_t phones)
@@ -656,7 +682,10 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
 
     if (pcm == (snd_pcm_t *)&g_h_hp) {
         /* Headphone/cue stream: park it in channels 2/3 of the mix and return.
-         * The master stream is what actually drives the write to the device. */
+         * The master stream is what actually drives the write to the device -
+         * but this one still has to keep to real time, or the engine clocks
+         * itself off it and the whole deck runs fast. */
+        static struct pace pace_hp = { 0, 0, 0, "the headphone stream", 0 };
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
             int32_t l = src[i * 2 + 0];
             int32_t r = src[i * 2 + 1];
@@ -668,11 +697,18 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
             g_mix4ch[i * 4 + 3] = r;
         }
         if (s_peak_hp > 100) s_has_hp_audio = 1;
+        pace_stream(&pace_hp, size, g_rate);
+        pace_report(&pace_hp, size);
         return size;
     }
 
-    if (pcm == (snd_pcm_t *)&g_h_booth || pcm == (snd_pcm_t *)&g_h_dummy)
-        return size;                     /* the FLX4 has no booth output */
+    if (pcm == (snd_pcm_t *)&g_h_booth || pcm == (snd_pcm_t *)&g_h_dummy) {
+        static struct pace pace_booth = { 0, 0, 0, "the booth stream", 0 };
+        pace_stream(&pace_booth, size, g_rate);  /* the FLX4 has no booth output, but
+                                          * the engine still counts on it
+                                          * taking real time */
+        return size;
+    }
 
     /* Master stream */
     for (snd_pcm_uframes_t i = 0; i < size; i++) {
@@ -776,14 +812,12 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         }
     }
 
-    if (!g_real_playback || !real_snd_pcm_writei || g_pcm_dead) {
-        /* No usable hardware: pace the engine thread ourselves.  Without this
-         * snd_pcm_writei returns instantly, the engine's transport is clocked
-         * by it, and the track races through at whatever speed the CPU
-         * manages - which is exactly what "the music plays way too fast"
-         * looks like, with no sound to go with it. */
-        unsigned int rate = g_rate ? g_rate : 44100;
-        usleep((useconds_t)((unsigned long long)size * 1000000ULL / rate));
+    /* The master stream, governed too.  A working device paces it and this
+     * never sleeps; a dead or missing one would otherwise free-run. */
+    {
+        static struct pace pace_master = { 0, 0, 0, "the master stream", 0 };
+        pace_stream(&pace_master, size, g_rate);
+        pace_report(&pace_master, size);
     }
 
     /* Publish the master level ~20x a second.  The launcher draws the meter

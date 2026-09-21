@@ -748,6 +748,117 @@ static void led_set(int ch, int note, int on)
     midi_send3(0x90 | (ch & 0x0f), note, on ? 0x7f : 0x00);
 }
 
+/* ---- what a button's light should DO ----
+ * Echoing the press is right for a button that means "do this now" and wrong
+ * for one that means "you are now in this state".  PLAY stays lit while the
+ * deck plays; a pad mode stays lit while that mode is chosen and the other
+ * three go dark; CUE lights while held.  The player's own LED state is down
+ * the panel link and not decoded yet (docs/13-panel-link.md), so this is
+ * modelled from what we send - which is right until something else changes
+ * the deck. */
+#define LED_MOMENTARY 0        /* lit while held                        */
+#define LED_TOGGLE    1        /* flips on each press                   */
+#define LED_RADIO     2        /* one of a group, the rest go dark      */
+
+struct led_rule {
+    int key;                   /* the engine key this button sends      */
+    int kind;
+    int group;                 /* for LED_RADIO: which set it belongs to */
+};
+
+static const struct led_rule led_rules[] = {
+    { K_PLAY,     LED_TOGGLE, 0 },
+    { K_SYNC,     LED_TOGGLE, 0 },
+    { K_MASTER,   LED_TOGGLE, 0 },
+    { K_BFX,      LED_TOGGLE, 0 },
+    { K_RELOOP,   LED_TOGGLE, 0 },
+    /* the four pad modes are one group per deck */
+    { K_HOTCUE,   LED_RADIO,  1 },
+    { K_ALOOP,    LED_RADIO,  1 },
+    { K_SLIPLOOP, LED_RADIO,  1 },
+    { K_BEATJUMP, LED_RADIO,  1 },
+};
+
+/* the state we are showing, per (channel, note) */
+#define LED_MAX 128
+static struct { int ch, note, key, on, sch; } led_state[LED_MAX];
+static int led_n = 0;
+
+static int led_kind_of(int key, int *group)
+{
+    for (size_t i = 0; i < sizeof(led_rules) / sizeof(led_rules[0]); i++)
+        if (led_rules[i].key == key) {
+            if (group) *group = led_rules[i].group;
+            return led_rules[i].kind;
+        }
+    return LED_MOMENTARY;
+}
+
+static void led_remember(int ch, int note, int key, int sch, int on)
+{
+    for (int i = 0; i < led_n; i++)
+        if (led_state[i].ch == ch && led_state[i].note == note) {
+            led_state[i].on = on;
+            led_state[i].key = key;
+            led_state[i].sch = sch;
+            return;
+        }
+    if (led_n < LED_MAX) {
+        led_state[led_n].ch = ch;
+        led_state[led_n].note = note;
+        led_state[led_n].key = key;
+        led_state[led_n].sch = sch;
+        led_state[led_n].on = on;
+        led_n++;
+    }
+}
+
+static int led_is_on(int ch, int note)
+{
+    for (int i = 0; i < led_n; i++)
+        if (led_state[i].ch == ch && led_state[i].note == note)
+            return led_state[i].on;
+    return 0;
+}
+
+/* Light a button the way its kind says, and darken the rest of its group. */
+static void led_for_press(int ch, int note, int key, int sch, int on)
+{
+    int group = 0;
+    int kind = led_kind_of(key, &group);
+
+    if (kind == LED_MOMENTARY) {
+        led_set(ch, note, on);
+        led_remember(ch, note, key, sch, on);
+        return;
+    }
+    if (!on)
+        return;                        /* state buttons act on the press */
+
+    if (kind == LED_TOGGLE) {
+        int next = !led_is_on(ch, note);
+        led_set(ch, note, next);
+        led_remember(ch, note, key, sch, next);
+        return;
+    }
+
+    /* LED_RADIO: this one on, the others in the group on the same deck off */
+    for (int i = 0; i < led_n; i++) {
+        int other_group = 0;
+        if (led_state[i].ch == ch && led_state[i].note == note)
+            continue;
+        if (led_kind_of(led_state[i].key, &other_group) != LED_RADIO ||
+            other_group != group || led_state[i].sch != sch)
+            continue;
+        if (led_state[i].on) {
+            led_set(led_state[i].ch, led_state[i].note, 0);
+            led_state[i].on = 0;
+        }
+    }
+    led_set(ch, note, 1);
+    led_remember(ch, note, key, sch, 1);
+}
+
 /* A short sweep at startup: every note we know how to light, on and then off.
  * It says "a host is here" to the controller, and it tells the operator at a
  * glance whether the output path works at all. */
@@ -768,6 +879,7 @@ static void led_hello(void)
             continue;
         led_set(notemap[i].ch, notemap[i].note, 0);
     }
+    led_n = 0;                          /* everything is dark again */
     logmsg("flx4-bridge: lamp test over %d button(s)%s\n", shown,
            midi_fd < 0 ? " (no output device)" : "");
 }
@@ -836,7 +948,7 @@ static void handle_note(int ch, int note, int on)
         if (sch == 0)
             sch = (ch == MC_DECK1) ? 1 : 2;
         send_ctrl(notemap[i].key, on ? OP_PRESS : OP_RELEASE, sch, 0, 0.0f, 0);
-        led_set(ch, note, on);          /* light what was pressed */
+        led_for_press(ch, note, notemap[i].key, sch, on);
         if (opt_verbose)
             logmsg("  %s -> 0x%04x %s ch%d\n", notemap[i].name,
                    notemap[i].key, on ? "press" : "release", sch);

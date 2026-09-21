@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import struct
 from pathlib import Path
 
 from . import config, util
@@ -528,22 +529,69 @@ def shims_loadable(cfg) -> tuple[bool, list[str]]:
     return (not bad), [entry["name"] for entry in bad]
 
 
+ELF_CLASS = {1: "32-bit", 2: "64-bit"}
+ELF_DATA = {1: "little-endian", 2: "big-endian"}
+ELF_OSABI = {0: "SYSV", 3: "Linux", 9: "FreeBSD"}
+ELF_TYPE = {1: "ET_REL", 2: "ET_EXEC", 3: "ET_DYN (shared object)", 4: "ET_CORE"}
+
+
+def elf_note(path: Path) -> str:
+    """Decode the header fields ld.so checks before it will load a file."""
+    try:
+        blob = path.read_bytes()[:52]
+    except OSError as exc:
+        return f"unreadable ({exc.strerror})"
+    if len(blob) < 52 or blob[:4] != b"\x7fELF":
+        return "not an ELF file at all"
+    cls, data, version, osabi, abiver = blob[4], blob[5], blob[6], blob[7], blob[8]
+    etype, machine = struct.unpack_from("<HH", blob, 16)
+    flags = struct.unpack_from("<I", blob, 36)[0]
+    eabi = (flags >> 24) & 0xff
+    bits = [
+        ELF_CLASS.get(cls, f"class {cls}?"),
+        ELF_DATA.get(data, f"data {data}?"),
+        f"version {version}",
+        f"OSABI {ELF_OSABI.get(osabi, osabi)}/{abiver}",
+        ELF_TYPE.get(etype, f"type {etype}?"),
+        "ARM" if machine == 40 else f"machine {machine}?",
+        f"EABI{eabi}",
+    ]
+    if flags & 0x400:
+        bits.append("HARD-FLOAT (will not load)")
+    return ", ".join(bits)
+
+
+def loader_version(path: Path) -> str:
+    """Which glibc the chroot's loader is, from the strings inside it."""
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return "unknown"
+    for needle in (b"GNU C Library", b"glibc "):
+        at = blob.find(needle)
+        if at >= 0:
+            end = blob.find(b"\x00", at)
+            return blob[at:end if end > 0 else at + 120].decode("latin-1")[:120]
+    return "unknown"
+
+
 def shim_probe(cfg) -> list[str]:
-    """Ask the chroot's own loader to preload each shim, and report what it says.
+    """Ask the chroot's own loader to preload things, and report what it says.
 
     Static checks say a file is present, is ARM, and needs only libraries that
     exist.  They cannot say whether ld.so will take it - and when it will not,
-    it says so once into the player's log and runs the player anyway.  So this
-    does what the player does: it runs the RX3's own loader, inside the
-    chroot, with one shim preloaded, and prints what comes back.
+    it says so once into the player's log and runs the player anyway.
 
-    It also prints how `/usr/lib/<shim>` resolves from inside the chroot,
-    because the usual reason a present, valid shim "cannot be opened" is that
-    the player and the host are not looking at the same file at all.
+    So this runs the RX3's own loader, inside the chroot, the same way the
+    player is started, and asks it to preload four things: each shim, a
+    library the runtime already loads, a shim moved to /lib, and a shim named
+    without a path.  Which of those fail tells you whether the fault is in our
+    files, in one directory, or in preloading at all.
     """
     root = cfg.chroot
     loader = "/lib/ld-linux.so.3"
-    lines = [f"chroot {root}", f"loader {loader}", ""]
+    lines = [f"chroot {root}", f"loader {loader}",
+             f"       {loader_version(inside(root, loader))}", ""]
 
     lines.append("where each shim really is, resolved as the chroot resolves it:")
     for name in SHIM_NAMES:
@@ -551,7 +599,6 @@ def shim_probe(cfg) -> list[str]:
         path = inside(root, rel)
         for hop in trail(root, rel):
             lines.append(f"    via {hop}")
-        naive = root / rel
         try:
             stat = path.lstat()
             lines.append(f"  {name:14} {stat.st_size:8d} bytes  "
@@ -559,17 +606,19 @@ def shim_probe(cfg) -> list[str]:
                          f"  at {path}")
         except OSError as exc:
             lines.append(f"  {name:14} NOT THERE at {path} ({exc.strerror})")
-        if path != naive:
-            lines.append(f"  {'':14} the host path {naive} is a DIFFERENT file - "
-                         "the player cannot see it")
+            continue
+        lines.append(f"  {'':14} {elf_note(path)}")
+        if path != root / rel:
+            lines.append(f"  {'':14} the host path {root / rel} is a DIFFERENT "
+                         "file - the player cannot see it")
 
     if not inside(root, loader).exists():
         lines.append(f"\nthere is no {loader} in the chroot, so nothing can "
                      "be loaded at all")
         return lines
 
-    # Something harmless to load the shims into.  The player is started the
-    # same way (the loader invoked explicitly), so this is the real path.
+    # Something harmless to load them into.  The player is started the same
+    # way (the loader invoked explicitly), so this is the real path.
     target = None
     for candidate, args in (("/usr/bin/env", []), ("/bin/true", []),
                             ("/bin/sh", ["-c", ":"]), ("/lib/libc.so.6", [])):
@@ -581,24 +630,62 @@ def shim_probe(cfg) -> list[str]:
                      "so only the paths above can be checked here")
         return lines
 
-    lines.append(f"\nasking the loader to preload each one into {target[0]} "
-                 "(this is exactly what the player does):")
-    for name in SHIM_NAMES:
+    def ask(preload):
         proc = util.run(["chroot", str(root), loader, target[0]] + target[1],
-                        check=False, timeout=15,
-                        env={"LD_PRELOAD": f"/usr/lib/{name}"})
-        blob = (proc.stdout or "").strip()
-        refused = [line for line in blob.splitlines()
-                   if "cannot be preloaded" in line]
+                        check=False, timeout=15, env={"LD_PRELOAD": preload})
+        blob = (proc.stdout or "")
+        refused = [ln for ln in blob.splitlines() if "cannot be preloaded" in ln]
         if refused:
-            lines.append(f"  {name:14} REFUSED: {refused[0].strip()}")
-        elif proc.returncode == 124:
-            # it loaded, and its constructor is off doing its job
-            lines.append(f"  {name:14} accepted (and kept running)")
-        elif proc.returncode != 0:
-            first = blob.splitlines()[0] if blob else "(silent)"
-            lines.append(f"  {name:14} the loader exited "
-                         f"{proc.returncode}: {first}")
+            reason = refused[0].split("cannot be preloaded", 1)[1]
+            return "REFUSED" + reason.replace(": ignored.", "").strip()
+        if proc.returncode == 124:
+            return "accepted (and kept running)"
+        if proc.returncode != 0:
+            first = blob.strip().splitlines()
+            return f"loader exited {proc.returncode}: " + (
+                first[0] if first else "(silent)")
+        return "accepted"
+
+    lines.append(f"\nasking the loader to preload things into {target[0]} "
+                 "(this is how the player is started):")
+    for name in SHIM_NAMES:
+        lines.append(f"  {name:24} {ask(f'/usr/lib/{name}')}")
+
+    # The discriminating cases.  If a library the runtime already loads is
+    # also refused, nothing is wrong with our shims: preloading itself is not
+    # working here, and that is a different repair.
+    lines.append("\nand the same question asked three other ways, to say "
+                 "where the fault is:")
+    for lib in ("libdl.so.2", "libpthread.so.0", "libc.so.6"):
+        if inside(root, f"lib/{lib}").exists():
+            lines.append(f"  {'/lib/' + lib:24} {ask('/lib/' + lib)}"
+                         "   <- already part of the runtime")
+            break
+
+    source = inside(root, "usr/lib/memshim.so")
+    copy = inside(root, "lib/memshim.so")
+    if source.exists() and not copy.exists():
+        try:
+            shutil.copy2(source, copy)
+        except OSError as exc:
+            lines.append(f"  could not copy a shim into /lib: {exc}")
         else:
-            lines.append(f"  {name:14} accepted")
+            lines.append(f"  {'/lib/memshim.so':24} {ask('/lib/memshim.so')}"
+                         "   <- the same shim, from /lib")
+            copy.unlink()
+    lines.append(f"  {'memshim.so':24} {ask('memshim.so')}"
+                 "   <- by name, no path")
+
+    # ld.so's own account of what it looked for.
+    proc = util.run(["chroot", str(root), loader, target[0]] + target[1],
+                    check=False, timeout=15,
+                    env={"LD_PRELOAD": "/usr/lib/memshim.so",
+                         "LD_DEBUG": "libs,files"})
+    blob = (proc.stdout or "")
+    wanted = [ln.strip() for ln in blob.splitlines()
+              if "memshim" in ln or "preload" in ln]
+    lines.append("\nwhat ld.so says it did (LD_DEBUG):")
+    lines.extend(f"  {ln}" for ln in (wanted[:20] or ["(LD_DEBUG said nothing "
+                                                     "- this loader was built "
+                                                     "without it)"]))
     return lines

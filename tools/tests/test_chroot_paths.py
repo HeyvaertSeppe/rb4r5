@@ -94,6 +94,43 @@ with tempfile.TemporaryDirectory() as tmp:
     check("and reports no symlinks", chroot.trail(plain, "usr/lib/memshim.so"),
           [])
 
+    # --- the ELF header ld.so checks before it will load anything ---------
+    def elf(machine=40, cls=1, data=1, etype=3, flags=0x05000000, osabi=0):
+        import struct as _s
+        blob = bytearray(52)
+        blob[0:4] = b"\x7fELF"
+        blob[4], blob[5], blob[6], blob[7], blob[8] = cls, data, 1, osabi, 0
+        _s.pack_into("<HH", blob, 16, etype, machine)
+        _s.pack_into("<I", blob, 36, flags)
+        return bytes(blob)
+
+    shim = tmp / "shim.so"
+    shim.write_bytes(elf())
+    note = chroot.elf_note(shim)
+    check("a good shim reads as 32-bit ARM EABI5 shared object",
+          note, "32-bit, little-endian, version 1, OSABI SYSV/0, "
+                "ET_DYN (shared object), ARM, EABI5")
+
+    shim.write_bytes(elf(flags=0x05000400))
+    check("hard-float is called out", "HARD-FLOAT" in chroot.elf_note(shim), True)
+
+    shim.write_bytes(elf(cls=2))
+    check("a 64-bit object is called out",
+          "64-bit" in chroot.elf_note(shim), True)
+
+    shim.write_bytes(elf(machine=62))
+    check("the wrong machine is called out",
+          "machine 62?" in chroot.elf_note(shim), True)
+
+    shim.write_bytes(b"#!/bin/sh\necho not an elf\n" + b"\0" * 40)
+    check("a non-ELF file is called out",
+          chroot.elf_note(shim), "not an ELF file at all")
+
+    shim.write_bytes(b"\x7fELF")
+    check("a truncated file is called out",
+          chroot.elf_note(shim), "not an ELF file at all")
+
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

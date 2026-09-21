@@ -33,7 +33,7 @@ The shim has no card numbers compiled into it. `rb4r5/audio.py` enumerates
 rates), decides, and passes the result in the environment:
 
 ```
-RB_AUDIO_DEV=plughw:CARD=FLX4,DEV=0,plughw:2,0   comma-separated, tried in order
+RB_AUDIO_DEV=plughw:CARD=FLX4,DEV=0|plughw:2,0|default   '|' separated, tried in order
 RB_AUDIO_CH=4                                    4 on the FLX4, 2 on HDMI
 RB_AUDIO_RATE=44100
 RB_AUDIO_FMT=6                                   SND_PCM_FORMAT_S24_LE
@@ -48,7 +48,7 @@ See exactly what it decided, without starting anything:
 PI$ python3 launch.py audio --env
 card 0 [vc4hdmi0] vc4-hdmi - vc4-hdmi-0
 card 2 [FLX4] USB-Audio - DDJ-FLX4 [4ch S24_3LE 44100Hz]
-chosen: plughw:CARD=FLX4,DEV=0,plughw:2,0 (4ch @44100 Hz, S24_LE, source=controller)
+chosen: plughw:CARD=FLX4,DEV=0 (4ch @44100 Hz, S24_LE, source=controller)
 routing: master -> FLX4 ch 1/2 (MASTER out), cue -> ch 3/4 (HEADPHONES)
 note: FLX4 is S24_3LE; alsa-lib converts from S24_LE
 ```

@@ -148,6 +148,7 @@ static float jog_tpr = 1800.0f;    /* FLX4 messages per revolution        */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 static int   jog_touch_timeout_ms = 4000;  /* 0 = never let a touch go     */
 static int   jog_emit_ms = 10;     /* one speed per this many ms          */
+static const char *jog_conf = "/tmp/rb-jog.conf";  /* live tuning          */
 static float jog_bend_scale = 0.25f;   /* the rim, relative to the plate  */
 static int   jog_reverse = 0;      /* the platter turns the other way     */
 static float jog_scale = 1.0f;     /* how hard a turn pushes the engine   */
@@ -341,6 +342,56 @@ static void build_cc14(void)
     add_cc14(MC_MIXER, 0x18, K_COLOR, OP_VALUE, 2, 0, "filter/colour FX");
 }
 
+/* ---------------- live tuning ----------------
+ * How far a turn of the wheel moves the deck depends on a number nobody
+ * documents - how many messages the FLX4 sends for one revolution - and the
+ * only way to get it right is to turn the wheel and see.  Doing that through
+ * a rebuild, a restart and a reload of the whole player takes minutes per
+ * guess; re-reading a four line file takes none, so the wheel can be dialled
+ * in while it is in your hand.
+ *
+ *     tpr=600        messages per revolution of the FLX4's wheel
+ *     scale=1.0      multiplies how far a turn pushes the deck
+ *     bend=0.25      the rim, relative to the plate
+ *     reverse=0      1 if it counts the wrong way
+ */
+static void reload_jog_conf(int announce)
+{
+    static time_t last_mtime = 0;
+    struct stat st;
+    FILE *f;
+    char line[128];
+
+    if (stat(jog_conf, &st) != 0)
+        return;
+    if (st.st_mtime == last_mtime)
+        return;
+    last_mtime = st.st_mtime;
+
+    f = fopen(jog_conf, "r");
+    if (!f)
+        return;
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        if (!eq)
+            continue;
+        *eq = '\0';
+        double value = atof(eq + 1);
+        if (!strcmp(line, "tpr") && value > 0.5)        jog_tpr = (float)value;
+        else if (!strcmp(line, "scale") && value > 0.0) jog_scale = (float)value;
+        else if (!strcmp(line, "bend") && value >= 0.0) jog_bend_scale = (float)value;
+        else if (!strcmp(line, "reverse"))              jog_reverse = value != 0.0;
+        else if (!strcmp(line, "emit_ms") && value >= 1) jog_emit_ms = (int)value;
+    }
+    fclose(f);
+    if (announce)
+        logmsg("flx4: jog retuned from %s: wheel %g/rev, scale %g, bend %g%s\n",
+               jog_conf, (double)jog_tpr, (double)jog_scale,
+               (double)jog_bend_scale, jog_reverse ? ", reversed" : "");
+}
+
 /* ---------------- jog wheels ---------------- */
 /* What the wheel is being asked to do.  The RX3 decides between scratching
  * and bending from whether the PLATE is held, and the FLX4 reports the plate
@@ -459,6 +510,12 @@ static void jog_emit(struct jog *s, long long t)
 static void jog_tick(void)
 {
     long long t = now_ms();
+    static long long last_conf = 0;
+
+    if (t - last_conf > 500) {          /* twice a second is plenty */
+        last_conf = t;
+        reload_jog_conf(1);
+    }
     for (int i = 0; i < 2; i++) {
         struct jog *s = &jogs[i];
 
@@ -1113,7 +1170,7 @@ int main(int argc, char **argv)
 
     /* -l is handled after the whole option list, so `-l -m map.conf` and
      * `-m map.conf -l` behave the same. */
-    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:RLF")) != -1) {
+    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:c:RLF")) != -1) {
         switch (opt) {
         case 'v': opt_verbose = 1; break;
         case 's': opt_sniff = 1; opt_verbose = 1; break;
@@ -1127,6 +1184,7 @@ int main(int argc, char **argv)
         case 'H': jog_touch_timeout_ms = atoi(optarg); break;
         case 'B': jog_bend_scale = (float)atof(optarg); break;
         case 'E': jog_emit_ms = atoi(optarg); break;
+        case 'c': jog_conf = optarg; break;
         case 'O': opt_overlay = optarg; break;
         case 'L': opt_leds = 0; break;
         case 'F': opt_filter_init = 1; break;
@@ -1136,7 +1194,8 @@ int main(int argc, char **argv)
                             "[-m mapfile] [-J engine_ppr] [-T flx4_ticks_per_rev] "
                             "[-S jog_scale] [-B bend_scale] [-E emit_ms] "
                             "[-R] [-L] [-H touch_timeout_ms] "
-                            "[-O overlayfifo] [-F]\n", argv[0]);
+                            "[-O overlayfifo] [-c jogconf] [-F]\n",
+                            argv[0]);
             return 2;
         }
     }
@@ -1148,6 +1207,7 @@ int main(int argc, char **argv)
         list_map();
         return 0;
     }
+    reload_jog_conf(0);                 /* before the first log line */
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
 

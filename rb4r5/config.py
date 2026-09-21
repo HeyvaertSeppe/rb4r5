@@ -102,7 +102,11 @@ DEFAULTS: dict = {
         # How many MIDI messages the FLX4 sends for one turn of its own jog
         # wheel.  Measure it: `launch.py jogtest`.  Getting this wrong makes
         # the wheel feel dead and the position run away.
-        "jog_ticks_per_rev": 1800,
+        # An estimate: Pioneer controller wheels send far fewer messages per
+        # revolution than the RX3's own 1800, and using the RX3's number makes
+        # the deck crawl.  Measure yours: `launch.py jogtest`, and tune it
+        # live with `jogtest --tpr N` while the wheel is in your hand.
+        "jog_ticks_per_rev": 600,
         # The rim bends, the plate scratches.  bend_scale is how much gentler
         # the rim is than the plate (0.25 = a quarter as far).
         "jog_bend_scale": 0.25,

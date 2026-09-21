@@ -138,7 +138,8 @@ def select(cfg) -> dict:
     override = cfg.get("audio.device")
     if override:
         channels = int(cfg.get("audio.channels") or 2)
-        return {"device": override, "channels": channels, "rate": want_rate,
+        return {"device": override, "candidates": [override],
+                "channels": channels, "rate": want_rate,
                 "format": want_fmt, "source": "config", "card": None,
                 "notes": ["audio.device set in the config file; no detection"]}
 
@@ -154,7 +155,8 @@ def select(cfg) -> dict:
             notes.append("no DJ controller found - using HDMI audio; plug the "
                          "FLX4 in and restart for master + headphone cue")
     if card is None:
-        return {"device": "default", "channels": 2, "rate": want_rate,
+        return {"device": "default", "candidates": ["default"],
+                "channels": 2, "rate": want_rate,
                 "format": want_fmt, "source": "none", "card": None,
                 "notes": ["no usable ALSA card found; the player will run "
                           "without audio and the transport will not advance"]}
@@ -193,9 +195,18 @@ def select(cfg) -> dict:
 
     prefix = "plughw" if plug else "hw"
     device = f"{prefix}:CARD={card['id']},DEV=0"
-    fallback = f"{prefix}:{card['index']},0"
+    # Alternatives to try if the first will not open - by index, then whatever
+    # ALSA calls default.  They are a LIST, not a joined string: an ALSA
+    # device name contains commas of its own, so gluing two together with one
+    # produces a name that can never open.
+    candidates = [device, f"{prefix}:{card['index']},0", "default"]
+    seen = []
+    for name in candidates:
+        if name not in seen:
+            seen.append(name)
     return {
-        "device": f"{device},{fallback}" if device != fallback else device,
+        "device": device,
+        "candidates": seen,
         "channels": channels,
         "rate": want_rate,
         "format": want_fmt,
@@ -209,8 +220,9 @@ def select(cfg) -> dict:
 def env(cfg, chosen: dict | None = None) -> dict:
     """The RB_AUDIO_* / STARTUP_* environment audioshim reads."""
     chosen = chosen or select(cfg)
+    # '|' separated: see the comment in select() and in audioshim.c
     return {
-        "RB_AUDIO_DEV": chosen["device"],
+        "RB_AUDIO_DEV": "|".join(chosen.get("candidates") or [chosen["device"]]),
         "RB_AUDIO_CH": str(chosen["channels"]),
         "RB_AUDIO_RATE": str(chosen["rate"]),
         "RB_AUDIO_FMT": str(chosen["format"]),
@@ -256,6 +268,9 @@ def describe(cfg) -> list[str]:
                  f"({chosen['channels']}ch @{chosen['rate']} Hz, "
                  f"{FORMAT_NAMES.get(chosen['format'], chosen['format'])}, "
                  f"source={chosen['source']})")
+    others = [d for d in (chosen.get("candidates") or []) if d != chosen["device"]]
+    if others:
+        lines.append(f"  if that will not open, it tries: {', '.join(others)}")
     if chosen["channels"] == 4:
         lines.append("routing: master -> FLX4 ch 1/2 (MASTER out), "
                      "cue -> ch 3/4 (HEADPHONES)")
@@ -359,10 +374,10 @@ def test_tone(cfg, seconds: float = 2.0, hz: float = 440.0) -> int:
     import subprocess
 
     chosen = select(cfg)
-    device = chosen["device"]
+    candidates = chosen.get("candidates") or [chosen["device"]]
     channels = int(chosen["channels"])
     rate = int(chosen["rate"])
-    if not device:
+    if not candidates:
         raise util.Fail("no audio device chosen - see `launch.py audio`")
 
     if not util.have("aplay"):
@@ -377,21 +392,33 @@ def test_tone(cfg, seconds: float = 2.0, hz: float = 440.0) -> int:
             # tone on both so either pair proves itself
             samples += struct.pack("<i", value)[0:3]
 
-    print(f"playing a {hz:.0f} Hz tone for {seconds:.0f}s on {device} "
-          f"({channels} channels, {rate} Hz, S24_3LE)")
-    proc = subprocess.run(
-        ["aplay", "-D", device, "-f", "S24_3LE", "-r", str(rate),
-         "-c", str(channels), "-t", "raw", "-"],
-        input=bytes(samples), capture_output=True)
-    if proc.returncode != 0:
-        print(proc.stderr.decode(errors="replace").strip())
-        print("\n  aplay could not play it, so the player cannot either.\n"
-              "  That message is the real problem: a busy device means "
-              "something else\n  has it open (stop the player first), and a "
-              "format error means the\n  channel count or format is wrong "
-              "for this card.")
-        return 1
-    print("\n  If you heard that, the device is fine and the silence is on "
-          "the player's\n  side: check `launch.py audio --levels` while a "
-          "track plays.")
-    return 0
+    # The same list, in the same order, that the player will try.
+    last = ""
+    for index, device in enumerate(candidates):
+        print(f"\n[{index + 1}/{len(candidates)}] a {hz:.0f} Hz tone for "
+              f"{seconds:.0f}s on {device}\n"
+              f"      ({channels} channels, {rate} Hz, S24_3LE)")
+        proc = subprocess.run(
+            ["aplay", "-D", device, "-f", "S24_3LE", "-r", str(rate),
+             "-c", str(channels), "-t", "raw", "-"],
+            input=bytes(samples), capture_output=True)
+        if proc.returncode == 0:
+            print(f"\n  {device} played it.\n"
+                  "  If you heard it, the device is fine and any remaining "
+                  "silence is the\n  player's side: `launch.py audio "
+                  "--levels` while a track plays.")
+            return 0
+        last = proc.stderr.decode(errors="replace").strip()
+        print("      " + last.replace("\n", "\n      "))
+
+    print(f"\n  None of the {len(candidates)} device names would open, so "
+          "the player cannot\n  open one either.  The message above is the "
+          "real problem:\n"
+          "    'Device or resource busy'  - something else has it open; stop "
+          "the player\n"
+          "    'Invalid argument'         - the channel count or format is "
+          "wrong for it\n"
+          "    'No such file or directory'- that card is not there\n"
+          f"  Try by hand:  aplay -D {candidates[0]} -f S24_3LE -c "
+          f"{channels} /dev/zero")
+    return 1

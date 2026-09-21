@@ -219,7 +219,7 @@ A jog wheel needs two numbers, and only one of them was ever right here.
 | | what it is | where it comes from |
 |---|---|---|
 | `controller.jog_ppr` | the units the **engine** counts one platter revolution in | the RX3's own wheel: 1800 |
-| `controller.jog_ticks_per_rev` | how many MIDI messages the **FLX4** sends for one turn of its wheel | nobody documents it — measure it |
+| `controller.jog_ticks_per_rev` | how many MIDI messages the **FLX4** sends for one turn of its wheel | nobody documents it — measure it. The default (600) is an estimate; using the RX3's own 1800 makes the deck crawl |
 
 The bridge used to divide the FLX4's messages by the *engine's* number, which
 makes every turn look far slower than it is (the wheel feels dead), and let
@@ -246,6 +246,26 @@ sudo python3 launch.py config --set controller.jog_reverse=true   # if needed
 
 `controller.jog_scale` is the last knob: it multiplies how far a turn pushes
 the deck, for when the units are right but the feel is not.
+
+### Tuning it while the wheel is in your hand
+
+Going through a rebuild and a restart for each guess takes minutes. The bridge
+re-reads `/tmp/rb-jog.conf` twice a second instead, so a change lands before
+you have finished turning:
+
+```sh
+sudo python3 launch.py jogtest --tpr 400      # the deck moves further
+sudo python3 launch.py jogtest --tpr 900      # ... and less far
+sudo python3 launch.py jogtest --scale 1.5    # or scale the lot
+sudo python3 launch.py jogtest --bend 0.4     # the rim, relative to the plate
+```
+
+**Lower `tpr` means the deck moves further for the same turn.** It is the
+number of messages the wheel sends per revolution, so dividing by less makes
+each message worth more.
+
+When it feels right, the command prints the `config --set` line that makes it
+the default.
 
 **A stuck plate touch** leaves the deck in scratch mode, and then every nudge
 of the wheel seeks the track instead of bending it — which is what "the music

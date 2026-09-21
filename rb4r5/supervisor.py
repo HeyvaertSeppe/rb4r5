@@ -25,7 +25,8 @@ import threading
 import time
 from pathlib import Path
 
-from . import audio, chroot, config, display, overlay, platform5, util
+from . import (audio, chroot, config, display, jogcal, overlay, platform5,
+               util)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -215,6 +216,7 @@ class Supervisor:
             nproc_limit=int(cfg.get("player.ulimit_procs", 1024) or 0) or None))
 
         if cfg.get("controller.enabled", True):
+            jogcal.seed_tuning(cfg)     # so live tuning starts from the config
             bridge = cfg.bindir / "flx4-bridge"
             if bridge.exists():
                 argv = [str(bridge), "-f", config.FIFO_CTRL,
@@ -224,6 +226,7 @@ class Supervisor:
                         "-H", str(cfg.get("controller.jog_touch_timeout_ms", 4000)),
                         "-B", str(cfg.get("controller.jog_bend_scale", 0.25)),
                         "-E", str(cfg.get("controller.jog_emit_ms", 10)),
+                        "-c", jogcal.JOG_CONF,
                         "-O", overlay.CMD_FIFO]
                 if not cfg.get("controller.leds", True):
                     argv.append("-L")

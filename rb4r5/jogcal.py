@@ -193,3 +193,71 @@ def run(cfg, seconds: float = 12.0, quiet: bool = False) -> int:
         print("\n  NOTE: that is a very low count for one revolution.  Turn it "
               "again\n  and check - a partial turn reads as a coarse wheel.")
     return 0
+
+
+# --------------------------------------------------------------------------
+# live tuning
+# --------------------------------------------------------------------------
+JOG_CONF = "/tmp/rb-jog.conf"
+
+
+def tune(cfg, **values) -> int:
+    """Retune the jog on a running bridge, without restarting anything.
+
+    How far a turn moves the deck depends on a number nobody documents - how
+    many messages the FLX4 sends for one revolution - and the only way to get
+    it right is to turn the wheel and see.  Going through a rebuild and a
+    restart for each guess takes minutes; this takes none, so it can be dialled
+    in while the wheel is in your hand.
+    """
+    current = read_tuning()
+    for key, value in values.items():
+        if value is not None:
+            current[key] = value
+    lines = [f"{key}={value}" for key, value in sorted(current.items())]
+    Path(JOG_CONF).write_text("\n".join(lines) + "\n")
+    try:
+        os.chmod(JOG_CONF, 0o666)
+    except OSError:
+        pass
+    print(f"wrote {JOG_CONF}:")
+    for line in lines:
+        print(f"    {line}")
+    print("\nThe bridge picks this up within half a second - turn the wheel "
+          "and see.\nWhen it feels right, make it the default:")
+    for key, value in sorted(current.items()):
+        name = {"tpr": "jog_ticks_per_rev", "scale": "jog_scale",
+                "bend": "jog_bend_scale", "reverse": "jog_reverse",
+                "emit_ms": "jog_emit_ms"}.get(key)
+        if name:
+            print(f"    sudo python3 launch.py config --set "
+                  f"controller.{name}={value}")
+    return 0
+
+
+def read_tuning() -> dict:
+    out: dict = {}
+    try:
+        for line in Path(JOG_CONF).read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                key, value = line.split("=", 1)
+                out[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return out
+
+
+def seed_tuning(cfg) -> None:
+    """Start the live file from the configured values, so tuning is relative."""
+    try:
+        if Path(JOG_CONF).exists():
+            return
+        Path(JOG_CONF).write_text(
+            f"tpr={cfg.get('controller.jog_ticks_per_rev', 600)}\n"
+            f"scale={cfg.get('controller.jog_scale', 1.0)}\n"
+            f"bend={cfg.get('controller.jog_bend_scale', 0.25)}\n"
+            f"reverse={1 if cfg.get('controller.jog_reverse') else 0}\n")
+        os.chmod(JOG_CONF, 0o666)
+    except OSError:
+        pass

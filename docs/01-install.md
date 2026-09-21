@@ -134,7 +134,7 @@ PI$ sudo python3 launch.py doctor
   content              398412 non-zero bytes in the first 400k (something is drawn)
 === audio
   card 2 [FLX4] USB-Audio - DDJ-FLX4 [4ch S24_3LE 44100Hz]
-  chosen: plughw:CARD=FLX4,DEV=0,plughw:2,0 (4ch @44100 Hz, S24_LE, source=controller)
+  chosen: plughw:CARD=FLX4,DEV=0 (4ch @44100 Hz, S24_LE, source=controller)
   routing: master -> FLX4 ch 1/2 (MASTER out), cue -> ch 3/4 (HEADPHONES)
 === controller (DDJ-FLX4)
   card                 2 [FLX4] USB-Audio - DDJ-FLX4

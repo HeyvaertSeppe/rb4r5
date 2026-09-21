@@ -332,7 +332,10 @@ def cmd_sniff(args, cfg) -> int:
 
 
 def cmd_jogtest(args, cfg) -> int:
-    """Measure the FLX4's jog wheel: ticks per revolution and direction."""
+    """Measure the FLX4's jog wheel, or retune it while it is in your hand."""
+    if any(v is not None for v in (args.tpr, args.scale, args.bend)) or args.reverse:
+        return jogcal.tune(cfg, tpr=args.tpr, scale=args.scale, bend=args.bend,
+                           reverse=1 if args.reverse else None)
     util.require_root("reading the controller's MIDI")
     return jogcal.run(cfg, seconds=args.seconds, quiet=args.quiet)
 
@@ -649,6 +652,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="how long to watch the turn (default 12)")
     jog.add_argument("--quiet", action="store_true",
                      help="totals only, no per-message lines")
+    jog.add_argument("--tpr", type=float, metavar="N",
+                     help="retune a running bridge: messages per revolution "
+                          "of the wheel (lower = the deck moves further)")
+    jog.add_argument("--scale", type=float, metavar="X",
+                     help="retune: multiply how far a turn pushes the deck")
+    jog.add_argument("--bend", type=float, metavar="X",
+                     help="retune: the rim, relative to the plate (0.25)")
+    jog.add_argument("--reverse", action="store_true",
+                     help="retune: count the other way")
     jog.set_defaults(func=cmd_jogtest)
 
     ov = sub.add_parser("overlay", help="the top button bar, the effect "

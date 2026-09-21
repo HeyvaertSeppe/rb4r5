@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("selected card", chosen["card"]["id"], "FLX4")
     check("selected channels", chosen["channels"], 4)
     check("selected device", chosen["device"],
-          "plughw:CARD=FLX4,DEV=0,plughw:2,0")
+          "plughw:CARD=FLX4,DEV=0")
     env = audio.env(cfg, chosen)
     check("env RB_AUDIO_CH", env["RB_AUDIO_CH"], "4")
     check("env RB_AUDIO_FMT", env["RB_AUDIO_FMT"], "6")   # S24_LE, plug converts
@@ -101,9 +101,80 @@ with tempfile.TemporaryDirectory() as tmp:
 
     audio.cards, audio.stream_caps = real_cards, real_caps
 
+
+def check2(label, cond):
+    if not cond:
+        failures.append(label)
+        print(f"FAIL {label}")
+    else:
+        print(f"ok   {label}")
+
+
+print("\n== the device name is one device, and the candidates are a list")
+
+_real_controller = audio.find_controller
+_real_caps = audio.stream_caps
+_real_hdmi = audio.find_hdmi
+
+
+def _fake_card(ident, index, channels=4):
+    audio.find_controller = lambda *a, **k: {
+        "id": ident, "index": index, "name": ident, "longname": ident}
+    audio.find_hdmi = lambda *a, **k: None
+    audio.stream_caps = lambda *a, **k: {
+        "channels": channels, "formats": ["S24_3LE"], "rates": [44100]}
+
+
+try:
+    for ident, index in (("DDJFLX4", 2), ("vc4hdmi0", 0)):
+        _fake_card(ident, index)
+        cfg = config.load("/nonexistent-audio.json")
+        chosen = audio.select(cfg)
+
+        check2(f"{ident}: the device is one name",
+              chosen["device"].count("hw:") == 1)
+        check2(f"{ident}: it names the card",
+              chosen["device"] == f"plughw:CARD={ident},DEV=0")
+        check2(f"{ident}: the candidates are a list",
+              isinstance(chosen["candidates"], list) and
+              len(chosen["candidates"]) >= 2)
+        for name in chosen["candidates"]:
+            check2(f"{ident}: candidate {name!r} is one device",
+                  name.count("hw:") <= 1)
+
+        # what audioshim receives: separated by something that is NOT a comma,
+        # and every piece has to survive the split intact
+        blob = audio.env(cfg, chosen)["RB_AUDIO_DEV"]
+        check2(f"{ident}: the shim gets them '|' separated", "|" in blob)
+        parts = blob.split("|")
+        check2(f"{ident}: they split back to exactly the candidates",
+              parts == chosen["candidates"])
+        check2(f"{ident}: splitting on a comma would destroy them",
+              any("," in part for part in parts))
+finally:
+    audio.find_controller = _real_controller
+    audio.stream_caps = _real_caps
+    audio.find_hdmi = _real_hdmi
+
+# and the shim must agree about the separator
+shim = (Path(__file__).resolve().parents[2] / "src/shims/audioshim.c").read_text()
+check2("audioshim splits the candidate list on '|'",
+      'strtok_r(list, "|", &save)' in shim)
+check2("audioshim does not split it on ','",
+      'strtok_r(list, ",", &save)' not in shim)
+
 print()
 if failures:
     for line in failures:
         print("FAIL", line)
     sys.exit(1)
 print("all audio parsing checks passed")
+
+
+# ---------------------------------------------------------------- device names
+# An ALSA device name contains commas of its own - "plughw:CARD=FLX4,DEV=0" is
+# ONE device - so a list of candidates can never be joined with a comma.  It
+# was, and the result was a name that could not open on any card, which is why
+# there was no sound at all: aplay said
+#     Parameter SUBDEV must be an integer
+#     Unknown PCM plughw:CARD=DDJFLX4,DEV=0,plughw:2,0

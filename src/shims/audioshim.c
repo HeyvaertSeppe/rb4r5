@@ -23,7 +23,12 @@
  * which enumerates /proc/asound and picks the device, so this file has no
  * card numbers compiled into it:
  *
- *   RB_AUDIO_DEV        ALSA device name, e.g. "plughw:CARD=FLX4,DEV=0"
+ *   RB_AUDIO_DEV        ALSA device name, e.g. "plughw:CARD=FLX4,DEV=0".
+ *                       Several may be given, to be tried in order, separated
+ *                       by '|' - NOT by a comma, which is part of the names
+ *                       themselves ("plughw:CARD=FLX4,DEV=0" is one device,
+ *                       and splitting it on the comma produces four things
+ *                       that are not devices at all).
  *                       (a comma-separated list is tried in order)
  *   RB_AUDIO_CH         real channel count: 4 (FLX4) or 2 (HDMI)   [default 2]
  *   RB_AUDIO_RATE       sample rate to negotiate                   [44100]
@@ -344,14 +349,18 @@ static void open_real_playback(int mode)
 
     if (!g_dev_list[0]) {
         if (pick_device(autodev, sizeof(autodev)))
-            snprintf(g_dev_list, sizeof(g_dev_list), "%s,default", autodev);
+            snprintf(g_dev_list, sizeof(g_dev_list), "%s|default", autodev);
         else
             snprintf(g_dev_list, sizeof(g_dev_list), "%s", "default");
         alog("audioshim: no RB_AUDIO_DEV, auto-picked '%s'\n", g_dev_list);
     }
 
+    /* Candidates are separated by '|'.  A comma cannot be the separator: it
+     * is part of every card-name device ("plughw:CARD=FLX4,DEV=0"), and
+     * splitting on it turns one real device into four names that are not
+     * devices - which is exactly why nothing ever opened. */
     snprintf(list, sizeof(list), "%s", g_dev_list);
-    for (p = strtok_r(list, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
+    for (p = strtok_r(list, "|", &save); p; p = strtok_r(NULL, "|", &save)) {
         while (*p == ' ') p++;
         if (!*p)
             continue;

@@ -459,11 +459,8 @@ def top_bar_rows(cfg) -> int:
         return 0
     from . import fb                                    # local: keeps import order simple
     wanted = int(cfg.get("display.top_bar_height", 0) or 0)
-    if wanted > 0:
-        return wanted
     info = fb.screeninfo(cfg.get("display.fbdev", "/dev/fb0"))
-    height = info.get("height", 0)
-    return max(48, round(height * 0.08)) if height else 0
+    return config.top_bar_height(info.get("height", 0), wanted)
 
 
 def player_env(cfg, audio_env: dict) -> dict:

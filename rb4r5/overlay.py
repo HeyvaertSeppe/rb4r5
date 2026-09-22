@@ -42,31 +42,28 @@ MODAL_FILE = "/tmp/rb-overlay.modal"    # while this exists the player holds off
 FRAMES_FILE = "/tmp/rb-frames.dat"      # the driver's frame counter
 
 # --- colours, near enough to the RX3's own panel ---------------------------
-# The player's own scheme: near-black panels, cool grey lettering, and the
-# amber that lights a selected control.  Nothing here is a brand asset - it
-# is the palette the hardware uses, matched by eye so the launcher's bar does
-# not look bolted onto the player's screen.
+# The player's scheme: flat grey panels, no shading, and the blue that
+# lights a control when it is active.  Nothing here is a brand asset - it is
+# the palette the hardware uses, matched by eye.  Flat on purpose: the RX3's
+# own buttons are blocks of colour, and a gradient reads as a web page.
 BG          = (8, 9, 12)              # the panel between the controls
-BUTTON_TOP  = (34, 37, 44)            # a button body, lit from above
-BUTTON_BOT  = (22, 24, 29)
-BUTTON_EDGE = (58, 63, 74)
-LABEL       = (208, 214, 226)
-LIT_TOP     = (255, 176, 44)          # the amber a selected control lights
-LIT_BOT     = (226, 138, 18)
-LIT_LABEL   = (18, 14, 6)
-LIT_EDGE    = (255, 206, 120)
-ACCENT      = (0, 156, 222)           # the cool blue of the player's own trim
-# the meter, in the RX3's own three bands
-METER_OK    = (54, 206, 122)
-METER_WARM  = (240, 196, 48)
-METER_HOT   = (238, 62, 48)
-METER_OFF   = (24, 26, 31)
+BUTTON_BG   = (46, 49, 56)            # a button body: flat grey
+BUTTON_EDGE = (72, 77, 88)
+LABEL       = (214, 219, 230)
+LIT_BG      = (0, 122, 204)           # the blue an active control lights
+LIT_LABEL   = (255, 255, 255)
+LIT_EDGE    = (92, 186, 255)
+ACCENT      = (0, 122, 204)
+# the meter: a fine scale that runs green to red, drawn as thin lines
+METER_LOW   = (46, 200, 116)
+METER_MID   = (236, 196, 52)
+METER_HOT   = (236, 62, 48)
+METER_OFF   = (26, 28, 33)
 # the effect list down the left border
-FX_ON_BG    = LIT_TOP
-FX_ON_BOT   = LIT_BOT
+FX_ON_BG    = LIT_BG
 FX_ON       = LIT_LABEL
-FX_OFF      = (138, 145, 160)
-FX_ROW      = (16, 18, 22)            # an unselected row, barely lifted
+FX_OFF      = (150, 157, 172)
+FX_ROW      = (30, 32, 38)
 
 # Beat FX, in the order the player steps through them.  Choosing one sends
 # that many steps of the player's own FX-select control, so the ORDER is what
@@ -122,11 +119,8 @@ class Layout:
     def bar_height(self) -> int:
         if not self.cfg.get("display.top_bar", True) or not self.fh:
             return 0
-        wanted = int(self.cfg.get("display.top_bar_height", 0) or 0)
-        if wanted <= 0:
-            # 8% of the panel, which on 1620 rows is 130 - about the
-            # proportion the RX3's own button row takes
-            wanted = max(48, round(self.fh * 0.08))
+        wanted = config.top_bar_height(
+            self.fh, int(self.cfg.get("display.top_bar_height", 0) or 0))
         return min(wanted, self.fh // 3)
 
     def bar_rect(self) -> tuple[int, int, int, int]:
@@ -185,26 +179,19 @@ class Overlay:
         bar = canvas.Canvas(self.layout.info, 0, 0,
                             self.layout.fw, self.layout.bar_h)
         bar.fill(BG)
-        pad = max(3, self.layout.bar_h // 12)
+        pad = max(2, self.layout.bar_h // 14)
         height = self.layout.bar_h - 2 * pad
-        radius = max(2, height // 6)
-
-        # One size for every label, chosen so the longest still fits.  Picking
-        # a size per button makes a row of buttons look like a ransom note.
         scale = self.bar_scale(pad)
 
         for button in self.buttons:
             lit = button.lit or (button.until > time.monotonic())
-            top = LIT_TOP if lit else BUTTON_TOP
-            bottom = LIT_BOT if lit else BUTTON_BOT
-            ink = LIT_LABEL if lit else LABEL
-            bar.round_rect(button.x, pad, button.w, height, top, radius, bottom)
-            bar.round_rect(button.x, pad, button.w, 1,
-                           LIT_EDGE if lit else BUTTON_EDGE, radius)
+            bar.rect(button.x, pad, button.w, height,
+                     LIT_BG if lit else BUTTON_BG)
+            bar.frame(button.x, pad, button.w, height,
+                      LIT_EDGE if lit else BUTTON_EDGE, 1)
             bar.text_centred(button.x + button.w // 2,
                              (self.layout.bar_h - font.text_height(scale)) // 2,
-                             button.label, ink, scale)
-        # the player's own trim line under the row
+                             button.label, LIT_LABEL if lit else LABEL, scale)
         bar.rect(0, self.layout.bar_h - 1, self.layout.fw, 1, ACCENT)
         if target is not False:
             bar.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
@@ -343,6 +330,22 @@ class Overlay:
                 return index
         return None
 
+    @staticmethod
+    def fx_lines(name: str) -> list[str]:
+        """An effect name, split so it can be read in a narrow column.
+
+        "ENIGMA JET" on one line in a 200px bar has to be tiny; on two it can
+        be twice the size.  Only names with a space in them split - the rest
+        are short enough already.
+        """
+        if " " not in name:
+            return [name]
+        words = name.split()
+        if len(words) == 2:
+            return words
+        half = (len(words) + 1) // 2
+        return [" ".join(words[:half]), " ".join(words[half:])]
+
     def fx_scale(self, w: int, h: int) -> int:
         """One text size for the whole list: the largest every name fits in.
 
@@ -353,9 +356,14 @@ class Overlay:
         if not self.fx:
             return 1
         probe = canvas.Canvas(self.layout.info, 0, 0, 1, 1)
-        rows = self.fx_rows(w, h)
-        return min(probe.fit_scale(name, w - 8, height - 6)
-                   for name, _top, height in rows)
+        best = None
+        for name, _top, height in self.fx_rows(w, h):
+            lines = self.fx_lines(name)
+            room = (height - 8) // len(lines)
+            for line in lines:
+                size = probe.fit_scale(line, w - 8, room)
+                best = size if best is None else min(best, size)
+        return max(1, best or 1)
 
     def draw_fx_strip(self, target: str | None = None) -> canvas.Canvas | None:
         """The effect list, with the selected one lit."""
@@ -365,18 +373,20 @@ class Overlay:
         strip = canvas.Canvas(self.layout.info, x, y, w, h)
         strip.fill(BG)
         scale = self.fx_scale(w, h)
-        text_h = font.text_height(scale)
-        radius = max(2, w // 12)
+        line_h = font.text_height(scale)
 
         for index, (name, top, height) in enumerate(self.fx_rows(w, h)):
             live = index == self.fx_index
             body_h = height - 2
+            strip.rect(0, top, w, body_h, FX_ON_BG if live else FX_ROW)
             if live:
-                strip.round_rect(0, top, w, body_h, FX_ON_BG, radius, FX_ON_BOT)
-            else:
-                strip.round_rect(0, top, w, body_h, FX_ROW, radius)
-            strip.text_centred(w // 2, top + max(0, (body_h - text_h) // 2),
-                               name, FX_ON if live else FX_OFF, scale)
+                strip.frame(0, top, w, body_h, LIT_EDGE, 1)
+            lines = self.fx_lines(name)
+            block = line_h * len(lines) + 2 * (len(lines) - 1)
+            start = top + max(0, (body_h - block) // 2)
+            for row, text in enumerate(lines):
+                strip.text_centred(w // 2, start + row * (line_h + 2), text,
+                                   FX_ON if live else FX_OFF, scale)
         if target is not False:
             strip.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return strip
@@ -409,23 +419,31 @@ class Overlay:
         ten_bit = min(1023, max(0, round(norm * 1023)))
         mode = str(self.cfg.get("overlay.fx_mode", "position")).lower()
 
+        pos14 = min(16383, max(0, round(norm * 16383)))
+        landed = True
         if mode == "tap":
             steps = (index - self.fx_index) % count
             for _ in range(steps):
-                keys.tap_ctrl("bfxtype", 1)
+                landed &= keys.tap_ctrl("bfxtype", 1)
                 time.sleep(0.02)
         elif mode == "delta":
             steps = index - self.fx_index
             for _ in range(abs(steps)):
-                keys.rotate("bfxtype", 1, 1 if steps > 0 else -1)
+                landed &= keys.rotate("bfxtype", 1, 1 if steps > 0 else -1)
                 time.sleep(0.02)
+        elif mode == "value":
+            landed = keys.value("bfxtype", 1, ten_bit, norm)
         else:
-            keys.rotate("bfxtype", 1, ten_bit, norm,
-                        min(16383, max(0, round(norm * 16383))))
+            landed = keys.rotate("bfxtype", 1, ten_bit, norm, pos14)
 
         self.fx_index = index
-        return (f"selected {self.fx[index]} "
-                f"({mode} {ten_bit}/1023)")
+        if not landed:
+            # Silence here is what let three different message formats look
+            # identical from the outside: nothing arrived, every time.
+            util.warn(f"overlay: nothing is reading {config.FIFO_CTRL} - the "
+                      "effect was not sent to the player")
+            return f"{self.fx[index]} (NOT SENT - no reader on the control fifo)"
+        return f"selected {self.fx[index]} ({mode} {ten_bit}/1023)"
 
     def step_fx(self, direction: int) -> str:
         """Move the selection one effect down (+1) or up (-1)."""
@@ -447,49 +465,59 @@ class Overlay:
 
     def draw_meter(self, left: float, right: float,
                    target: str | None = None) -> canvas.Canvas | None:
+        """The master level, as two columns of fine lines.
+
+        Thin lines with a gap between them, coloured along the scale rather
+        than in three blocks - close to what the player draws, and it reads
+        as a meter at a glance instead of as a bar chart.
+        """
         x, y, w, h = self.meter_rect()
         if w <= 0 or h <= 0:
             return None
         meter = canvas.Canvas(self.layout.info, x, y, w, h)
         meter.fill(BG)
 
-        segments = max(12, h // 26)
-        gap = max(1, h // (segments * 8))
-        seg_h = (h - gap * (segments - 1)) // segments
-        col_w = (w - max(2, w // 8)) // 2
+        line_h = max(1, h // 150)          # thin
+        gap = max(1, line_h)
+        step = line_h + gap
+        segments = max(8, h // step)
+        col_w = (w - max(2, w // 10)) // 2
         col_gap = w - col_w * 2
 
         for column, level in enumerate((left, right)):
             cx = column * (col_w + col_gap)
-            # dBFS, so the top of the scale behaves like a real meter: the
-            # last fifth is the red, and -6 dB is about three quarters up
             db = -60.0 if level <= 0.0005 else 20.0 * math.log10(level)
             filled = int(round((db + 48.0) / 48.0 * segments))
             for index in range(segments):
-                top = h - (index + 1) * (seg_h + gap) + gap
-                share = index / max(1, segments - 1)
-                if index >= filled:
-                    colour = METER_OFF
-                elif share > 0.88:
-                    colour = METER_HOT
-                elif share > 0.72:
-                    colour = METER_WARM
-                else:
-                    colour = METER_OK
-                meter.rect(cx, top, col_w, seg_h, colour)
+                top = h - (index + 1) * step + gap
+                colour = (METER_OFF if index >= filled
+                          else self.meter_colour(index / max(1, segments - 1)))
+                meter.rect(cx, top, col_w, line_h, colour)
 
-        # the red line, where the RX3 puts it
+        # where the player puts its red line
         line_y = h - int(h * 0.88) - 1
-        meter.rect(0, line_y, w, max(1, h // 300), (90, 40, 40))
+        meter.rect(0, line_y, w, 1, (86, 38, 34))
         scale = meter.fit_scale("LR", w, max(6, h // 40))
-        meter.text(0, h - font.text_height(scale) - 1, "L", (90, 96, 108), scale)
+        meter.text(0, h - font.text_height(scale) - 1, "L", FX_OFF, scale)
         meter.text(col_w + col_gap, h - font.text_height(scale) - 1, "R",
-                   (90, 96, 108), scale)
+                   FX_OFF, scale)
         if target is not False:
             meter.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return meter
 
-    # -- state shared with the touch daemon --------------------------------
+    @staticmethod
+    def meter_colour(share: float) -> tuple[int, int, int]:
+        """Green at the bottom through amber to red at the top, blended."""
+        share = max(0.0, min(1.0, share))
+        if share < 0.72:
+            mix = share / 0.72
+            low, high = METER_LOW, METER_MID
+        else:
+            mix = (share - 0.72) / 0.28
+            low, high = METER_MID, METER_HOT
+        return tuple(int(round(low[i] + (high[i] - low[i]) * mix))
+                     for i in range(3))
+
     def hold_screen(self, mine: bool) -> None:
         """Tell the display driver to stop publishing (or start again).
 

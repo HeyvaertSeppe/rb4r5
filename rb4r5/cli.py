@@ -364,6 +364,60 @@ def cmd_subucom(args, cfg) -> int:
     return subucom.run(cfg, capture=args.capture)
 
 
+def cmd_fxhunt(args, cfg) -> int:
+    """Try every plausible way of telling the player to change its Beat FX.
+
+    Three readings of that control have now been tried and the player stayed
+    on DELAY, so this stops guessing: it sends each candidate in turn, names
+    it first, and waits.  Watch the player's Beat FX name - when it moves,
+    the line above it is the answer.
+
+    Then set it and it is done:
+        sudo python3 launch.py config --set overlay.fx_mode=<mode>
+    """
+    util.require_root("sending controls to the player")
+    if not Path(config.FIFO_CTRL).exists():
+        raise util.Fail(f"{config.FIFO_CTRL} is not there - is the player "
+                        "running?")
+
+    names = [args.key] if args.key else ["bfxtype", "bfxch"]
+    pause = args.pause
+    print(f"\nWatch the player's BEAT FX name.  Each line is sent {pause:.1f}s "
+          f"after it prints;\nwhen the effect changes, that line is the one "
+          f"that works.\n")
+
+    tried = 0
+    for name in names:
+        code = keys.resolve(name)
+        for label, send in (
+            ("rotate, absolute 0",     lambda: keys.rotate(code, 1, 0, 0.0, 0)),
+            ("rotate, absolute 511",   lambda: keys.rotate(code, 1, 511, 0.5, 8191)),
+            ("rotate, absolute 1023",  lambda: keys.rotate(code, 1, 1023, 1.0, 16383)),
+            ("rotate, delta +1",       lambda: keys.rotate(code, 1, 1)),
+            ("rotate, delta -1",       lambda: keys.rotate(code, 1, -1)),
+            ("value, 0",               lambda: keys.value(code, 1, 0, 0.0)),
+            ("value, 511",             lambda: keys.value(code, 1, 511, 0.5)),
+            ("value, 1023",            lambda: keys.value(code, 1, 1023, 1.0)),
+            ("press and release",      lambda: keys.tap_ctrl(code, 1)),
+        ):
+            mode = {"rotate, absolute": "position", "rotate, delta": "delta",
+                    "value": "value", "press": "tap"}
+            hint = next((v for k, v in mode.items() if label.startswith(k)), "")
+            print(f"  {name} 0x{code:04x}  {label:<22} "
+                  f"(overlay.fx_mode={hint})")
+            time.sleep(pause)
+            if not send():
+                util.warn(f"    nothing is reading {config.FIFO_CTRL} - the "
+                          "player is not listening")
+                return 1
+            tried += 1
+
+    print(f"\n{tried} sent.  If NONE of them moved it, the key itself is "
+          f"wrong, not the\nmessage - try another with: launch.py fxhunt "
+          f"--key 0x4490   (and see\n`launch.py keys --list`).")
+    return 0
+
+
 def cmd_ledsweep(args, cfg) -> int:
     """Light the controller's lamps one at a time, so they can be mapped.
 
@@ -723,6 +777,14 @@ def build_parser() -> argparse.ArgumentParser:
     sniff = sub.add_parser("sniff", help="print what the controller sends, to "
                                         "identify a button")
     sniff.add_argument("-d", "--device", help="/dev/snd/midiC*D*")
+
+    hunt = sub.add_parser("fxhunt", help="find the message that actually "
+                                        "changes the player's Beat FX")
+    hunt.add_argument("--key", help="a key name or code to try instead of "
+                                    "the Beat FX ones")
+    hunt.add_argument("--pause", type=float, default=2.5,
+                      help="seconds between each attempt (default 2.5)")
+    hunt.set_defaults(func=cmd_fxhunt)
 
     sweep = sub.add_parser("ledsweep", help="light the controller's lamps one "
                                             "at a time, to find out which "

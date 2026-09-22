@@ -299,6 +299,23 @@ def load(path: Path | None = None) -> Config:
 
 # Paths that live in /tmp because the chroot bind-mounts the host /tmp, which
 # is how the shims inside rbp and the daemons outside it talk to each other.
+# How much of the panel the button bar takes when no height is configured.
+# It is used in two places - the bar that is drawn (rb4r5/overlay.py) and the
+# rows the player is told to keep off (rb4r5/chroot.py) - and if those two
+# disagree the player draws under the bar or leaves a gap.
+TOP_BAR_SHARE = 0.06
+TOP_BAR_MIN = 40
+
+
+def top_bar_height(panel_height: int, configured: int = 0) -> int:
+    """The bar's height in pixels, from the panel's."""
+    if configured > 0:
+        return configured
+    if not panel_height:
+        return 0
+    return max(TOP_BAR_MIN, round(panel_height * TOP_BAR_SHARE))
+
+
 FIFO_KEYS = "/tmp/rb-keys.fifo"
 FIFO_CTRL = "/tmp/rb-ctrl.fifo"
 FIFO_UDEV = ["/tmp/udev_usb1", "/tmp/udev_usb2",

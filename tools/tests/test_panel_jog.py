@@ -135,13 +135,28 @@ rgb = fb.to_rgb(bytes(loud.buf), dict(loud.info, width=loud.w, height=loud.h,
                                       line_length=loud.stride))
 
 
-def at(x, y):
-    off = (y * loud.w + x) * 3
-    return tuple(rgb[off:off + 3])
+def at(x, y, pixels=None, shot=None):
+    shot = shot or loud
+    pixels = pixels if pixels is not None else rgb
+    off = (y * shot.w + x) * 3
+    return tuple(pixels[off:off + 3])
 
 
-bottom = at(loud.w // 4, loud.h - loud.h // 12)
-top = at(loud.w // 4, loud.h // 40)
+def lit_near(y, pixels=None, shot=None, span=12):
+    """The brightest pixel within a few rows of y.
+
+    The meter is thin lines with gaps between them now, so a single sample
+    can land in a gap and read as the background.
+    """
+    shot = shot or loud
+    pixels = pixels if pixels is not None else rgb
+    rows = [at(shot.w // 4, row, pixels, shot)
+            for row in range(max(0, y - span), min(shot.h, y + span))]
+    return max(rows, key=sum)
+
+
+bottom = lit_near(loud.h - loud.h // 12)
+top = lit_near(loud.h // 40)
 check(bottom[1] > bottom[0] and bottom[1] > bottom[2],
       f"the bottom of a full meter is green {bottom}")
 check(top[0] > top[1] and top[0] > top[2],
@@ -150,8 +165,7 @@ check(top[0] > top[1] and top[0] > top[2],
 half = over.draw_meter(0.02, 0.02, target=False)
 hrgb = fb.to_rgb(bytes(half.buf), dict(half.info, width=half.w, height=half.h,
                                        line_length=half.stride))
-htop = hrgb[((half.h // 40) * half.w + half.w // 4) * 3:
-            ((half.h // 40) * half.w + half.w // 4) * 3 + 3]
+htop = lit_near(half.h // 40, hrgb, half)
 check(sum(htop) < 120, f"a quiet signal leaves the top unlit {tuple(htop)}")
 
 print("\n" + ("all panel/jog/meter tests passed" if not FAIL

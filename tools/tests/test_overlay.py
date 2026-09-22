@@ -51,16 +51,23 @@ def build(info=None, **overrides):
 
 print("== geometry")
 over = build()
-check(over.layout.bar_h == 130, f"8% of 1620 rows is {over.layout.bar_h}")
-check(over.layout.frame == (248, 130, 2384, 1490),
+# One source for this: the bar that is drawn and the rows the player is told
+# to keep off both come from config.top_bar_height(), and if they disagree
+# the player draws under the bar or leaves a gap.
+check(over.layout.bar_h == config.top_bar_height(1620),
+      f"the bar is {over.layout.bar_h} rows, as the config says")
+check(over.layout.bar_h == 97, f"6% of 1620 rows is {over.layout.bar_h}")
+check(over.layout.frame == (222, 97, 2436, 1523),
       f"the player frame sits under the bar: {over.layout.frame}")
 # the same numbers the C computes - tools/tests/test_fbscale.c asserts these
-check(fb.frame_rect(panel(), 1280, 800, True, 130) == over.layout.frame,
+check(fb.frame_rect(panel(), 1280, 800, True, over.layout.bar_h)
+      == over.layout.frame,
       "Layout and fb.frame_rect agree")
 check(build(panel(1920, 1080)).layout.frame == (96, 86, 1728, 908) or True,
       "a 1080p panel also fits under its bar")
 small = build(panel(800, 480))
-check(small.layout.bar_h >= 48, f"a small panel keeps a usable bar "
+check(small.layout.bar_h >= config.TOP_BAR_MIN,
+      f"a small panel keeps a usable bar "
                                 f"({small.layout.bar_h}px)")
 check(build(display__top_bar=False).layout.bar_h == 0, "the bar can be off")
 check(build(display__top_bar_height=200).layout.bar_h == 200,
@@ -297,7 +304,8 @@ over.mode = "none"
 over.write_state()
 check(overlay.modal_up() is False, "the effect list is not")
 state = overlay.read_state()
-check(state.get("bar_h") == 130 and tuple(state.get("frame", ())) == over.layout.frame,
+check(state.get("bar_h") == over.layout.bar_h
+      and tuple(state.get("frame", ())) == over.layout.frame,
       "the state carries the geometry touchd needs")
 
 print("\n== the effect list can be replaced without touching the code")

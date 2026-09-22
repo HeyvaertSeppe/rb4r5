@@ -115,8 +115,35 @@ looks like anything but a missing file. The one that started this:
 rbp: mask_inline.h:282: snd_mask_value: Assertion `!snd_mask_empty(mask)' failed.
 ```
 
-That is alsa-lib aborting because the engine asked a real sound card for
-parameters only the RX3's own hardware has.
+That is alsa-lib aborting on an **empty parameter mask**, and the usual cause
+is in our own shim rather than in the hardware.
+
+`snd_pcm_hw_params_t` is opaque, and the caller allocates it zeroed — so every
+mask inside it starts empty. audioshim answers for four of the engine's five
+streams with virtual handles, and a stub like
+
+```c
+int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
+{
+    if (is_real(pcm)) return real_snd_pcm_hw_params_any(g_real_playback, params);
+    return 0;                 /* success - and `params` left untouched */
+}
+```
+
+reports success while leaving that zeroed struct behind. alsa-lib does not
+return an error when something later reads an empty mask out of it; it
+asserts, and the player aborts. Every start, in `scanForDevices()`, before any
+audio is played at all.
+
+So a virtual stream must still hand back a *filled* params struct. It borrows
+one from a real device: the real output when it is open, otherwise alsa-lib's
+own `null` PCM, which needs no hardware and is defined by `alsa.conf` itself.
+Nothing is written through that donor — it exists only to make the struct
+readable. `tools/tests/test_audioshim_params.py` builds the shim against a
+fake libasound and checks it.
+
+The same trap applies to every other stub in that file: returning 0 from a
+function with an out-parameter is only safe if the out-parameter is written.
 
 ### First: make sure the message means what it says
 

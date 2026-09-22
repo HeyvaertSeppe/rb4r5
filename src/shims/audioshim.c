@@ -62,11 +62,16 @@
 #include "rate_gate.h"
 #include <sys/syscall.h>
 
-/* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13 */
+/* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13.
+ *
+ * RB_NO_SYMVER lets the tests build this file against a modern host glibc,
+ * which has no GLIBC_2.4 to bind to.  The real build never defines it. */
+#ifndef RB_NO_SYMVER
 __asm__(".symver dlsym, dlsym@GLIBC_2.4");
 __asm__(".symver dlopen, dlopen@GLIBC_2.4");
 __asm__(".symver dlerror, dlerror@GLIBC_2.4");
 __asm__(".symver dlclose, dlclose@GLIBC_2.4");
+#endif
 
 #ifndef SYS_mmap2
 #define SYS_mmap2 __NR_mmap2
@@ -124,6 +129,11 @@ static int g_h_cap    = 4;
 
 static snd_pcm_t *g_real_playback = NULL;
 static int g_playback_open_count  = 0;
+
+/* An open PCM kept only so hw_params_any() has something real to fill a
+ * caller's params struct from.  See params_donor() for why that matters. */
+static snd_pcm_t *g_donor      = NULL;
+static int        g_donor_tried = 0;
 
 /* ---- runtime configuration (env, filled by the launcher) --------------- */
 static int   g_cfg_done     = 0;
@@ -295,6 +305,38 @@ static inline int is_real(snd_pcm_t *pcm)
     return (pcm && pcm == g_real_playback);
 }
 
+/* A real PCM to fill hw_params from, for the streams that have no hardware.
+ *
+ * snd_pcm_hw_params_t is opaque and version-specific, so a shim cannot build
+ * a valid one by hand.  But it MUST be valid: the caller allocates it zeroed,
+ * every mask inside it is therefore empty, and alsa-lib asserts rather than
+ * returns when asked to read an empty mask
+ *
+ *     rbp: mask_inline.h:282: snd_mask_value: Assertion !snd_mask_empty(mask)
+ *
+ * which aborts the player.  So the virtual streams borrow a real device's
+ * capabilities: the real output if it is open, otherwise alsa-lib's own
+ * "null" PCM, which needs no hardware and is defined by alsa.conf itself.
+ * Nothing is ever written through the donor - it exists only to make the
+ * params struct readable.
+ */
+static snd_pcm_t *params_donor(void)
+{
+    if (g_real_playback)
+        return g_real_playback;
+    if (g_donor || g_donor_tried)
+        return g_donor;
+    g_donor_tried = 1;
+    if (real_snd_pcm_open) {
+        int err = real_snd_pcm_open(&g_donor, "null", SND_PCM_STREAM_PLAYBACK,
+                                    0);
+        alog("audioshim: params donor 'null' res=%d handle=%p\n", err, g_donor);
+        if (err < 0)
+            g_donor = NULL;
+    }
+    return g_donor;
+}
+
 /* Fallback device discovery, used only when the launcher did not set
  * RB_AUDIO_DEV (e.g. rbp started by hand).  Prefer the DJ controller, then any
  * HDMI sink, then ALSA's default. */
@@ -441,10 +483,25 @@ int snd_pcm_close(snd_pcm_t *pcm)
 
 int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
+    snd_pcm_t *donor;
+
     init_real_alsa();
     if (is_real(pcm) && real_snd_pcm_hw_params_any)
         return real_snd_pcm_hw_params_any(g_real_playback, params);
-    return 0;
+
+    /* A virtual stream still has to leave `params` filled in.  Returning 0
+     * and touching nothing leaves the caller's zeroed struct behind, and the
+     * next thing that reads it aborts the player inside alsa-lib. */
+    donor = params_donor();
+    if (donor && real_snd_pcm_hw_params_any)
+        return real_snd_pcm_hw_params_any(donor, params);
+
+    /* Nothing to fill it from.  Fail rather than hand back an empty struct:
+     * a caller that checks skips the device, and one that does not would have
+     * aborted either way. */
+    alog("audioshim: hw_params_any on a virtual stream with no donor - "
+         "returning EINVAL rather than an unreadable params struct\n");
+    return -EINVAL;
 }
 
 int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int access)

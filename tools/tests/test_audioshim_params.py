@@ -23,7 +23,9 @@ import ctypes
 import os
 import subprocess
 import sys
+import struct
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -87,8 +89,12 @@ int snd_pcm_hw_params_any(void *pcm, void *params)
     return 0;
 }
 
+static int applied_access = -1;
 int snd_pcm_hw_params(void *a, void *b) { (void)a; (void)b; return 0; }
-int snd_pcm_hw_params_set_access(void *a, void *b, int c) { (void)a;(void)b;(void)c; return 0; }
+int snd_pcm_hw_params_set_access(void *a, void *b, int c)
+{ (void)a;(void)b; applied_access = c; return 0; }
+int fake_access(void) { return applied_access; }
+void fake_forget_access(void) { applied_access = -1; }
 int snd_pcm_hw_params_set_format(void *a, void *b, int c) { (void)a;(void)b;(void)c; return 0; }
 int snd_pcm_hw_params_set_channels(void *a, void *b, unsigned c) { (void)a;(void)b;(void)c; return 0; }
 int snd_pcm_hw_params_set_rate_near(void *a, void *b, unsigned *c, int *d) { (void)a;(void)b;(void)c;(void)d; return 0; }
@@ -143,8 +149,10 @@ with tempfile.TemporaryDirectory() as tmp:
           cc(fake, tmp / "libasound.so.2", "-Wl,-soname,libasound.so.2"))
 
     shim = tmp / "audioshim.so"
+    levels = tmp / "levels.dat"
     built = cc(REPO / "src/shims/audioshim.c", shim,
                "-DRB_NO_SYMVER", "-DSYS_mmap2=9", "-DSYS_poll=7",
+               f'-DRB_LEVELS_PATH="{levels}"',
                f"-I{REPO / 'src/shims'}", "-O1", "-w", "-ldl")
     check("audioshim builds for the host", built)
     if not built:
@@ -264,6 +272,63 @@ with tempfile.TemporaryDirectory() as tmp:
         master2, ctypes.byref(params), ctypes.byref(period), None)
     check("a period that is already large enough is not shrunk",
           asound.fake_period(), 2048)
+
+    # --- access ---------------------------------------------------------
+    #
+    # This shim reaches the hardware through snd_pcm_writei(), and writei on
+    # a PCM configured for mmap access returns -EINVAL on every call:
+    #
+    #   writei #1 frames=64 written=-22
+    #   the output device stopped accepting audio (Invalid argument)
+    #
+    # The engine does not always ask for an access type at all, so setting it
+    # only when it does is not enough.
+    SND_PCM_ACCESS_MMAP_INTERLEAVED = 0
+    SND_PCM_ACCESS_RW_INTERLEAVED = 3
+
+    lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params),
+                                     SND_PCM_ACCESS_MMAP_INTERLEAVED)
+    check("an mmap access request is overridden, because writei cannot use it",
+          asound.fake_access(), SND_PCM_ACCESS_RW_INTERLEAVED)
+
+    # and it is set even when the engine never asks
+    asound.fake_forget_access()
+    lib.snd_pcm_hw_params(master2, ctypes.byref(params))
+    check("access is set by hw_params even when the engine never asked",
+          asound.fake_access(), SND_PCM_ACCESS_RW_INTERLEAVED)
+
+    # --- what a sample actually says ------------------------------------
+    #
+    # S24_LE puts a 24-bit sample in the low three bytes of a 32-bit
+    # container and leaves the top byte alone, so a negative sample arrives
+    # looking like a large positive int32.  Read raw, -16 (0x00FFFFF0) comes
+    # out as 16777200 against a full scale of 8388607 - which is why the
+    # meter sat pinned at the top with nothing playing.
+    FRAMES = 64
+
+    def write_master(sample):
+        """Feed the master FRAMES stereo frames of one S24_LE value."""
+        raw = (sample & 0x00FFFFFF).to_bytes(4, "little")
+        buf = ctypes.create_string_buffer(raw * 2 * FRAMES, 4 * 2 * FRAMES)
+        lib.snd_pcm_writei.restype = ctypes.c_long
+        lib.snd_pcm_writei(master2, buf, ctypes.c_ulong(FRAMES))
+
+    def published():
+        blob = levels.read_bytes()
+        _seq, left, right, _phones, full = struct.unpack("<5i", blob[:20])
+        return left, right, full
+
+    write_master(-16)
+    left, right, full = published()
+    check("full scale is signed 24-bit", full, 8388607)
+    check("near-silence reads as near-silence, not as full scale",
+          left < 1000 and right < 1000, True)
+
+    time.sleep(0.06)            # publish_levels only writes 20x a second
+    write_master(-8388608)      # the most negative sample there is
+    left, _right, full = published()
+    check("a loud negative sample reads as loud",
+          left > full * 9 // 10, True)
 
 print()
 if failures:

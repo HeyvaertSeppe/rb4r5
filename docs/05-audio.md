@@ -284,3 +284,44 @@ and a non-blocking handle returns `EAGAIN` instead of pacing the engine. (The
 code meant to clear it but masked off bit 2, which is `SND_PCM_ASYNC`, so
 NONBLOCK stayed set — and a momentarily busy card then failed outright
 instead of waiting.)
+
+## Reading a sample the way the engine meant it
+
+`SND_PCM_FORMAT_S24_LE` keeps a 24-bit sample in the **low three bytes** of a
+32-bit container and leaves the top byte alone. A negative sample therefore
+arrives looking like a large positive `int32`:
+
+| sample | container | read raw as int32 |
+|---|---|---|
+| −1 | `0x00FFFFFF` | 16777215 |
+| −16 | `0x00FFFFF0` | 16777200 |
+
+against a full scale of 8388607. That is why the meter sat pinned at the top
+with nothing playing, and why `peak_m` in the log read a steady 16777200 when
+the engine was in fact sending near-silence. `engine_sample()` sign-extends
+from 24 bits before anything looks at the value — metering, the cue mix and
+the startup fade all depend on it being the number the engine meant. A 32-bit
+format already fills the container, so it is left alone.
+
+## Access: writei cannot use an mmap PCM
+
+The engine does not always ask for an access type; on the RX3 it takes
+whatever its own device defaults to. Left alone, `snd_pcm_hw_params()` picks
+the first access the hardware offers, which for a USB card is mmap — and then
+every `snd_pcm_writei()` returns `-EINVAL`:
+
+```
+writei #1 frames=64 written=-22
+the output device stopped accepting audio (Invalid argument after 1 writes)
+```
+
+This shim reaches the hardware through `writei`, so the real device is forced
+to `SND_PCM_ACCESS_RW_INTERLEAVED` — both in `set_access()` when the engine
+does ask, and again in `hw_params()` for when it never does. After
+`hw_params()` succeeds the shim logs what the device actually settled on
+(access, format, channels, rate, period, buffer), because every "no sound" in
+this port so far has been one of those numbers not being what the calls
+leading up to it suggested.
+
+A device that fails a write is no longer written off for the whole run: a
+later `hw_params()` that succeeds clears the flag and gives it another chance.

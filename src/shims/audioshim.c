@@ -158,17 +158,26 @@ static int   g_cue_mirror   = 0;
 static unsigned long g_min_period  = 512;
 static unsigned long g_min_periods = 4;
 
-/* What a full-scale sample from the engine looks like.
+/* What a full-scale sample from the engine looks like. */
+static int32_t g_full_scale = 8388607;
+
+/* Read one sample as the engine meant it.
  *
- * The engine asks for S24_LE, whose samples are 24 bits right-justified in a
- * 32-bit container, so full scale is 8388607.  If what actually arrives is
- * larger than that it cannot be S24_LE data, and the only thing it can
- * sensibly be is 32-bit - in which case the meter needs the bigger scale (or
- * it sits pinned at the top regardless of what is playing) and the samples
- * need shifting down before they go to a device that was configured for 24.
- * Detected rather than assumed, because guessing wrong is silent either way. */
-static int32_t g_full_scale   = 8388607;
-static int     g_sample_shift = 0;
+ * S24_LE keeps a 24-bit sample in the low three bytes of a 32-bit container
+ * and leaves the top byte alone, so a NEGATIVE sample arrives looking like a
+ * large positive int32: -16 is 0x00FFFFF0, which reads as 16777200.  Taking
+ * the absolute value of that gives 16777200 out of a claimed full scale of
+ * 8388607, which is why the meter sat pinned at the top with nothing playing
+ * and why peak_m in the log was always about 16777200 instead of 0.
+ *
+ * Only S24_LE needs this; a 32-bit format already fills the container. */
+static inline int32_t engine_sample(int32_t v)
+{
+    if (g_format != SND_PCM_FORMAT_S24_LE)
+        return v;
+    v &= 0x00FFFFFF;
+    return (v & 0x00800000) ? v - 0x01000000 : v;
+}
 
 static void cfg_init(void)
 {
@@ -192,6 +201,7 @@ static void cfg_init(void)
 
     s = getenv("RB_AUDIO_FMT");
     if (s && *s) g_format = atoi(s);
+    g_full_scale = (g_format == SND_PCM_FORMAT_S24_LE) ? 8388607 : 2147483647;
 
     s = getenv("RB_AUDIO_CUE_ON_2CH");
     if (s && *s && *s != '0') g_cue_on_2ch = 1;
@@ -234,6 +244,13 @@ static int (*real_snd_pcm_sw_params)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
 static int (*real_snd_pcm_prepare)(snd_pcm_t *) = NULL;
 static int (*real_snd_pcm_drop)(snd_pcm_t *) = NULL;
 static int (*real_snd_pcm_hw_free)(snd_pcm_t *) = NULL;
+/* read back what the device actually settled on, for the log */
+static int (*real_get_access)(const snd_pcm_hw_params_t *, unsigned int *) = NULL;
+static int (*real_get_format)(const snd_pcm_hw_params_t *, int *) = NULL;
+static int (*real_get_channels)(const snd_pcm_hw_params_t *, unsigned int *) = NULL;
+static int (*real_get_rate)(const snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
+static int (*real_get_period_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *) = NULL;
+static int (*real_get_buffer_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *) = NULL;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t) = NULL;
 static int (*real_snd_pcm_state)(snd_pcm_t *) = NULL;
 
@@ -278,6 +295,12 @@ static void init_real_alsa(void)
     real_snd_pcm_prepare = dlsym(lib, "snd_pcm_prepare");
     real_snd_pcm_drop = dlsym(lib, "snd_pcm_drop");
     real_snd_pcm_hw_free = dlsym(lib, "snd_pcm_hw_free");
+    real_get_access = dlsym(lib, "snd_pcm_hw_params_get_access");
+    real_get_format = dlsym(lib, "snd_pcm_hw_params_get_format");
+    real_get_channels = dlsym(lib, "snd_pcm_hw_params_get_channels");
+    real_get_rate = dlsym(lib, "snd_pcm_hw_params_get_rate");
+    real_get_period_size = dlsym(lib, "snd_pcm_hw_params_get_period_size");
+    real_get_buffer_size = dlsym(lib, "snd_pcm_hw_params_get_buffer_size");
     real_snd_pcm_writei = dlsym(lib, "snd_pcm_writei");
     real_snd_pcm_state = dlsym(lib, "snd_pcm_state");
     real_snd_ctl_open = dlsym(lib, "snd_ctl_open");
@@ -623,8 +646,17 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int access)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_access)
-        return real_snd_pcm_hw_params_set_access(g_real_playback, params, access);
+    if (is_real(pcm) && real_snd_pcm_hw_params_set_access) {
+        /* Whatever the engine wants for its own device, THIS shim reaches the
+         * hardware through snd_pcm_writei(), and writei on a PCM configured
+         * for mmap access returns -EINVAL.  So the real device is always
+         * RW_INTERLEAVED. */
+        int err = real_snd_pcm_hw_params_set_access(g_real_playback, params,
+                                                    SND_PCM_ACCESS_RW_INTERLEAVED);
+        alog("audioshim: real set_access(req=%d -> %d RW_INTERLEAVED) res=%d\n",
+             access, SND_PCM_ACCESS_RW_INTERLEAVED, err);
+        return err;
+    }
     return 0;
 }
 
@@ -731,8 +763,55 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
     init_real_alsa();
     if (is_real(pcm) && real_snd_pcm_hw_params) {
-        int err = real_snd_pcm_hw_params(g_real_playback, params);
+        int err;
+
+        /* The engine does not always ask for an access type - it leaves the
+         * RX3's device on whatever it defaults to.  Left alone, hw_params
+         * picks the first access the hardware offers, which for a USB card is
+         * mmap, and then every snd_pcm_writei() returns -EINVAL:
+         *
+         *   writei #1 frames=64 written=-22
+         *   the output device stopped accepting audio (Invalid argument)
+         *
+         * So set it here too, whether or not set_access was ever called. */
+        if (real_snd_pcm_hw_params_set_access) {
+            int aerr = real_snd_pcm_hw_params_set_access(
+                g_real_playback, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+            if (aerr < 0)
+                alog("audioshim: the device will not do RW_INTERLEAVED "
+                     "access (res=%d) - writei cannot work on it\n", aerr);
+        }
+
+        err = real_snd_pcm_hw_params(g_real_playback, params);
         alog("audioshim: real hw_params res=%d\n", err);
+        if (err >= 0) {
+            /* Say what the device actually settled on.  Every "no sound" so
+             * far has been one of these numbers not being what it looked
+             * like it should be, and reading them back beats inferring them
+             * from the set_* calls that led here. */
+            unsigned int access = 0, channels = 0, rate = 0;
+            int format = 0;
+            snd_pcm_uframes_t period = 0, buffer = 0;
+            if (real_get_access) real_get_access(params, &access);
+            if (real_get_format) real_get_format(params, &format);
+            if (real_get_channels) real_get_channels(params, &channels);
+            if (real_get_rate) real_get_rate(params, &rate, NULL);
+            if (real_get_period_size) real_get_period_size(params, &period, NULL);
+            if (real_get_buffer_size) real_get_buffer_size(params, &buffer);
+            alog("audioshim: the device is now access=%u (3 = RW_INTERLEAVED, "
+                 "which is what writei needs) format=%d channels=%u rate=%u "
+                 "period=%lu buffer=%lu (%.1f ms)\n",
+                 access, format, channels, rate, (unsigned long)period,
+                 (unsigned long)buffer,
+                 rate ? (double)buffer * 1000.0 / (double)rate : 0.0);
+        }
+        if (err >= 0 && g_pcm_dead) {
+            /* A fresh, accepted configuration deserves a fresh chance: one
+             * bad write at startup should not silence the rest of the run. */
+            g_pcm_dead = 0;
+            g_pcm_fails = 0;
+            alog("audioshim: the device was reconfigured; trying it again\n");
+        }
         return err;
     }
     return 0;
@@ -887,8 +966,8 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
          * itself off it and the whole deck runs fast. */
         static struct pace pace_hp = { 0, 0, 0, "the headphone stream", 0, 0 };
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
-            int32_t l = src[i * 2 + 0];
-            int32_t r = src[i * 2 + 1];
+            int32_t l = engine_sample(src[i * 2 + 0]);
+            int32_t r = engine_sample(src[i * 2 + 1]);
             int32_t al = (l < 0) ? -l : l;
             int32_t ar = (r < 0) ? -r : r;
             if (al > s_peak_hp) s_peak_hp = al;
@@ -912,22 +991,14 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
 
     /* Master stream */
     for (snd_pcm_uframes_t i = 0; i < size; i++) {
-        int32_t l = src[i * 2 + 0];
-        int32_t r = src[i * 2 + 1];
+        int32_t l = engine_sample(src[i * 2 + 0]);
+        int32_t r = engine_sample(src[i * 2 + 1]);
         int32_t al = (l < 0) ? -l : l;
         int32_t ar = (r < 0) ? -r : r;
         if (al > s_peak_master) s_peak_master = al;
         if (ar > s_peak_master) s_peak_master = ar;
         if (al > s_peak_l) s_peak_l = al;
         if (ar > s_peak_r) s_peak_r = ar;
-        if (!g_sample_shift && (al > 8388607 || ar > 8388607)) {
-            g_sample_shift = 8;
-            g_full_scale = 2147483647;
-            alog("audioshim: the engine is sending 32-bit samples, not the "
-                 "S24_LE it asked for (saw %d, 24-bit full scale is 8388607) "
-                 "- shifting them down by 8 and scaling the meter to "
-                 "match\n", al > ar ? al : ar);
-        }
         g_mix4ch[i * 4 + 0] = l;
         g_mix4ch[i * 4 + 1] = r;
         /* Mirror master into the cue pair only while the engine has not
@@ -944,19 +1015,14 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     /* Build the hardware buffer */
     if (g_real_ch == 4) {
         /* DDJ-FLX4: 1/2 = MASTER out, 3/4 = HEADPHONES out */
-        if (g_sample_shift == 0) {
-            memcpy(g_out, g_mix4ch, (size_t)size * 4 * sizeof(int32_t));
-        } else {
-            for (snd_pcm_uframes_t i = 0; i < size * 4; i++)
-                g_out[i] = g_mix4ch[i] >> g_sample_shift;
-        }
+        memcpy(g_out, g_mix4ch, (size_t)size * 4 * sizeof(int32_t));
     } else {
         /* stereo sink (HDMI): master, or the cue mix when it has audio and the
          * operator asked for cue-on-stereo */
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
             int use_cue = (g_cue_on_2ch && s_has_hp_audio);
-            g_out[i * 2 + 0] = g_mix4ch[i * 4 + (use_cue ? 2 : 0)] >> g_sample_shift;
-            g_out[i * 2 + 1] = g_mix4ch[i * 4 + (use_cue ? 3 : 1)] >> g_sample_shift;
+            g_out[i * 2 + 0] = g_mix4ch[i * 4 + (use_cue ? 2 : 0)];
+            g_out[i * 2 + 1] = g_mix4ch[i * 4 + (use_cue ? 3 : 1)];
         }
     }
 
@@ -1048,10 +1114,13 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
             if (!g_pcm_dead) {
                 g_pcm_dead = 1;
                 alog("audioshim: the output device stopped accepting audio "
-                     "(%s after %lu writes); pacing the engine in software "
-                     "instead, so the deck still runs at the right speed - "
-                     "but there will be no sound until this is fixed\n",
-                     strerror((int)-written), g_write_count);
+                     "(%s, errno %d, after %lu writes, state %d); pacing the "
+                     "engine in software instead, so the deck still runs at "
+                     "the right speed - but there will be no sound until "
+                     "this is fixed\n",
+                     strerror((int)-written), (int)-written, g_write_count,
+                     real_snd_pcm_state ?
+                         real_snd_pcm_state(g_real_playback) : -1);
             }
             break;
         }

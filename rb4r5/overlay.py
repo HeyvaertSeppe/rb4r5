@@ -210,12 +210,9 @@ class Overlay:
     def boot_logo(self) -> tuple[int, int, bytes] | None:
         """The image on the boot screen, if there is one to show.
 
-        Nothing vendor-owned ships with this project, so no logo is bundled
-        - the same rule the firmware follows (docs/03-payload.md).  Point
-        `display.boot_logo` at a PNG you own and it is used; the player's own
-        firmware payload carries one, which is where most people will get it.
-        Without one the boot screen is the bar on black, which is closer to
-        the player's than any stand-in would be.
+        Looked for in order: `display.boot_logo`, the player's own firmware
+        payload, /etc/rb4r5/boot-logo.png, and one placed next to this file.
+        Without any of them the boot screen is the bar on black.
         """
         if self._logo is not None:
             return self._logo or None
@@ -223,7 +220,8 @@ class Overlay:
         wanted = self.cfg.get("display.boot_logo")
         places = [wanted] if wanted else []
         places += [str(Path(self.cfg.chroot) / "root/gui/logo.png"),
-                   "/etc/rb4r5/boot-logo.png"]
+                   "/etc/rb4r5/boot-logo.png",
+                   str(Path(__file__).resolve().parent / "boot-logo.png")]
         for place in places:
             if not place or not Path(place).exists():
                 continue

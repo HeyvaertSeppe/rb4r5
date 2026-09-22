@@ -381,6 +381,48 @@ static inline int is_real(snd_pcm_t *pcm)
     return (pcm && pcm == g_real_playback);
 }
 
+/* Whose handle is this?
+ *
+ * THE thing to understand about this shim: it exports public ALSA symbols,
+ * and alsa-lib CALLS THOSE SYMBOLS ITSELF.  A plug PCM - which is what
+ * plughw: is - implements snd_pcm_prepare() by calling snd_pcm_prepare() on
+ * its slave, snd_pcm_hw_params() by calling snd_pcm_hw_params() on its slave,
+ * and so on down the chain.  With LD_PRELOAD in play those internal calls
+ * land HERE, with a handle this shim has never seen.
+ *
+ * Swallowing them - "not one of mine, return 0" - leaves the slave
+ * unconfigured and unprepared while every single call reports success.  That
+ * is precisely what
+ *
+ *     setup hw_params res=0
+ *     our own sw_params (...) res=0
+ *     prepare after setup res=0, state now 1
+ *     writei #1 written=-77   (EBADFD)
+ *
+ * was: the plug layer accepted everything and passed nothing on, because we
+ * were intercepting it on the way.  It also explains the boundary of 0 - the
+ * plug's own setup never completed - and every earlier repair that looked
+ * correct and changed nothing.
+ *
+ * So: this shim owns its virtual streams, and the master handle the engine
+ * was given.  EVERYTHING else is alsa-lib's own business and is passed
+ * straight through, with its own handle, untouched.
+ */
+#define H_ALSA    0     /* alsa-lib's internal slave - pass through */
+#define H_MASTER  1     /* the master, as the engine holds it */
+#define H_VIRTUAL 2     /* one of our fake streams */
+
+static int whose(snd_pcm_t *pcm)
+{
+    if (pcm == (snd_pcm_t *)&g_h_master || pcm == (snd_pcm_t *)&g_h_hp ||
+        pcm == (snd_pcm_t *)&g_h_booth  || pcm == (snd_pcm_t *)&g_h_dummy ||
+        pcm == (snd_pcm_t *)&g_h_cap)
+        return H_VIRTUAL;
+    if (pcm && pcm == g_real_playback)
+        return H_MASTER;
+    return H_ALSA;
+}
+
 /* A real PCM to fill hw_params from, for the streams that have no hardware.
  *
  * snd_pcm_hw_params_t is opaque and version-specific, so a shim cannot build
@@ -811,28 +853,21 @@ static void apply_sw_params(void)
 int snd_pcm_close(snd_pcm_t *pcm)
 {
     init_real_alsa();
-    alog("audioshim: snd_pcm_close(handle=%p)\n", pcm);
-
-    if (!is_real(pcm))
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_close ? real_snd_pcm_close(pcm) : 0;
+    if (whose(pcm) == H_VIRTUAL)
         return 0;
 
-    /* Do NOT close the card.  The engine opens and closes the master several
-     * times while it starts up, and a card that has just been closed can
-     * still be busy when the next open arrives - which is how the master
-     * ended up with no device at all and the transport stopped advancing.
-     *
-     * Instead give it back to the OPEN state: drop whatever is queued and
-     * free the hardware parameters, so the next open can reconfigure it.
-     * The descriptor stays ours for the life of the process, which is also
-     * what stops anything else taking the card in between. */
+    /* The master.  Do NOT close the card: the engine opens and closes it
+     * several times while it starts up, and a card that has just been closed
+     * can still be busy when the next open arrives.  It stays configured and
+     * prepared - configure_real_device() did that once, at open - so there is
+     * nothing to tear down here either. */
     if (--g_real_refs > 0)
         return 0;
     g_real_refs = 0;
-    if (real_snd_pcm_drop)
-        real_snd_pcm_drop(g_real_playback);
-    if (real_snd_pcm_hw_free)
-        real_snd_pcm_hw_free(g_real_playback);
-    alog("audioshim: master released back to OPEN, card still held\n");
+    alog("audioshim: the engine closed the master; the card stays open and "
+         "configured\n");
     return 0;
 }
 
@@ -841,8 +876,9 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
     snd_pcm_t *donor;
 
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_any)
-        return real_snd_pcm_hw_params_any(g_real_playback, params);
+    if (whose(pcm) != H_VIRTUAL)
+        return real_snd_pcm_hw_params_any ?
+               real_snd_pcm_hw_params_any(pcm, params) : 0;
 
     /* A virtual stream still has to leave `params` filled in.  Returning 0
      * and touching nothing leaves the caller's zeroed struct behind, and the
@@ -850,10 +886,6 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
     donor = params_donor();
     if (donor && real_snd_pcm_hw_params_any)
         return real_snd_pcm_hw_params_any(donor, params);
-
-    /* Nothing to fill it from.  Fail rather than hand back an empty struct:
-     * a caller that checks skips the device, and one that does not would have
-     * aborted either way. */
     alog("audioshim: hw_params_any on a virtual stream with no donor - "
          "returning EINVAL rather than an unreadable params struct\n");
     return -EINVAL;
@@ -861,41 +893,46 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 
 /* ---- the engine's hardware parameters -----------------------------------
  *
- * All of these are accepted and NOT applied to the real device.  The engine
- * is describing the RX3's own output; configure_real_device() has already set
- * up the one that actually exists, from its own clean parameter set, using
- * numbers that suit it.  Feeding the engine's here is what left the device
- * configured-but-unpreparable, and it took three separate repairs before the
- * pattern was clear enough to stop doing it.
+ * On the MASTER these are accepted and not applied: the engine is describing
+ * the RX3's own output, and configure_real_device() has already set up the
+ * one that exists.  They still have to SUCCEED, because the engine checks and
+ * will not open its audio otherwise.
  *
- * They still have to SUCCEED: the engine checks, and a failure here stops it
- * opening its audio at all.
+ * On anything else they go straight through - see whose().
  */
 int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int access)
 {
     init_real_alsa();
-    (void)pcm; (void)params; (void)access;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params_set_access ?
+               real_snd_pcm_hw_params_set_access(pcm, params, access) : 0;
     return 0;
 }
 
 int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int format)
 {
     init_real_alsa();
-    (void)pcm; (void)params; (void)format;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params_set_format ?
+               real_snd_pcm_hw_params_set_format(pcm, params, format) : 0;
     return 0;
 }
 
 int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val)
 {
     init_real_alsa();
-    (void)pcm; (void)params; (void)val;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params_set_channels ?
+               real_snd_pcm_hw_params_set_channels(pcm, params, val) : 0;
     return 0;
 }
 
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
 {
     init_real_alsa();
-    (void)pcm; (void)params; (void)dir;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params_set_rate_near ?
+               real_snd_pcm_hw_params_set_rate_near(pcm, params, val, dir) : 0;
     /* the engine reads this back and clocks itself from it */
     if (val) *val = (unsigned)g_rate;
     return 0;
@@ -904,19 +941,25 @@ int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params,
 int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val, int *dir)
 {
     init_real_alsa();
-    (void)pcm; (void)params; (void)dir; (void)val;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params_set_period_size_near ?
+               real_snd_pcm_hw_params_set_period_size_near(pcm, params, val, dir) : 0;
     return 0;
 }
 
 int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
 {
     init_real_alsa();
-    (void)pcm; (void)params; (void)dir; (void)val;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params_set_periods_near ?
+               real_snd_pcm_hw_params_set_periods_near(pcm, params, val, dir) : 0;
     return 0;
 }
 
 /* The engine asks what the (RX3) device can do before it opens it; answer for
- * the stereo stream it believes in, not for the real sink. */
+ * the stereo stream it believes in, not for the real sink.  These take no
+ * pcm, so they cannot be told apart - but alsa-lib does not call them
+ * internally on a slave, it reads the masks directly. */
 int snd_pcm_hw_params_get_channels_min(const snd_pcm_hw_params_t *params, unsigned int *val)
 {
     if (val) *val = 2;
@@ -932,16 +975,19 @@ int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *params, unsign
 int snd_pcm_hw_params_test_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int rate)
 {
     cfg_init();
+    if (whose(pcm) == H_ALSA)
+        return 0;
     return ((int)rate == g_rate) ? 0 : -EINVAL;
 }
 
 int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
     init_real_alsa();
-    (void)params;
-    if (is_real(pcm)) {
-        /* Already configured at open.  If an earlier attempt left it
-         * unusable, this is a good moment to try again. */
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_hw_params ? real_snd_pcm_hw_params(pcm, params) : 0;
+    if (whose(pcm) == H_MASTER) {
+        /* Already configured at open.  If something left it unusable, this
+         * is a good moment to try again. */
         int state = real_snd_pcm_state ? real_snd_pcm_state(g_real_playback) : -1;
         if (state != 2 && state != 3) {
             alog("audioshim: the engine is configuring its output and ours is "
@@ -955,10 +1001,10 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 int snd_pcm_sw_params_current(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
 {
     init_real_alsa();
-    int err = 0;
-    if (is_real(pcm) && real_snd_pcm_sw_params_current)
-        err = real_snd_pcm_sw_params_current(g_real_playback, params);
-    return err;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_sw_params_current ?
+               real_snd_pcm_sw_params_current(pcm, params) : 0;
+    return 0;
 }
 
 int snd_pcm_sw_params_get_boundary(const snd_pcm_sw_params_t *params, snd_pcm_uframes_t *val)
@@ -974,75 +1020,61 @@ int snd_pcm_sw_params_get_boundary(const snd_pcm_sw_params_t *params, snd_pcm_uf
     return err;
 }
 
+/* Software parameters: through for alsa-lib, ignored for ours.  The engine
+ * sizes these for the 128-frame buffer it believes in; apply_sw_params() sets
+ * them from the buffer the hardware actually has. */
 int snd_pcm_sw_params_set_silence_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    /* Not forwarded for the real device: the engine sizes these for the
-     * 128-frame buffer it believes in, and applying them to the real one
-     * stops the stream dead.  apply_sw_params() sets them from the buffer
-     * the hardware actually has. */
-    (void)params; (void)val;
-    return 0; /* always succeed */
+    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_silence_threshold)
+        return real_snd_pcm_sw_params_set_silence_threshold(pcm, params, val);
+    return 0;
 }
 
 int snd_pcm_sw_params_set_silence_size(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    /* Not forwarded for the real device: the engine sizes these for the
-     * 128-frame buffer it believes in, and applying them to the real one
-     * stops the stream dead.  apply_sw_params() sets them from the buffer
-     * the hardware actually has. */
-    (void)params; (void)val;
+    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_silence_size)
+        return real_snd_pcm_sw_params_set_silence_size(pcm, params, val);
     return 0;
 }
 
 int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    /* Not forwarded for the real device: the engine sizes these for the
-     * 128-frame buffer it believes in, and applying them to the real one
-     * stops the stream dead.  apply_sw_params() sets them from the buffer
-     * the hardware actually has. */
-    (void)params; (void)val;
+    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_start_threshold)
+        return real_snd_pcm_sw_params_set_start_threshold(pcm, params, val);
     return 0;
 }
 
 int snd_pcm_sw_params_set_stop_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    /* Not forwarded for the real device: the engine sizes these for the
-     * 128-frame buffer it believes in, and applying them to the real one
-     * stops the stream dead.  apply_sw_params() sets them from the buffer
-     * the hardware actually has. */
-    (void)params; (void)val;
+    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_stop_threshold)
+        return real_snd_pcm_sw_params_set_stop_threshold(pcm, params, val);
     return 0;
 }
 
 int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
 {
     init_real_alsa();
-    /* Deliberately not applied to the real device - apply_sw_params() has
-     * already set software parameters that match its actual buffer, and the
-     * engine's would undo them. */
-    (void)pcm; (void)params;
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_sw_params ? real_snd_pcm_sw_params(pcm, params) : 0;
     return 0;
 }
 
 int snd_pcm_prepare(snd_pcm_t *pcm)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_prepare)
-        real_snd_pcm_prepare(g_real_playback);
+    /* alsa-lib prepares a plug PCM by calling THIS on its slave.  Passing it
+     * through is the whole reason the device can reach PREPARED at all. */
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_prepare ? real_snd_pcm_prepare(pcm) : 0;
+    if (whose(pcm) == H_MASTER && real_snd_pcm_prepare)
+        return real_snd_pcm_prepare(g_real_playback);
     return 0;
 }
 
-int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
-{
-    return 0;   /* the streams are already muxed into one device here */
-}
-
-/* Say how each stream is doing against the clock, because "the song plays too
- * fast" is a ratio and this is where the ratio is known. */
 static void pace_report(struct pace *p, snd_pcm_uframes_t frames)
 {
     long long now = rb4r5_now_us();
@@ -1063,8 +1095,6 @@ static void pace_report(struct pace *p, snd_pcm_uframes_t frames)
     }
 }
 
-/* peak L, peak R, peak headphones, all 0..2^23, plus a counter so a reader
- * can tell a stalled engine from a silent one. */
 static void publish_levels(int32_t left, int32_t right, int32_t phones)
 {
     static long long s_last_ms = 0;
@@ -1095,6 +1125,11 @@ static void publish_levels(int32_t left, int32_t right, int32_t phones)
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
     init_real_alsa();
+    /* alsa-lib writes to a plug PCM's slave through this same symbol.  Those
+     * are its own frames, already converted, and must go straight on. */
+    if (whose(pcm) == H_ALSA)
+        return real_snd_pcm_writei ?
+               real_snd_pcm_writei(pcm, buffer, size) : (snd_pcm_sframes_t)size;
     if (!buffer || size == 0) return size;
 
     if (size > MAX_FRAMES)

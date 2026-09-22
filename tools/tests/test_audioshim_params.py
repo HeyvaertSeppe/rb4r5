@@ -51,6 +51,13 @@ struct fake_pcm { char name[64]; int stream; };
 static struct fake_pcm pcms[8];
 static int npcm = 0;
 
+/* A stand-in for a plug PCM's slave: a handle the shim has never seen. */
+static struct fake_pcm slave_pcm;
+static int slave_prepared = 0, slave_configured = 0;
+void *fake_slave(void) { return &slave_pcm; }
+int fake_slave_prepared(void) { return slave_prepared; }
+int fake_slave_configured(void) { return slave_configured; }
+
 /* every call is recorded here so the test can read back what happened */
 static char opened[8][64];
 static int  n_opened = 0;
@@ -90,7 +97,8 @@ int snd_pcm_hw_params_any(void *pcm, void *params)
 }
 
 static int applied_access = -1;
-int snd_pcm_hw_params(void *a, void *b) { (void)a; (void)b; return 0; }
+int snd_pcm_hw_params(void *a, void *b)
+{ (void)b; if (a == (void *)&slave_pcm) slave_configured++; return 0; }
 int snd_pcm_hw_params_set_access(void *a, void *b, int c)
 { (void)a;(void)b; applied_access = c; return 0; }
 int fake_access(void) { return applied_access; }
@@ -135,7 +143,8 @@ int snd_pcm_sw_params_set_start_threshold(void *a, void *b, unsigned long c)
 int snd_pcm_sw_params_set_stop_threshold(void *a, void *b, unsigned long c)
 { (void)a;(void)b; sw_stop = (int)c; return 0; }
 int snd_pcm_sw_params(void *a, void *b) { (void)a;(void)b; sw_applied++; return 0; }
-int snd_pcm_prepare(void *a) { (void)a; return 0; }
+int snd_pcm_prepare(void *a)
+{ if (a == (void *)&slave_pcm) slave_prepared++; return 0; }
 int snd_pcm_hw_params_get_period_size(const void *a, unsigned long *b, int *c)
 { (void)a;(void)c; if (b) *b = 512; return 0; }
 int snd_pcm_hw_params_get_buffer_size(const void *a, unsigned long *b)
@@ -338,6 +347,48 @@ with tempfile.TemporaryDirectory() as tmp:
           lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params), 0), 0)
     check("and its hw_params still succeeds",
           lib.snd_pcm_hw_params(master2, ctypes.byref(params)), 0)
+
+    # --- alsa-lib calls these symbols on its OWN handles -----------------
+    #
+    # This is the one that cost the most. `plughw:` is a plug PCM wrapping a
+    # hw PCM, and alsa-lib implements the plug's prepare by calling the
+    # PUBLIC snd_pcm_prepare() on its slave - likewise hw_params, sw_params
+    # and writei.  Under LD_PRELOAD those internal calls land in this shim,
+    # with a handle it has never seen.  Swallowing them leaves the slave
+    # unconfigured and unprepared while every call reports success:
+    #
+    #   setup hw_params res=0
+    #   prepare after setup res=0, state now 1
+    #   writei #1 written=-77   (EBADFD)
+    #
+    # Anything that is not ours has to go straight through, with its own
+    # handle.
+    asound.fake_slave.restype = ctypes.c_void_p
+    slave = ctypes.c_void_p(asound.fake_slave())
+
+    before = asound.fake_slave_prepared()
+    lib.snd_pcm_prepare(slave)
+    check("prepare on alsa-lib's own slave reaches alsa-lib",
+          asound.fake_slave_prepared(), before + 1)
+
+    before = asound.fake_slave_configured()
+    lib.snd_pcm_hw_params(slave, ctypes.byref(params))
+    check("and so does hw_params", asound.fake_slave_configured(), before + 1)
+
+    asound.fake_forget()
+    lib.snd_pcm_hw_params_set_access(slave, ctypes.byref(params), 3)
+    check("and set_access", asound.fake_access(), 3)
+
+    asound.fake_forget_sw()
+    lib.snd_pcm_sw_params_set_stop_threshold(slave, ctypes.byref(params),
+                                             ctypes.c_ulong(4096))
+    check("and the software parameters", asound.fake_sw_stop(), 4096)
+
+    # the master must still be ours, not passed through
+    asound.fake_forget()
+    lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params), 0)
+    check("while the engine's master is still handled here",
+          asound.fake_access(), -1)
 
     # --- what a sample actually says ------------------------------------
     #

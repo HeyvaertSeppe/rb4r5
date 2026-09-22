@@ -387,3 +387,49 @@ engine clocks itself from it.
 If the device is ever found outside PREPARED or RUNNING, the whole setup runs
 again: from `hw_params()` when the engine reconfigures, and from the write
 path when `prepare()` alone will not recover it.
+
+## The shim intercepts alsa-lib's own calls to itself
+
+This is the single most important thing to know about `audioshim.c`, and it
+was the cause behind four separate "no sound" repairs that each looked
+correct and changed nothing.
+
+The shim exports public ALSA symbols. **alsa-lib calls those same public
+symbols internally.** `plughw:` is a *plug* PCM wrapping a *hw* PCM, and the
+plug implements its operations by calling the public function on its slave:
+
+```
+snd_pcm_prepare(plug)    ->  snd_pcm_prepare(slave)
+snd_pcm_hw_params(plug)  ->  snd_pcm_hw_params(slave)
+snd_pcm_writei(plug)     ->  snd_pcm_writei(slave)
+```
+
+Under `LD_PRELOAD` every one of those internal calls lands **in this shim**,
+carrying a handle it has never seen. Swallowing them — "not one of mine,
+return 0" — leaves the slave unconfigured and unprepared while every call
+reports success:
+
+```
+setup hw_params res=0
+our own sw_params (start=512, stop=boundary 1073741824, ...) res=0
+prepare after setup res=0, state now 1
+writei #1 frames=64 written=-77          (EBADFD)
+```
+
+It also explains the boundary of 0 — the plug's own setup never completed,
+so `pcm->boundary` was never computed — and why forcing the access type,
+enlarging the buffer and rewriting the software parameters all changed
+nothing: none of it was reaching the hardware.
+
+`whose()` classifies every handle into three kinds, and every exported
+function begins by asking:
+
+| kind | handle | what happens |
+|---|---|---|
+| `H_ALSA` | anything the shim did not create | **passed straight through, with its own handle** |
+| `H_MASTER` | the real device, as the engine holds it | the shim's own policy (configured once, at open) |
+| `H_VIRTUAL` | headphones, booth, dummy, capture | answered by the shim |
+
+A new interposed function must make that check its first line. Forgetting it
+does not fail loudly — it returns success and silently breaks the layer
+underneath.

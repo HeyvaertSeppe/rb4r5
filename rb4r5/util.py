@@ -174,7 +174,48 @@ def ensure_fifo(path, mode: int = 0o666) -> None:
     os.chmod(path, mode)
 
 
+def mount_points(source: str = "/proc/self/mountinfo") -> list[str]:
+    """Every mount point in this namespace, in order, from the kernel.
+
+    Repeats matter: mounting the same target twice stacks, and the stack is
+    what has to be unwound.
+    """
+    points = []
+    try:
+        with open(source, encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 5:
+                    continue
+                # field 5 is the mount point, with \040 style escapes
+                points.append(fields[4]
+                              .replace("\\040", " ").replace("\\011", "\t")
+                              .replace("\\012", "\n").replace("\\134", "\\"))
+    except OSError:
+        return []
+    return points
+
+
+def mount_count(path, source: str = "/proc/self/mountinfo") -> int:
+    """How many mounts are stacked on `path`."""
+    want = os.path.abspath(str(path))
+    return sum(1 for point in mount_points(source) if point == want)
+
+
 def is_mountpoint(path) -> bool:
+    """Whether anything is mounted on `path`.
+
+    NOT os.path.ismount(): that compares st_dev against the parent, so it
+    cannot see a bind mount whose source is on the SAME filesystem.  /tmp
+    bound onto <chroot>/tmp has the parent's device and ismount() says no -
+    so the mount was made again on every run, stacking, and never unmounted,
+    until the kernel refused a new one with ENOSPC ("No space left on
+    device", which for mount(2) means the mount table, not the disk).
+    """
+    if mount_count(path):
+        return True
+    # a namespace without mountinfo (or a path we cannot match) still gets
+    # the old answer rather than none at all
     return os.path.ismount(str(path))
 
 

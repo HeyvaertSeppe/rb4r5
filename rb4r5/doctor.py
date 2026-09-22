@@ -62,7 +62,17 @@ def run(cfg, verbose: bool = False) -> int:
             warnings.append("edb_streamd is absent: no rekordbox database "
                             "import (folder browsing still works)")
     for name, mounted in state["mounts"].items():
-        _row(f"bind /{name}", "mounted" if mounted else "not mounted")
+        deep = state.get("stacked", {}).get(name, 0)
+        if deep > 1:
+            _row(f"bind /{name}", f"mounted {deep} TIMES OVER - they have "
+                                  f"been stacking up")
+            problems.append(
+                f"/{name} carries {deep} mounts.  Each run adds another "
+                f"until mount(2) fails with 'No space left on device', which "
+                f"means the mount table, not the disk.\n"
+                f"    sudo python3 launch.py stop     (unwinds them)")
+        else:
+            _row(f"bind /{name}", "mounted" if mounted else "not mounted")
     arm_ok, arm_why = platform5.can_run_arm32(
         str(cfg.chroot / "lib/ld-linux.so.3"))
     _row("32-bit loader", ("ok - " if arm_ok else "FAILED - ") + arm_why)

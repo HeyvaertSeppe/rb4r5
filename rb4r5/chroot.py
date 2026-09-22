@@ -163,12 +163,16 @@ def status(cfg) -> dict:
     absent_optional = [rel for rel in OPTIONAL
                        if not inside(root, rel).exists()]
     mounts = {name: util.is_mountpoint(root / name) for name in BIND_MOUNTS}
+    # how many are stacked on each: more than one means they have been
+    # mounted again without being seen, which ends in ENOSPC from mount(2)
+    stacked = {name: util.mount_count(root / name) for name in BIND_MOUNTS}
     return {
         "root": root,
         "exists": root.exists(),
         "missing": missing,
         "missing_optional": absent_optional,
         "mounts": mounts,
+        "stacked": stacked,
         "ready": root.exists() and not missing,
     }
 
@@ -379,12 +383,58 @@ def mount_binds(cfg) -> list[str]:
     notes = []
     for name in BIND_MOUNTS:
         target = util.ensure_dir(root / name)
-        if util.is_mountpoint(target):
+        stacked = util.mount_count(target)
+        if stacked > 1:
+            # Mounts that were made again on every run because they could not
+            # be seen.  Take them back down to one rather than adding another.
+            notes.append(f"{name} was mounted {stacked} times over; "
+                         f"unwinding {stacked - 1}")
+            drain_mount(target, keep=1)
+            continue
+        if stacked or util.is_mountpoint(target):
             notes.append(f"{name} already mounted")
             continue
-        util.run(["mount", "--bind", f"/{name}", str(target)])
+        proc = util.run(["mount", "--bind", f"/{name}", str(target)],
+                        check=False)
+        if proc.returncode != 0:
+            out = (proc.stdout or "").strip()
+            extra = ""
+            if "No space left" in out:
+                extra = (f"\n\n'No space left on device' from mount(2) is the "
+                         f"MOUNT TABLE, not the disk: mounts have been "
+                         f"stacking up.\nThere are {util.mount_count(target)} "
+                         f"on {target} right now.  Clear them with:\n"
+                         f"    sudo python3 launch.py stop\n"
+                         f"and if that is not enough:\n"
+                         f"    sudo umount -l {target}   # repeat until it "
+                         f"says 'not mounted'")
+            raise util.Fail(f"could not bind-mount /{name} onto {target}: "
+                            f"{out}{extra}")
         notes.append(f"bind-mounted /{name}")
     return notes
+
+
+def drain_mount(target, keep: int = 0) -> int:
+    """Unmount everything stacked on `target`, down to `keep`.
+
+    A target can carry more than one mount: anything that mounts without
+    checking, or checks with something that cannot see a same-filesystem bind
+    mount, stacks another on top.  One umount takes off one layer.
+    """
+    removed = 0
+    for _ in range(256):
+        if util.mount_count(target) <= keep:
+            break
+        before = util.mount_count(target)
+        util.run(["umount", str(target)], check=False)
+        if util.mount_count(target) >= before:
+            # a busy mount needs the lazy form, which detaches it now and
+            # cleans up when the last user lets go
+            util.run(["umount", "-l", str(target)], check=False)
+        if util.mount_count(target) >= before:
+            break                      # it will not come off; stop trying
+        removed += 1
+    return removed
 
 
 def umount_binds(cfg) -> list[str]:
@@ -392,7 +442,12 @@ def umount_binds(cfg) -> list[str]:
     notes = []
     # the library bind lives under media/, unmount it before the rest
     for target in [cfg.chroot_media] + [root / name for name in reversed(BIND_MOUNTS)]:
-        if util.is_mountpoint(target):
+        stacked = util.mount_count(target)
+        if stacked > 1:
+            removed = drain_mount(target)
+            notes.append(f"unmounted {target} ({removed} of {stacked} "
+                         f"stacked mounts)")
+        elif stacked or util.is_mountpoint(target):
             util.run(["umount", "-l", str(target)], check=False)
             notes.append(f"unmounted {target}")
     return notes

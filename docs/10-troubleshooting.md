@@ -351,3 +351,35 @@ drop-ins, restores `graphical.target` and `getty@tty1`, and takes our marked
 block out of `config.txt` and `cmdline.txt` (backups are kept beside them as
 `*.rb4r5.bak`). It does not delete `/opt/rb4r5`, so the runtime you built is
 still there if you change your mind.
+
+## `mount(2) ... No space left on device`
+
+```
+[XX] command failed (32): mount --bind /tmp /opt/rb4r5/chroot/tmp
+mount: /opt/rb4r5/chroot/tmp: mount(2) system call failed:
+       No space left on device.
+```
+
+The disk is fine. For `mount(2)` this is the **mount table**: the same target
+had been mounted over and over until the kernel would not take another.
+
+`os.path.ismount()` decides by comparing a path's `st_dev` with its parent's.
+A bind mount whose source is on the **same filesystem** has the parent's
+device, so it answers no — and `/tmp` bound onto `<chroot>/tmp` is exactly
+that when `/tmp` is not a tmpfs. The launcher therefore believed nothing was
+mounted, mounted it again on every run, and never unmounted it either, since
+the same check guards the unmount. `/proc` and `/sys` are separate
+filesystems and were detected correctly, which is why only `/tmp` (and `/dev`
+on some setups) ran away.
+
+`util.is_mountpoint()` now reads `/proc/self/mountinfo`, so it sees a bind
+mount regardless of what filesystem it came from, and `util.mount_count()`
+says how many are stacked. `launch.py stop` unwinds the whole stack, one
+`umount` per layer; `doctor` reports any target carrying more than one.
+
+To clear it by hand:
+
+```
+sudo python3 launch.py stop
+sudo umount -l /opt/rb4r5/chroot/tmp      # repeat until "not mounted"
+```

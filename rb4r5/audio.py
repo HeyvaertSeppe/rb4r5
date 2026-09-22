@@ -376,6 +376,72 @@ def watch_levels(seconds: float = 6.0) -> int:
     return 0
 
 
+def test_routing(cfg, seconds: float = 2.0) -> int:
+    """Play a tone into each output pair in turn, and say which is which.
+
+    The FLX4 presents one 4-channel playback device: 1/2 is the MASTER
+    output, 3/4 is the HEADPHONES output.  The player writes both through a
+    single stream, so "no sound" can mean the device, the pair, or the
+    player - and those need different fixes.  This takes the player out of
+    the picture and drives each pair on its own.
+    """
+    import math
+    import struct
+    import subprocess
+
+    chosen = select(cfg)
+    candidates = chosen.get("candidates") or [chosen["device"]]
+    channels = int(chosen["channels"])
+    rate = int(chosen["rate"])
+    if not util.have("aplay"):
+        raise util.Fail("aplay is missing (apt install alsa-utils)")
+
+    if channels < 4:
+        pairs = [("both channels", (0, 1), 440.0)]
+    else:
+        pairs = [("MASTER out (channels 1/2)", (0, 1), 440.0),
+                 ("HEADPHONES out (channels 3/4)", (2, 3), 880.0)]
+
+    device = candidates[0]
+    print(f"\nplaying into {device}, {channels} channels @ {rate} Hz\n")
+    for label, (left, right), hz in pairs:
+        frames = int(rate * seconds)
+        blob = bytearray()
+        for index in range(frames):
+            value = int(0.25 * 8388607 *
+                        math.sin(2 * math.pi * hz * index / rate))
+            packed = struct.pack("<i", value)[0:3]
+            for channel in range(channels):
+                blob += packed if channel in (left, right) else b"\x00\x00\x00"
+        print(f"  {hz:.0f} Hz for {seconds:.0f}s on {label} ... ", end="",
+              flush=True)
+        proc = subprocess.run(
+            ["aplay", "-D", device, "-f", "S24_3LE", "-r", str(rate),
+             "-c", str(channels), "-t", "raw", "-"],
+            input=bytes(blob), capture_output=True)
+        if proc.returncode != 0:
+            print("FAILED")
+            print("      " + (proc.stderr or b"").decode().strip()[:300])
+            return 1
+        print("sent")
+
+    print("\nWhat you should have heard:")
+    if channels >= 4:
+        print("  a low tone from the FLX4's MASTER output, then a higher one\n"
+              "  in the HEADPHONES only.  If they came out of the wrong one,\n"
+              "  the pairs are swapped and audio.swap_pairs will fix it.\n"
+              "  If only one played, that output is the problem, not the "
+              "player.")
+    else:
+        print("  a tone from the output.  This device has no separate "
+              "headphone pair.")
+    print("\nIf both were right and the player is still silent, the device\n"
+          "is fine and the fault is on the player's side: run\n"
+          "    sudo python3 launch.py audio --levels\n"
+          "while a track is playing.")
+    return 0
+
+
 def test_tone(cfg, seconds: float = 2.0, hz: float = 440.0) -> int:
     """Play a tone on the chosen device, with the player out of the way.
 

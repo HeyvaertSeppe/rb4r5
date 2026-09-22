@@ -638,6 +638,19 @@ static void apply_sw_params(void)
     }
     if (real_snd_pcm_sw_params_get_boundary)
         real_snd_pcm_sw_params_get_boundary(sw, &boundary);
+    if (boundary == 0) {
+        /* alsa-lib computes the boundary as the buffer size doubled until it
+         * nearly fills a long.  Ask for it and it can still come back zero -
+         * and a stop_threshold of ZERO stops the stream harder than the
+         * engine's own value did, which is how "stop=boundary 0" left the
+         * device sitting in SETUP.  Never pass a threshold of nothing. */
+        boundary = g_hw_buffer ? g_hw_buffer : 2048;
+        while (boundary * 2 <= (snd_pcm_uframes_t)(0x7fffffffL - (long)g_hw_buffer))
+            boundary *= 2;
+        alog("audioshim: the device reported a boundary of 0; using %lu "
+             "(the buffer, doubled until it nearly fills a long)\n",
+             (unsigned long)boundary);
+    }
     if (real_snd_pcm_sw_params_set_stop_threshold)
         real_snd_pcm_sw_params_set_stop_threshold(g_real_playback, sw, boundary);
     if (real_snd_pcm_sw_params_set_start_threshold)

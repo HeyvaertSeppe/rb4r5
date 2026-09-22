@@ -508,6 +508,12 @@ def cmd_audio(args, cfg) -> int:
             raise util.Fail("the player has the device open - stop it first "
                             "(launch.py stop), then try again")
         return audio.test_tone(cfg, seconds=args.seconds)
+    if args.routing:
+        util.require_root("opening the audio device")
+        if util.pgrep_arg("/root/pdj/rbp"):
+            raise util.Fail("the player has the device open - stop it first "
+                            "(launch.py stop), then try again")
+        return audio.test_routing(cfg, seconds=args.seconds)
     for line in audio.describe(cfg):
         print(line)
     if args.env:
@@ -775,6 +781,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="watch what the player is actually producing")
     aud.add_argument("--test", action="store_true",
                      help="play a tone on the chosen device, player stopped")
+    aud.add_argument("--routing", action="store_true",
+                     help="tone each output pair in turn, so master and "
+                          "headphones can be told apart")
     aud.add_argument("--seconds", type=float, default=6.0,
                      help="how long to watch or play (default 6)")
     aud.add_argument("--env", action="store_true",

@@ -118,8 +118,10 @@ int fake_sw_start(void) { return sw_start; }
 int fake_sw_stop(void) { return sw_stop; }
 int fake_sw_applied(void) { return sw_applied; }
 void fake_forget_sw(void) { sw_start = -1; sw_stop = -1; }
+static unsigned long boundary_reply = 0x40000000;
 int snd_pcm_sw_params_get_boundary(const void *a, unsigned long *b)
-{ (void)a; if (b) *b = 0x40000000; return 0; }
+{ (void)a; if (b) *b = boundary_reply; return 0; }
+void fake_boundary_says_zero(void) { boundary_reply = 0; }
 int snd_pcm_sw_params_set_silence_threshold(void *a, void *b, unsigned long c) { (void)a;(void)b;(void)c; return 0; }
 int snd_pcm_sw_params_set_silence_size(void *a, void *b, unsigned long c) { (void)a;(void)b;(void)c; return 0; }
 int snd_pcm_sw_params_set_start_threshold(void *a, void *b, unsigned long c)
@@ -331,6 +333,15 @@ with tempfile.TemporaryDirectory() as tmp:
           asound.fake_sw_start(), 512)
     check("stop_threshold is the boundary, so an underrun cannot stop the "
           "stream", asound.fake_sw_stop(), 0x40000000)
+
+    # A device can report a boundary of zero, and a stop_threshold of zero
+    # stops the stream harder than any real value - it has to be computed
+    # rather than passed through.
+    asound.fake_boundary_says_zero()
+    asound.fake_forget_sw()
+    lib.snd_pcm_hw_params(master2, ctypes.byref(params))
+    check("a reported boundary of zero is never used as a stop threshold",
+          asound.fake_sw_stop() > 2048, True)
 
     # and the engine's own values must never reach the device
     asound.fake_forget_sw()

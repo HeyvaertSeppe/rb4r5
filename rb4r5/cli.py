@@ -364,6 +364,22 @@ def cmd_subucom(args, cfg) -> int:
     return subucom.run(cfg, capture=args.capture)
 
 
+def cmd_ledsweep(args, cfg) -> int:
+    """Light the controller's lamps one at a time, so they can be mapped.
+
+    The FLX4's lamps are lit by the host, and which message lights which lamp
+    is not published.  `sniff` says what the controller SENDS; this says what
+    it LISTENS to.  Watch the controller, note what lights, and put it in
+    /etc/rb4r5/flx4-map.conf.
+    """
+    util.require_root("writing to the controller")
+    channels = ([int(args.channel) - 1] if args.channel
+                else list(range(args.channels)))
+    return jogcal.led_sweep(cfg, channels=channels,
+                            first=int(args.first, 0), last=int(args.last, 0),
+                            hold=args.hold, note=not args.cc)
+
+
 def cmd_sniff(args, cfg) -> int:
     """Print what the controller sends, so a button can be identified.
 
@@ -707,6 +723,21 @@ def build_parser() -> argparse.ArgumentParser:
     sniff = sub.add_parser("sniff", help="print what the controller sends, to "
                                         "identify a button")
     sniff.add_argument("-d", "--device", help="/dev/snd/midiC*D*")
+
+    sweep = sub.add_parser("ledsweep", help="light the controller's lamps one "
+                                            "at a time, to find out which "
+                                            "message lights which")
+    sweep.add_argument("--channel", help="one MIDI channel (1-16) instead of "
+                                         "all of them")
+    sweep.add_argument("--channels", type=int, default=16,
+                       help="how many channels to walk (default 16)")
+    sweep.add_argument("--first", default="0x00", help="first note/CC")
+    sweep.add_argument("--last", default="0x7f", help="last note/CC")
+    sweep.add_argument("--hold", type=float, default=0.35,
+                       help="seconds each lamp stays lit (default 0.35)")
+    sweep.add_argument("--cc", action="store_true",
+                       help="send control changes instead of notes")
+    sweep.set_defaults(func=cmd_ledsweep)
     sniff.set_defaults(func=cmd_sniff)
 
     jog = sub.add_parser("jogtest", help="measure the jog wheel: ticks per "

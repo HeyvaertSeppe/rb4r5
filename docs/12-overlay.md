@@ -106,3 +106,29 @@ copy — and they divide the screen:
 
 The last row is what `/tmp/rb-overlay.state` is for: `rbtouchd` reads it and
 keeps off the UI while a modal is up.
+
+## Choosing an effect
+
+The picker sends what the controller's own **BEAT FX SELECT** button sends: a
+press and a release of the FX-type key. It used to send a *rotate* carrying a
+delta, and the engine does nothing with that — which is why tapping an effect
+moved the highlight on screen and changed nothing in the player.
+
+A button only goes one way, so the route is forwards through the end of the
+list and round. There is no way to ask the player which effect is selected,
+so the index is tracked here; a **long press** on a cell means "it is already
+on this one" and re-syncs without sending anything, which is the repair when
+the two drift apart.
+
+The picker's own button blinks while it is open — the `K_OVERLAY_FX` branch in
+the bridge used to `return` before any LED was touched, so it never lit at
+all. The bridge watches the launcher's modal flag file rather than trusting
+its own idea of the state, because the picker can also be closed by a tap on
+the screen, which the bridge never hears about.
+
+## The meter does not paint over a modal
+
+`poll_meter()` skips while the overlay is showing the picker or the splash.
+The meter is a strip at the side and the picker is a box in the middle, but
+they overlap on a narrow panel — and the meter redraws twenty times a second,
+straight over it. That is what "the FX picker glitches" was.

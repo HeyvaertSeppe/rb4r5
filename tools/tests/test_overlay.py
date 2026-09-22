@@ -117,19 +117,38 @@ for index, (name, cx, cy, cw, ch) in enumerate(cells):
           f"cell {index} is inside the box")
 check(over.picker_hit(5, 5) is None, "a touch outside the box is not a cell")
 
-print("\n== choosing an effect steps the selector by the difference")
+print("\n== choosing an effect steps the player's selector to it")
+#
+# The effect is chosen by sending what the controller's own BEAT FX SELECT
+# button sends: a press and a release of the FX-type key.  A rotate carries a
+# delta and the engine does nothing with it - which is why tapping an effect
+# moved the highlight here and changed nothing in the player.  A button only
+# goes one way, so the route is forwards and round.
 sent = []
 import rb4r5.keys as keys                                  # noqa: E402
-keys.rotate = lambda *a, **k: sent.append(a)
+keys.tap_ctrl = lambda *a, **k: sent.append(a)
+keys.rotate = lambda *a, **k: sent.append(("ROTATE",) + a)
+count = len(over.fx)
+
 over.fx_index = 2
 over.choose_fx(6)
-check(len(sent) == 4 and all(s[2] == 1 for s in sent),
-      f"2 -> 6 is four steps forward ({len(sent)} sent)")
+check(len(sent) == 4, f"2 -> 6 is four steps on ({len(sent)} sent)")
+check(all(s[0] == "bfxtype" for s in sent),
+      "each one is the FX-type key")
+check(not any(s[0] == "ROTATE" for s in sent),
+      "and none of them is a rotate, which the engine ignores")
 check(over.fx_index == 6, "and the tracked index follows")
+
 sent.clear()
 over.choose_fx(1)
-check(len(sent) == 5 and all(s[2] == -1 for s in sent),
-      f"6 -> 1 is five steps back ({len(sent)} sent)")
+check(len(sent) == (1 - 6) % count,
+      f"6 -> 1 wraps forward rather than going back ({len(sent)} sent)")
+check(over.fx_index == 1, "and lands on the right effect")
+
+sent.clear()
+over.choose_fx(1)
+check(sent == [], "choosing the effect already selected sends nothing")
+
 sent.clear()
 over.choose_fx(9, resync=True)
 check(sent == [] and over.fx_index == 9,

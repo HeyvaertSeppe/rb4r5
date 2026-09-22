@@ -588,6 +588,56 @@ static void led_set(int ch, int note, int on)
     midi_send3(0x90 | (ch & 0x0f), note, on ? 0x7f : 0x00);
 }
 
+/* ---- the BEAT FX SELECT lamp ----
+ *
+ * The picker is a mode you are in, not an action you took, so its button
+ * blinks for as long as it is open - which is what the RX3 does with a
+ * control that has taken over the screen.
+ *
+ * It never lit at all before: the K_OVERLAY_FX branch of handle_note()
+ * returns as soon as it has told the launcher to open the picker, and
+ * led_for_press() is below that return.
+ *
+ * The picker can also be closed by touching the screen, which this process
+ * never hears about, so the lamp checks the launcher's own modal flag file
+ * rather than trusting its idea of the state.
+ */
+#define FX_SELECT_NOTE  0x63
+#define FX_BLINK_MS     350
+static const char *opt_modal = "/tmp/rb-overlay.modal";
+
+static int       g_fx_open   = 0;
+static int       g_fx_lit    = 0;
+static long long g_fx_at     = 0;
+
+static void fx_lamp(int open)
+{
+    g_fx_open = open;
+    g_fx_lit  = open;
+    g_fx_at   = now_ms();
+    led_set(MC_FX1, FX_SELECT_NOTE, open);
+}
+
+static void fx_lamp_tick(void)
+{
+    long long t;
+
+    if (!g_fx_open)
+        return;
+    t = now_ms();
+    if (t - g_fx_at < FX_BLINK_MS)
+        return;
+    g_fx_at = t;
+
+    if (access(opt_modal, F_OK) != 0) {
+        /* the picker went away without us - a tap on the screen */
+        fx_lamp(0);
+        return;
+    }
+    g_fx_lit = !g_fx_lit;
+    led_set(MC_FX1, FX_SELECT_NOTE, g_fx_lit);
+}
+
 /* ---- what a button's light should DO ----
  * Echoing the press is right for a button that means "do this now" and wrong
  * for one that means "you are now in this state".  PLAY stays lit while the
@@ -1025,8 +1075,10 @@ static void handle_note(int ch, int note, int on)
             }
         }
         if (notemap[i].key == K_OVERLAY_FX) {
-            if (on)
+            if (on) {
                 overlay_command("fx");
+                fx_lamp(!g_fx_open);
+            }
             if (opt_verbose)
                 logmsg("  %s -> effect picker %s\n", notemap[i].name,
                        on ? "toggle" : "(release)");
@@ -1316,6 +1368,7 @@ static void run_device(int fd)
             logmsg("flx4: poll: %s\n", strerror(errno));
             break;
         }
+        fx_lamp_tick();
         if (pr == 0) {
             jog_tick();
             continue;

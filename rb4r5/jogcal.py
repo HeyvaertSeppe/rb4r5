@@ -261,3 +261,59 @@ def seed_tuning(cfg) -> None:
         os.chmod(JOG_CONF, 0o666)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# what lights which lamp
+# --------------------------------------------------------------------------
+def led_sweep(cfg, channels=None, first: int = 0x00, last: int = 0x7f,
+              hold: float = 0.35, note: bool = True) -> int:
+    """Light one lamp at a time and say what was sent, so it can be mapped.
+
+    The FLX4's lamps are lit by the host, and Pioneer does not publish which
+    message lights which one.  The way to find out is to send them one at a
+    time and watch the controller - so this does that, printing each message
+    before it sends it.  Note what lights up and put it in the map.
+
+    Stop with Ctrl-C.  Every lamp touched is turned back off on the way out.
+    """
+    path = find_midi(cfg)
+    if not path:
+        raise util.Fail("no /dev/snd/midiC*D* node - is the FLX4 plugged in?")
+    if util.pgrep_arg("flx4-bridge"):
+        raise util.Fail("the bridge has the controller open - stop it first:\n"
+                        "    sudo python3 launch.py stop")
+
+    channels = channels or list(range(16))
+    kind = "note" if note else "CC"
+    status_base = 0x90 if note else 0xb0
+    print(f"sweeping {kind} {first:#04x}..{last:#04x} on MIDI channels "
+          f"{channels[0] + 1}..{channels[-1] + 1} of {path}")
+    print("watch the controller; note what lights, then Ctrl-C\n")
+
+    touched = []
+    try:
+        with open(path, "r+b", buffering=0) as port:
+            for channel in channels:
+                for number in range(first, last + 1):
+                    print(f"  ch{channel + 1:<3} {kind} {number:#04x} on ",
+                          end="", flush=True)
+                    port.write(bytes([status_base | channel, number, 0x7f]))
+                    touched.append((channel, number))
+                    time.sleep(hold)
+                    port.write(bytes([status_base | channel, number, 0x00]))
+                    print("off")
+    except KeyboardInterrupt:
+        print("\nstopped")
+    except OSError as exc:
+        raise util.Fail(f"could not write to {path}: {exc}") from exc
+    finally:
+        try:
+            with open(path, "r+b", buffering=0) as port:
+                for channel, number in touched:
+                    port.write(bytes([status_base | channel, number, 0x00]))
+        except OSError:
+            pass
+    print(f"\n{len(touched)} lamp message(s) sent.  Whatever lit up, the line "
+          f"above it says\nwhich message did it.")
+    return 0

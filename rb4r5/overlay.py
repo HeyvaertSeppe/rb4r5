@@ -258,17 +258,28 @@ class Overlay:
         "it is already on this one" and re-syncs without sending anything,
         which is the repair when the two drift apart.
         """
-        index = max(0, min(index, len(self.fx) - 1))
+        count = len(self.fx)
+        index = max(0, min(index, count - 1))
         if resync:
             self.fx_index = index
             return f"marked {self.fx[index]} as the selected effect"
-        delta = index - self.fx_index
-        step = 1 if delta > 0 else -1
-        for _ in range(abs(delta)):
-            keys.rotate("bfxtype", 1, step)
-            time.sleep(0.01)
+
+        # Send exactly what the controller's own BEAT FX SELECT button sends:
+        # a press and a release of the FX-type key, which is how the engine
+        # is built to be told to move on.  A rotate carries a delta and the
+        # engine does nothing with it - which is why tapping an effect
+        # changed the highlight here and nothing in the player.
+        #
+        # A button only goes one way, so the shorter route is forwards
+        # through the end of the list and round.
+        steps = (index - self.fx_index) % count
+        for _ in range(steps):
+            keys.tap_ctrl("bfxtype", 1)
+            time.sleep(0.02)
         self.fx_index = index
-        return f"selected {self.fx[index]} ({abs(delta)} step(s))"
+        if not steps:
+            return f"{self.fx[index]} was already selected"
+        return f"selected {self.fx[index]} ({steps} step(s) on)"
 
     # -- the splash --------------------------------------------------------
     def draw_splash(self, progress: float = 0.0, message: str = "",
@@ -640,7 +651,11 @@ class OverlayDaemon:
         point doing even that 50 times a second when the level has not moved
         a segment.
         """
-        if not self.meter_on or self.overlay.mode == "splash":
+        if not self.meter_on or self.overlay.mode in ("splash", "picker"):
+            # The picker is a box in the middle of the screen and the meter
+            # is a strip at the side, but they overlap on a narrow panel -
+            # and the meter redraws twenty times a second, straight over it.
+            # That is the picker "glitching".
             return
         now = time.monotonic()
         if now - self.meter_at < 0.05:

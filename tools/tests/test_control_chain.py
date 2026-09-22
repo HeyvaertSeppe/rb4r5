@@ -181,6 +181,13 @@ with tempfile.TemporaryDirectory() as tmp:
     watcher.join(timeout=3)
     check("FX SELECT asks the launcher to open the effect picker",
           b"fx" in b"".join(picker))
+    # and it lights its own lamp: the branch that opens the picker used to
+    # return before anything touched an LED, so the button never lit
+    bridge_src_fx = (REPO / "src/host/flx4-bridge.c").read_text()
+    fx_branch = bridge_src_fx[bridge_src_fx.index("if (notemap[i].key == K_OVERLAY_FX)"):]
+    fx_branch = fx_branch[:fx_branch.index("return;")]
+    check("and lights the FX button while the picker is open",
+          "fx_lamp(" in fx_branch)
     check("and does not send the engine a blind FX-type step",
           engine_log.read_text().count("key=0000448b") == 1)
 

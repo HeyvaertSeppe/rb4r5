@@ -357,3 +357,22 @@ note ch5 0x63 0xf001 global   FX select opens the picker
 ```
 
 `0xf001` is not an engine key: it is the launcher's effect picker.
+
+## Finding out which message lights which lamp
+
+The FLX4's lamps are lit by the host, and Pioneer does not publish the
+mapping. `sniff` shows what the controller **sends**; `ledsweep` shows what it
+**listens to**:
+
+```
+sudo python3 launch.py stop          # the bridge must not hold the port
+sudo python3 launch.py ledsweep --channel 5
+```
+
+It lights one lamp at a time, printing each message before it sends it, and
+turns everything back off on the way out. Watch the controller, note what
+lights, and put it in `/etc/rb4r5/flx4-map.conf`.
+
+`--cc` sweeps control changes instead of notes, which is how level-meter LEDs
+are usually driven on Pioneer hardware. Narrow the walk with `--first` and
+`--last`, and slow it down with `--hold`.

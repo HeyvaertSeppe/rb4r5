@@ -95,18 +95,45 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 
 #define LOG_PATH "/tmp/audioshim.log"
 
+/* The log is capped.  It gets a line per device call and one every 500
+ * writes - about one a second - forever, across every restart, and a
+ * crash-looping player writes it without end.  Unbounded, it filled the
+ * Pi's disk, which then silently truncated whatever else was being written:
+ * a source file, and a git object.  A log that costs you the filesystem is
+ * worse than no log. */
+#define LOG_MAX_BYTES (4 * 1024 * 1024)
+
 static void alog(const char *fmt, ...)
 {
     char buf[512];
     va_list ap;
+    int fd;
+    off_t size;
+
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd >= 0) {
-        write(fd, buf, strlen(buf));
+
+    fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0)
+        return;
+    size = lseek(fd, 0, SEEK_END);
+    if (size > LOG_MAX_BYTES) {
+        /* start again rather than grow: the interesting part of this log is
+         * always the most recent start, not the first one of the day */
         close(fd);
+        fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0)
+            return;
+        {
+            static const char note[] =
+                "audioshim: --- log restarted (it had reached its size "
+                "limit) ---\n";
+            if (write(fd, note, sizeof(note) - 1) < 0) { /* nothing to do */ }
+        }
     }
+    if (write(fd, buf, strlen(buf)) < 0) { /* nothing to be done */ }
+    close(fd);
 }
 
 /* Opaque ALSA types */

@@ -174,6 +174,74 @@ def ensure_fifo(path, mode: int = 0o666) -> None:
     os.chmod(path, mode)
 
 
+def free_bytes(path="/") -> int:
+    """Free space on the filesystem holding `path`, for the caller."""
+    try:
+        info = os.statvfs(str(path))
+    except OSError:
+        return -1
+    return info.f_bavail * info.f_frsize
+
+
+def human(size: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def cap_file(path, limit: int) -> str:
+    """Keep the tail of a file that has grown past `limit`.
+
+    A log nobody rotates fills the disk, and a full disk does not announce
+    itself - it truncates whatever is written next, which here meant a source
+    file and a git object.
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size <= limit:
+        return ""
+    keep = limit // 2
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(size - keep)
+            handle.readline()               # start at a line boundary
+            tail = handle.read()
+        with open(path, "wb") as handle:
+            handle.write(b"--- earlier lines dropped: this log had reached "
+                         + human(size).encode() + b" ---\n")
+            handle.write(tail)
+    except OSError:
+        return ""
+    return f"trimmed {path.name} from {human(size)} to {human(keep)}"
+
+
+def prune_files(directory, keep: int) -> str:
+    """Keep the newest `keep` files in a directory and delete the rest."""
+    directory = Path(directory)
+    try:
+        files = sorted((f for f in directory.iterdir() if f.is_file()),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        return ""
+    doomed = files[keep:]
+    freed = 0
+    for path in doomed:
+        try:
+            freed += path.stat().st_size
+            path.unlink()
+        except OSError:
+            pass
+    if not doomed:
+        return ""
+    return (f"removed {len(doomed)} old file(s) from {directory.name}, "
+            f"freeing {human(freed)}")
+
+
 def mount_points(source: str = "/proc/self/mountinfo") -> list[str]:
     """Every mount point in this namespace, in order, from the kernel.
 

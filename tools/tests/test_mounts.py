@@ -83,6 +83,48 @@ with tempfile.TemporaryDirectory() as tmp:
     check("and does not invent one", util.is_mountpoint(tmp / "not-a-mount"),
           False)
 
+    # --- keeping the disk from filling ---------------------------------
+    #
+    # A full disk does not report itself.  It truncates whatever is written
+    # next, and what got truncated here was a source file and a git object.
+    big = tmp / "big.log"
+    big.write_bytes(b"line of log\n" * 200_000)          # ~2.3 MB
+    before = big.stat().st_size
+    note = util.cap_file(big, 100_000)
+    check("an oversized log is trimmed", bool(note), True)
+    check("and is smaller afterwards", big.stat().st_size < before, True)
+    check("but not empty", big.stat().st_size > 1000, True)
+    check("it says what was dropped",
+          big.read_bytes().startswith(b"--- earlier lines dropped"), True)
+    check("and it still ends on whole lines",
+          big.read_bytes().endswith(b"line of log\n"), True)
+
+    small = tmp / "small.log"
+    small.write_bytes(b"short\n")
+    check("a small log is left alone", util.cap_file(small, 100_000), "")
+    check("and is untouched", small.read_bytes(), b"short\n")
+
+    check("a missing file is not an error", util.cap_file(tmp / "nope", 10), "")
+
+    shots = tmp / "shots"
+    shots.mkdir()
+    for index in range(10):
+        shot = shots / f"shot{index}.png"
+        shot.write_bytes(b"x" * 100)
+        os.utime(shot, (index, index))
+    note = util.prune_files(shots, 4)
+    check("old screenshots are pruned", len(list(shots.iterdir())), 4)
+    check("the newest are the ones kept",
+          sorted(f.name for f in shots.iterdir()),
+          ["shot6.png", "shot7.png", "shot8.png", "shot9.png"])
+    check("and it says how much it freed", "freeing" in note, True)
+    check("pruning again does nothing", util.prune_files(shots, 4), "")
+
+    check("free space is reported", util.free_bytes(tmp) > 0, True)
+    check("and for a path that is not there it is -1",
+          util.free_bytes("/definitely/not/here"), -1)
+
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

@@ -279,6 +279,8 @@ def cmd_zones(args, cfg) -> int:
 
 
 def cmd_logs(args, cfg) -> int:
+    if args.prune:
+        return prune_logs(cfg)
     names = [args.name] if args.name else [
         "rbp.log", "flx4-bridge.log", "touchd.log", "usbwatch.log",
         "edb_streamd.log"]
@@ -297,6 +299,46 @@ def cmd_logs(args, cfg) -> int:
         return 1
     cmd = ["tail"] + (["-F"] if args.follow else ["-n", str(args.lines)]) + paths
     return subprocess.call(cmd)
+
+
+def prune_logs(cfg) -> int:
+    """Take the logs and screenshots back down to a sensible size.
+
+    They are written without end - a line per device call, one every 500
+    audio writes, three screenshots per run - and a crash-looping player
+    writes them faster still.  Left alone they fill the disk, and a full disk
+    does not report itself: it truncates whatever is written next, which in
+    this project meant a source file and a git object.
+    """
+    util.step("clearing space")
+    freed_before = util.free_bytes(cfg.logs)
+    done = False
+
+    for path in sorted(Path(cfg.logs).glob("*.log")):
+        note = util.cap_file(path, 8 * 1024 * 1024)
+        if note:
+            util.info(note)
+            done = True
+    for extra in [config.LOG_RBP] + config.LOG_SHIMS:
+        note = util.cap_file(extra, 4 * 1024 * 1024)
+        if note:
+            util.info(note)
+            done = True
+
+    shots = Path(cfg.logs) / "screenshots"
+    if shots.is_dir():
+        note = util.prune_files(shots, 30)
+        if note:
+            util.info(note)
+            done = True
+
+    free = util.free_bytes(cfg.logs)
+    if not done:
+        util.ok(f"nothing needed trimming; {util.human(free)} free")
+    else:
+        util.ok(f"{util.human(free)} free "
+                f"(was {util.human(freed_before)})")
+    return 0
 
 
 def cmd_shimtest(args, cfg) -> int:
@@ -751,6 +793,9 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("name", nargs="?")
     logs.add_argument("-f", "--follow", action="store_true")
     logs.add_argument("-n", "--lines", type=int, default=40)
+    logs.add_argument("--prune", action="store_true",
+                      help="trim the logs and old screenshots, and say how "
+                           "much space that freed")
     logs.set_defaults(func=cmd_logs)
 
     fbdump = sub.add_parser("fbdump", help="save what is on screen to a file")

@@ -68,8 +68,16 @@ class Child:
             except (ValueError, OSError):
                 pass
 
+    LOG_MAX_BYTES = 8 * 1024 * 1024
+
     def start(self) -> None:
         util.ensure_dir(self.log.parent)
+        # A crash-looping child writes its log without end.  Unbounded, it
+        # fills the disk - and a full disk does not announce itself, it just
+        # truncates whatever is written next.
+        note = util.cap_file(self.log, self.LOG_MAX_BYTES)
+        if note:
+            util.info(note)
         env = dict(os.environ)
         if self.env:
             env.update(self.env)
@@ -177,8 +185,32 @@ class Supervisor:
             util.info("stopped the tty1 login prompt for the player's sake "
                       "(it returns when the player stops)")
 
+    # Below this, a write can fail or truncate silently - and the things that
+    # get truncated are whatever happens to be written next.
+    DISK_FLOOR = 256 * 1024 * 1024
+
+    def check_disk(self) -> None:
+        """Say something before the disk runs out, not after.
+
+        A full disk does not announce itself.  It truncates: a log, a source
+        file being edited, a git object being written.  By the time anything
+        complains, the damage is somewhere else entirely.
+        """
+        for where in (self.cfg.logs, Path("/tmp"), self.cfg.chroot):
+            free = util.free_bytes(where)
+            if free < 0:
+                continue
+            if free < self.DISK_FLOOR:
+                util.warn(f"only {util.human(free)} free on the filesystem "
+                          f"holding {where}.  A full disk truncates whatever "
+                          f"is written next, without an error - clear some "
+                          f"space before running:\n"
+                          f"    sudo python3 launch.py logs --prune\n"
+                          f"    sudo rm -f /tmp/audioshim.log")
+
     def prepare_system(self) -> None:
         util.step("preparing the screen and the runtime")
+        self.check_disk()
         self.hold_console()
         for note in display.quiet_console(int(self.cfg.get("display.quiet_console", 2))):
             util.info(note)
@@ -592,6 +624,10 @@ class Supervisor:
             return
         delays = self.cfg.get("display.screenshot_delays") or [10, 30, 90]
         shots = util.ensure_dir(self.cfg.logs / "screenshots")
+        # three per run, a few MB each, kept forever: they filled the disk
+        note = util.prune_files(shots, int(self.cfg.get("logs.keep_shots", 30)))
+        if note:
+            util.info(note)
 
         def shoot():
             previous = 0.0

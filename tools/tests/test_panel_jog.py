@@ -126,6 +126,25 @@ check(over.read_levels() == (0.0, 0.0, 0), "a short file reads as silence")
 levels.unlink()
 check(over.read_levels() == (0.0, 0.0, 0), "and so does a missing one")
 
+# the master knob, when the controller sends one: the meter measures the
+# audio BEFORE it, so without this it reads the same however far it is down
+import os as _os                                             # noqa: E402
+_master = overlay.MASTER_FILE
+_had = _os.path.exists(_master)
+try:
+    Path(_master).write_text("1.0\n")
+    over.fx_index = 0
+    loud_open = over.read_levels()
+    Path(_master).write_text("0.25\n")
+    turned_down = over.read_levels()
+    check(over.master_level() == 0.25, "the master knob is read back")
+    Path(_master).write_text("nonsense\n")
+    check(over.master_level() == 1.0, "and junk in it does not break the meter")
+finally:
+    if not _had:
+        Path(_master).unlink(missing_ok=True)
+check(over.master_level() == 1.0, "no knob mapped means no scaling")
+
 quiet = over.draw_meter(0.0, 0.0, target=False)
 loud = over.draw_meter(1.0, 1.0, target=False)
 check(bytes(quiet.buf) != bytes(loud.buf), "silence and full scale differ")

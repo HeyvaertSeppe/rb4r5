@@ -266,6 +266,34 @@ static int cc14_n = 0;
 /* Add a control, or replace the one already bound to (ch, msb_cc) - a map
  * file must be able to override a built-in binding, and handle_cc14() takes
  * the first match. */
+/* What the DJ has each channel set to, 0..1, straight off the faders.
+ *
+ * The audio this shim sees is the MASTER mix - one stereo stream, already
+ * mixed - so there is no per-deck level in it to show.  The fader is the
+ * closest real signal there is: the left meter follows deck 1's fader and
+ * the right follows deck 2's, so pulling one down drops its own meter.  It
+ * is an approximation, and an honest one: it shows what you are sending,
+ * not what the deck is playing. */
+static float g_fader[2] = { 1.0f, 1.0f };
+
+/* The master level knob, if it sends anything.  Not mapped by default -
+ * `launch.py sniff` says whether yours does - and published for the
+ * launcher's on-screen meter as well as used here. */
+static int   g_master_ch = -1;
+static int   g_master_cc = 0;
+static float g_master = 1.0f;
+
+static void publish_master(void)
+{
+    char text[32];
+    int fd = open("/tmp/rb-master.dat", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+        return;
+    int len = snprintf(text, sizeof(text), "%.4f\n", (double)g_master);
+    if (write(fd, text, len) < 0) { /* nothing to be done */ }
+    close(fd);
+}
+
 static void add_cc14(int ch, int msb_cc, int key, int op, int send_ch,
                      int signed_norm, const char *name)
 {
@@ -323,6 +351,8 @@ static int handle_cc14(int ch, int cc, int val)
             }
             if (v10 < 0) v10 = 0;
             if (v10 > 1023) v10 = 1023;
+            if (s->key == K_FADER && s->send_ch >= 1 && s->send_ch <= 2)
+                g_fader[s->send_ch - 1] = norm;
             if (v10 != s->last10) {
                 s->last10 = v10;
                 send_ctrl(s->key, s->op, s->send_ch, v10, norm, pos);
@@ -901,6 +931,7 @@ static struct meter_out g_meter[2] = {
 };
 static long long g_meter_at = 0;
 
+
 static void meter_send(int column, int level)
 {
     struct meter_out *out = &g_meter[column];
@@ -939,6 +970,9 @@ static void meter_tick(void)
         for (int column = 0; column < 2; column++) {
             int32_t peak = record[1 + column];
             int level = 0;
+            /* the master mix is one stream: scale each column by its own
+             * channel's fader so the two meters move apart */
+            peak = (int32_t)((float)peak * g_fader[column] * g_master);
             if (peak > 0 && full > 0) {
                 /* dBFS over 48 dB, so the top of the scale behaves like a
                  * meter rather than like a volume control */
@@ -1029,6 +1063,17 @@ static void load_map_file(const char *path)
             add_cc14(midich, num, key,
                      !strcmp(ops, "value") ? OP_VALUE : OP_ROTATE,
                      schan, got >= 7 ? signed_norm : 0, "(map file)");
+            n++;
+        } else if (!strcmp(kind, "masterlevel")) {
+            char how[16];
+            int number = 0;
+            int got = sscanf(line, "%15s %15s %15s %i", kind, chs, how, &number);
+            if (got < 4) { logmsg("flx4: bad map line: %s", line); continue; }
+            g_master_ch = parse_ch(chs) - 1;
+            if (g_master_ch < 0) g_master_ch = 0;
+            g_master_cc = number;
+            logmsg("flx4: master level knob on ch%d CC %#x\n",
+                   g_master_ch + 1, number);
             n++;
         } else if (!strcmp(kind, "meter")) {
             char which[16], how[16];
@@ -1196,6 +1241,14 @@ static void handle_cc(int ch, int cc, int val)
 {
     if (opt_sniff) {
         logmsg("MIDI ch%-2d CC  %3d (0x%02x) val=%3d\n", ch + 1, cc, cc, val);
+        return;
+    }
+
+    if (g_master_ch >= 0 && ch == g_master_ch && cc == g_master_cc) {
+        g_master = (float)val / 127.0f;
+        publish_master();
+        if (opt_verbose)
+            logmsg("  master level %.2f\n", (double)g_master);
         return;
     }
 

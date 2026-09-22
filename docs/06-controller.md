@@ -405,3 +405,36 @@ sudo python3 launch.py ledsweep --channel 1 --cc
 
 It lights one lamp at a time, naming each message before it sends it, and
 turns everything back off on the way out.
+
+## Two meters from one mixed stream
+
+The audio this port can see is the **master mix** — one stereo stream, after
+the mixer — so there is no per-deck level in it to show. The channel faders
+are the closest real signal there is, and the bridge already sees them: the
+left meter is scaled by deck 1's fader and the right by deck 2's, so pulling
+one channel down drops its own meter.
+
+It is an approximation, and worth being clear about: it shows what you are
+**sending**, not what the deck is playing. A deck with its fader up and
+nothing loaded will still show the master level.
+
+## The MASTER level knob
+
+Most Pioneer controllers wire this straight to the output and send nothing
+over MIDI, in which case the on-screen meter cannot follow it — it measures
+the audio *before* the knob. Check whether yours sends anything:
+
+```
+sudo python3 launch.py stop
+sudo python3 launch.py sniff        # then turn the MASTER knob
+```
+
+If a CC appears, map it and both the on-screen meter and the controller's own
+level LEDs follow the knob:
+
+```
+masterlevel ch<n> cc <number>
+```
+
+The bridge publishes the position to `/tmp/rb-master.dat`, which is what the
+launcher's meter reads.

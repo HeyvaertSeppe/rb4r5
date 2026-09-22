@@ -38,6 +38,7 @@ from . import canvas, config, fb, font, inputs, keys, util, zones
 CMD_FIFO = "/tmp/rb-overlay.fifo"
 STATE_FILE = "/tmp/rb-overlay.state"
 LEVELS_FILE = "/tmp/rb-levels.dat"      # written by audioshim, 5 x int32
+MASTER_FILE = "/tmp/rb-master.dat"      # the controller's MASTER knob, 0..1
 MODAL_FILE = "/tmp/rb-overlay.modal"    # while this exists the player holds off
 FRAMES_FILE = "/tmp/rb-frames.dat"      # the driver's frame counter
 
@@ -460,8 +461,21 @@ class Overlay:
         except (OSError, struct.error):
             return 0.0, 0.0, 0
         full = full or 8388607
-        return (min(1.0, max(0.0, left / full)),
-                min(1.0, max(0.0, right / full)), seq)
+        # The master knob is after the audio this measures, so the meter has
+        # to be told about it or it reads the same however far it is turned
+        # down.  The bridge publishes it when it is mapped; without that the
+        # scale is 1 and the meter shows what is leaving the player.
+        scale = self.master_level()
+        return (min(1.0, max(0.0, left * scale / full)),
+                min(1.0, max(0.0, right * scale / full)), seq)
+
+    def master_level(self) -> float:
+        """Where the controller's MASTER knob is, 0..1, or 1 if unknown."""
+        try:
+            return max(0.0, min(1.0, float(
+                Path(MASTER_FILE).read_text().strip())))
+        except (OSError, ValueError):
+            return 1.0
 
     def draw_meter(self, left: float, right: float,
                    target: str | None = None) -> canvas.Canvas | None:

@@ -118,17 +118,20 @@ typedef long snd_pcm_sframes_t;
 
 #define SND_PCM_STREAM_PLAYBACK 0
 #define SND_PCM_STREAM_CAPTURE  1
+#define SND_PCM_NONBLOCK        1
+#define SND_PCM_ASYNC           2
 #define SND_PCM_ACCESS_RW_INTERLEAVED 3
 #define SND_PCM_FORMAT_S24_LE   6
 
 /* Virtual handles for the streams that are not the real device */
+static int g_h_master = 0;   /* only when no hardware could be opened */
 static int g_h_hp     = 1;
 static int g_h_booth  = 2;
 static int g_h_dummy  = 3;
 static int g_h_cap    = 4;
 
 static snd_pcm_t *g_real_playback = NULL;
-static int g_playback_open_count  = 0;
+static int g_real_refs            = 0;
 
 /* An open PCM kept only so hw_params_any() has something real to fill a
  * caller's params struct from.  See params_donor() for why that matters. */
@@ -197,6 +200,8 @@ static int (*real_snd_pcm_sw_params_set_start_threshold)(snd_pcm_t *, snd_pcm_sw
 static int (*real_snd_pcm_sw_params_set_stop_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
 static int (*real_snd_pcm_sw_params)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
 static int (*real_snd_pcm_prepare)(snd_pcm_t *) = NULL;
+static int (*real_snd_pcm_drop)(snd_pcm_t *) = NULL;
+static int (*real_snd_pcm_hw_free)(snd_pcm_t *) = NULL;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t) = NULL;
 static int (*real_snd_pcm_state)(snd_pcm_t *) = NULL;
 
@@ -239,6 +244,8 @@ static void init_real_alsa(void)
     real_snd_pcm_sw_params_set_stop_threshold = dlsym(lib, "snd_pcm_sw_params_set_stop_threshold");
     real_snd_pcm_sw_params = dlsym(lib, "snd_pcm_sw_params");
     real_snd_pcm_prepare = dlsym(lib, "snd_pcm_prepare");
+    real_snd_pcm_drop = dlsym(lib, "snd_pcm_drop");
+    real_snd_pcm_hw_free = dlsym(lib, "snd_pcm_hw_free");
     real_snd_pcm_writei = dlsym(lib, "snd_pcm_writei");
     real_snd_pcm_state = dlsym(lib, "snd_pcm_state");
     real_snd_ctl_open = dlsym(lib, "snd_ctl_open");
@@ -417,7 +424,19 @@ static void open_real_playback(int mode)
         while (*p == ' ') p++;
         if (!*p)
             continue;
-        err = real_snd_pcm_open(&g_real_playback, p, SND_PCM_STREAM_PLAYBACK, mode);
+        /* -EBUSY is worth waiting out.  A card the engine itself has just
+         * closed can take a moment to come free, and an earlier player that
+         * is still shutting down holds it for longer than that. */
+        for (int try = 0; try < 20; try++) {
+            err = real_snd_pcm_open(&g_real_playback, p,
+                                    SND_PCM_STREAM_PLAYBACK, mode);
+            if (err != -EBUSY)
+                break;
+            g_real_playback = NULL;
+            if (try == 0)
+                alog("audioshim: '%s' is busy; waiting for it\n", p);
+            usleep(100000);
+        }
         alog("audioshim: opened real '%s' for Master (mode=%d), res=%d handle=%p\n",
              p, mode, err, g_real_playback);
         if (err == 0 && g_real_playback)
@@ -428,41 +447,93 @@ static void open_real_playback(int mode)
          "will not advance\n", err);
 }
 
+/* Which of the RX3's outputs a device name is.
+ *
+ * The RX3 has one card with three output subdevices:
+ *
+ *     hw:cs4344audiorev8,0   Master
+ *     hw:cs4344audiorev8,1   Headphones / cue
+ *     hw:cs4344audiorev8,2   Booth
+ *
+ * and hw:esaics4344audio,0, which is the mic/return path, not an output.
+ *
+ * This used to be decided by counting opens: the first playback open was the
+ * master, the second the headphones, and so on.  But the engine opens and
+ * closes these repeatedly while it enumerates devices, so by the time it
+ * opened the master for real the count had already drifted past it - the
+ * master was handed a dummy handle, its audio was dropped on the floor, and
+ * there was no sound and no meter movement, with nothing in the log that
+ * looked wrong.  The name is stable; the count is not.
+ */
+static int rx3_output(const char *name)
+{
+    const char *comma;
+
+    if (!name)
+        return -1;
+    if (strstr(name, "esaic"))          /* mic / return, never an output */
+        return -1;
+    comma = strrchr(name, ',');
+    if (!comma)                          /* "default", "hw:card" */
+        return 0;
+    switch (atoi(comma + 1)) {
+    case 0:  return 0;
+    case 1:  return 1;
+    case 2:  return 2;
+    default: return -1;
+    }
+}
+
 int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
 {
+    int which;
+
     init_real_alsa();
     alog("audioshim: snd_pcm_open(name='%s', stream=%d, mode=%d)\n",
          name ? name : "null", stream, mode);
 
-    if (stream == SND_PCM_STREAM_PLAYBACK) {
-        if (g_playback_open_count == 0) {
-            /* Output 0: Master -> the real device */
-            if (!g_real_playback)
-                open_real_playback(mode & ~2); /* clear NONBLOCK: the hardware paces us */
-            *pcm = g_real_playback;
-            g_playback_open_count++;
-            return 0;
-        } else if (g_playback_open_count == 1) {
-            alog("audioshim: mapped virtual Headphone/cue device\n");
-            *pcm = (snd_pcm_t *)&g_h_hp;
-            g_playback_open_count++;
-            return 0;
-        } else if (g_playback_open_count == 2) {
-            alog("audioshim: mapped virtual Booth device\n");
-            *pcm = (snd_pcm_t *)&g_h_booth;
-            g_playback_open_count++;
-            return 0;
-        } else {
-            alog("audioshim: mapped dummy output device %d\n", g_playback_open_count);
-            *pcm = (snd_pcm_t *)&g_h_dummy;
-            g_playback_open_count++;
-            return 0;
-        }
+    if (stream != SND_PCM_STREAM_PLAYBACK) {
+        /* Capture / mic -> virtual handle, so nothing fights for the hardware */
+        alog("audioshim: mapped virtual Capture device\n");
+        *pcm = (snd_pcm_t *)&g_h_cap;
+        return 0;
     }
 
-    /* Capture / mic -> virtual handle, so nothing fights for the hardware */
-    alog("audioshim: mapped virtual Capture device\n");
-    *pcm = (snd_pcm_t *)&g_h_cap;
+    which = rx3_output(name);
+    if (which == 1) {
+        alog("audioshim: mapped virtual Headphone/cue device\n");
+        *pcm = (snd_pcm_t *)&g_h_hp;
+        return 0;
+    }
+    if (which == 2) {
+        alog("audioshim: mapped virtual Booth device\n");
+        *pcm = (snd_pcm_t *)&g_h_booth;
+        return 0;
+    }
+    if (which != 0) {
+        alog("audioshim: mapped dummy output device\n");
+        *pcm = (snd_pcm_t *)&g_h_dummy;
+        return 0;
+    }
+
+    /* The master.  Clear NONBLOCK: the hardware is the transport clock, and
+     * a non-blocking handle returns EAGAIN instead of pacing us.  (This used
+     * to clear bit 2, which is ASYNC - so NONBLOCK stayed set, and an open of
+     * a momentarily busy card failed outright instead of waiting.) */
+    if (!g_real_playback)
+        open_real_playback(mode & ~(SND_PCM_NONBLOCK | SND_PCM_ASYNC));
+
+    if (g_real_playback) {
+        g_real_refs++;
+        alog("audioshim: mapped Master -> the real device (refs=%d)\n",
+             g_real_refs);
+        *pcm = g_real_playback;
+        return 0;
+    }
+
+    alog("audioshim: no hardware for Master - running it virtually, paced in "
+         "software, with no sound\n");
+    *pcm = (snd_pcm_t *)&g_h_master;
     return 0;
 }
 
@@ -471,13 +542,26 @@ int snd_pcm_close(snd_pcm_t *pcm)
     init_real_alsa();
     alog("audioshim: snd_pcm_close(handle=%p)\n", pcm);
 
-    if (is_real(pcm)) {
-        if (g_real_playback && real_snd_pcm_close) {
-            real_snd_pcm_close(g_real_playback);
-            g_real_playback = NULL;
-        }
-        g_playback_open_count = 0;
-    }
+    if (!is_real(pcm))
+        return 0;
+
+    /* Do NOT close the card.  The engine opens and closes the master several
+     * times while it starts up, and a card that has just been closed can
+     * still be busy when the next open arrives - which is how the master
+     * ended up with no device at all and the transport stopped advancing.
+     *
+     * Instead give it back to the OPEN state: drop whatever is queued and
+     * free the hardware parameters, so the next open can reconfigure it.
+     * The descriptor stays ours for the life of the process, which is also
+     * what stops anything else taking the card in between. */
+    if (--g_real_refs > 0)
+        return 0;
+    g_real_refs = 0;
+    if (real_snd_pcm_drop)
+        real_snd_pcm_drop(g_real_playback);
+    if (real_snd_pcm_hw_free)
+        real_snd_pcm_hw_free(g_real_playback);
+    alog("audioshim: master released back to OPEN, card still held\n");
     return 0;
 }
 

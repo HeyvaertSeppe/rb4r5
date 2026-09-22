@@ -20,6 +20,7 @@ checks that hw_params comes back filled in.
 Run:  python3 tools/tests/test_audioshim_params.py
 """
 import ctypes
+import os
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 failures = []
+
+# Pin the shim's configuration before it is loaded: cfg_init() reads these
+# once, on the first call into it.
+os.environ["RB_AUDIO_DEV"] = "plughw:CARD=TESTCARD,DEV=0"
+os.environ["RB_AUDIO_CH"] = "4"
+os.environ["RB_AUDIO_RATE"] = "44100"
 
 FAKE_ASOUND = r"""
 /* Just enough libasound for audioshim to talk to, and a params struct that
@@ -62,7 +69,11 @@ int snd_pcm_open(void **pcm, const char *name, int stream, int mode)
     return 0;
 }
 
-int snd_pcm_close(void *pcm) { (void)pcm; return 0; }
+static int n_closed = 0;
+int snd_pcm_close(void *pcm) { (void)pcm; n_closed++; return 0; }
+int fake_closed_count(void) { return n_closed; }
+int snd_pcm_drop(void *pcm) { (void)pcm; return 0; }
+int snd_pcm_hw_free(void *pcm) { (void)pcm; return 0; }
 
 /* the real one fills the caller's struct with the device's capabilities;
  * the fake one writes a sentinel so the test can see that it happened */
@@ -159,10 +170,68 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # the donor must be alsa-lib's own null device: no hardware, always there
     asound.fake_opened.restype = ctypes.c_char_p
-    names = [asound.fake_opened(i).decode()
-             for i in range(asound.fake_opened_count())]
+
+    def opens():
+        """Every device name libasound has actually been asked to open."""
+        return [asound.fake_opened(i).decode()
+                for i in range(asound.fake_opened_count())]
+
+    names = opens()
     check("the params come from alsa-lib's null device, which needs no "
           "hardware", "null" in names, True)
+
+    # --- which stream is the master -----------------------------------
+    #
+    # The engine opens and closes these repeatedly while it enumerates
+    # devices.  Deciding by open ORDER meant that once the count had drifted
+    # the master was handed a dummy handle: its audio went nowhere, the
+    # meters never moved, and nothing in the log looked wrong.  Map by name.
+    SND_PCM_STREAM_PLAYBACK = 0
+
+    def open_out(name):
+        h = ctypes.c_void_p()
+        rc = lib.snd_pcm_open(ctypes.byref(h), name.encode(),
+                              SND_PCM_STREAM_PLAYBACK, 0)
+        return rc, h
+
+    rc, master = open_out("hw:cs4344audiorev8,0")
+    check("the master output opens", rc, 0)
+    rc, hp = open_out("hw:cs4344audiorev8,1")
+    check("the headphone output opens", rc, 0)
+    rc, booth = open_out("hw:cs4344audiorev8,2")
+    check("the booth output opens", rc, 0)
+
+    check("master, headphones and booth are three different streams",
+          len({master.value, hp.value, booth.value}), 3)
+
+    # close and reopen in a different order, exactly as the engine does
+    lib.snd_pcm_close(master)
+    lib.snd_pcm_close(hp)
+    lib.snd_pcm_close(booth)
+    rc, booth2 = open_out("hw:cs4344audiorev8,2")
+    rc, hp2 = open_out("hw:cs4344audiorev8,1")
+    rc, master2 = open_out("hw:cs4344audiorev8,0")
+
+    check("the master is still the master after a close and a reopen "
+          "out of order", master2.value, master.value)
+    check("and the headphones are still the headphones", hp2.value, hp.value)
+    check("and the booth is still the booth", booth2.value, booth.value)
+
+    # the mic/return card is never an output
+    rc, mic = open_out("hw:esaics4344audio,0")
+    check("the mic card is not mistaken for the master",
+          mic.value != master.value, True)
+
+    # The master must be the REAL device, not a virtual stand-in.
+    check("the master went to the configured real device",
+          "plughw:CARD=TESTCARD,DEV=0" in opens(), True)
+
+    # And the card must not be closed out from under us: the engine closes
+    # the master several times during startup, and a card that was really
+    # closed comes back EBUSY on the next open - which is how the transport
+    # lost its device and stopped advancing.
+    check("closing the master never closes the card",
+          asound.fake_closed_count(), 0)
 
 print()
 if failures:

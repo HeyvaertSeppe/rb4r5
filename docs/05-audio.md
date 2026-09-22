@@ -233,3 +233,54 @@ sudo python3 launch.py audio --levels    # what the player is producing
   is loaded.
 * **`--levels` shows audio and you hear nothing** — it is between the shim and
   the speakers: the `audioshim:` lines in `rbp.log` say what the device did.
+
+## Which stream is the master
+
+The RX3 has one sound card with three output subdevices, and the engine opens
+them by name:
+
+| device | stream |
+|---|---|
+| `hw:cs4344audiorev8,0` | Master |
+| `hw:cs4344audiorev8,1` | Headphones / cue |
+| `hw:cs4344audiorev8,2` | Booth |
+| `hw:esaics4344audio,0` | mic / return — not an output |
+
+audioshim maps the master onto the real hardware and answers for the rest
+itself. It decides **by name**. It used to decide by counting opens — first
+playback open is the master, second is the headphones, and so on — which is
+wrong because the engine opens and closes these repeatedly while it
+enumerates devices. By the time it opened the master for real, the count had
+drifted past it, so the master got a dummy handle: its audio was dropped, the
+meters never moved, and nothing in the log looked out of place. The name is
+stable; the count is not.
+
+## The card is opened once and kept
+
+`snd_pcm_close()` on the master does **not** close the card. It drops what is
+queued and frees the hardware parameters, returning the handle to the OPEN
+state so the next open can reconfigure it, but the descriptor stays ours for
+the life of the process.
+
+This is deliberate. The engine closes and reopens the master several times
+during startup, and a card that was genuinely closed is often still busy when
+the next open arrives:
+
+```
+opened real 'plughw:CARD=DDJFLX4,DEV=0' for Master, res=0    <- fine
+snd_pcm_close(...)
+opened real 'plughw:CARD=DDJFLX4,DEV=0' for Master, res=-16  <- EBUSY
+opened real 'plughw:0,0'                for Master, res=-16
+opened real 'default'                   for Master, res=-16
+NO usable playback device - the transport will not advance
+```
+
+Holding the descriptor also stops anything else taking the card in between.
+An open that does still come back `-EBUSY` is retried for two seconds, which
+covers a previous player that is still shutting down.
+
+The open also clears `SND_PCM_NONBLOCK`. The hardware is the transport clock,
+and a non-blocking handle returns `EAGAIN` instead of pacing the engine. (The
+code meant to clear it but masked off bit 2, which is `SND_PCM_ASYNC`, so
+NONBLOCK stayed set — and a momentarily busy card then failed outright
+instead of waiting.)

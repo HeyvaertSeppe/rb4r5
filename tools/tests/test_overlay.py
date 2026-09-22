@@ -159,42 +159,41 @@ check(over.fx_index == len(over.fx) - 1, "and up from the top wraps to the end")
 
 print("\n== choosing an effect puts the player's selector on it")
 #
-# BEAT FX SELECT is a selector KNOB on the RX3 - not a button, not an endless
-# encoder - so the engine wants an absolute position:
+# onEv_BeatEffectType(SW_BFX_TYPE) is a FOURTEEN-POSITION SWITCH, and the
+# engine is told which position it is on:
 #
-#   op 4 ROTATE: param = 10-bit absolute (faders, EQ, trim, crossfader)
-#                or relative delta (browse knob)
+#   send_rx_key(K_BFXTYPE, OP_VALUE, CH_GLOBAL, position)
 #
-# A delta of +1 reads as position 1 out of 1023: the bottom of the knob's
-# travel, which is the first effect.  That is why it sat on DELAY however
-# many times it was pressed, and why a press and release did nothing at all.
+# op 5 VALUE, and the parameter is the position 0..13 - not a 10-bit value,
+# not a delta, not a button press.  That is from the live-verified SC Live 4
+# port (knobshim2.c handle_fx_select), and it is why a rotate with a delta, a
+# rotate with an absolute position, and a press and release all left the
+# player sitting on DELAY: none of them is what that control takes.
 sent = []
 import rb4r5.keys as keys                                  # noqa: E402
-keys.rotate = lambda *a, **k: sent.append(a)
-keys.tap_ctrl = lambda *a, **k: sent.append(("TAP",) + a)
+keys.value = lambda *a, **k: (sent.append(("VALUE",) + a), True)[1]
+keys.rotate = lambda *a, **k: (sent.append(("ROTATE",) + a), True)[1]
+keys.tap_ctrl = lambda *a, **k: (sent.append(("TAP",) + a), True)[1]
 count = len(over.fx)
+check(count == 14, f"the list is the switch's fourteen positions ({count})")
 
 over.fx_index = 0
 over.choose_fx(7)
-check(len(sent) == 1, f"one message puts the knob where it belongs ({len(sent)})")
-check(sent[0][0] == "bfxtype", "on the FX-type control")
-check(not any(s[0] == "TAP" for s in sent),
-      "and it is not a button press, which that control ignores")
-_key, _ch, ten_bit, norm, pos14 = sent[0]
-check(ten_bit == round(7 / (count - 1) * 1023),
-      f"the position is where that effect sits on the knob ({ten_bit}/1023)")
-check(abs(norm - 7 / (count - 1)) < 0.001, "with a matching normalised value")
-check(pos14 == round(7 / (count - 1) * 16383), "and the raw 14-bit position")
+check(len(sent) == 1, f"one message moves the switch ({len(sent)})")
+check(sent[0][0] == "VALUE", f"sent as a VALUE, not a {sent[0][0].lower()}")
+check(sent[0][1] == "bfxtype", "on the FX-type control")
+check(sent[0][3] == 7, f"carrying the switch POSITION, not a scaled value "
+                       f"({sent[0][3]})")
 check(over.fx_index == 7, "and the tracked index follows")
 
 sent.clear()
 over.choose_fx(0)
-check(sent[0][2] == 0, "the first effect is the bottom of the travel")
+check(sent[0][3] == 0, "the first effect is position 0")
 sent.clear()
 over.choose_fx(count - 1)
-check(sent[0][2] == 1023, "and the last is the top")
+check(sent[0][3] == count - 1, f"and the last is position {count - 1}")
 
-# up and down cost the same now - there is no stepping and no wrapping
+# up and down cost the same: one message either way
 sent.clear()
 over.fx_index = 1
 over.choose_fx(0)
@@ -207,6 +206,12 @@ check(sent == [] and over.fx_index == 9,
 sent.clear()
 over.choose_fx(99)
 check(over.fx_index == len(over.fx) - 1, "an index past the end clamps")
+
+# the effects are the RX3's, not a DJM's
+check("PITCH" in over.fx and "VINYL BRAKE" in over.fx and "HELIX" in over.fx,
+      "the list has the RX3's own effects")
+check("MOBIUS SAW" not in over.fx and "ENIGMA JET" not in over.fx,
+      "and not the DJM-900's")
 
 print("\n== the boot screen")
 #

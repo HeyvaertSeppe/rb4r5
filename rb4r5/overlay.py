@@ -71,9 +71,18 @@ FX_ROW      = (30, 32, 38)
 # matters, not the spelling: if the player lands on the wrong effect, fix the
 # order in /etc/rb4r5/fx-list.json and the two agree again.
 DEFAULT_FX = [
-    "DELAY", "ECHO", "PING PONG", "SPIRAL", "REVERB", "TRANS", "ENIGMA JET",
-    "FLANGER", "PHASER", "FILTER", "SLIP ROLL", "ROLL", "MOBIUS SAW",
-    "MOBIUS TRI",
+    # The XDJ-RX3's fourteen, in the order its BEAT FX selector steps through
+    # them.  Fourteen is not a coincidence: onEv_BeatEffectType(SW_BFX_TYPE)
+    # is a 14-position switch, and what the launcher sends is the POSITION,
+    # so this order has to be the switch's.  The names are only labels - if
+    # the player lands on a different effect from the one that was tapped,
+    # the order is wrong, not the spelling.  Fix it in fx-list.json.
+    #
+    # ENIGMA JET, MOBIUS SAW and MOBIUS TRI were in this list and are DJM-900
+    # effects, not the RX3's; PITCH, VINYL BRAKE, HELIX and FILTER were
+    # missing.
+    "DELAY", "ECHO", "PING PONG", "SPIRAL", "REVERB", "TRANS", "FILTER",
+    "FLANGER", "PHASER", "PITCH", "SLIP ROLL", "ROLL", "VINYL BRAKE", "HELIX",
 ]
 
 # The buttons above the RX3's screen.  "key" is a name from rb4r5/keys.py;
@@ -393,19 +402,24 @@ class Overlay:
     def choose_fx(self, index: int, resync: bool = False) -> str:
         """Put the player's effect selector on the effect that was chosen.
 
-        BEAT FX SELECT is a *selector knob* on the RX3, not a button and not
-        an endless encoder, so the engine wants an ABSOLUTE position:
+        `onEv_BeatEffectType(SW_BFX_TYPE)` is a **14-position switch**, and
+        the engine is told which position it is on:
 
-            op 4 ROTATE: param = 10-bit absolute (faders, EQ, trim,
-                         crossfader) or relative delta (browse knob)
+            send_rx_key(K_BFXTYPE, OP_VALUE, CH_GLOBAL, position)
 
-        Sending a delta of +1 reads as position 1 out of 1023 - the very
-        bottom of the knob's travel, which is the first effect in the list.
-        That is why it sat on DELAY however many times it was pressed.  A
-        press and release does nothing at all, because it is not a button.
+        - op 5 VALUE, not ROTATE
+        - the parameter is the POSITION, 0..13 - not a 10-bit 0..1023 value,
+          and not a delta
 
-        One message puts the knob where it needs to be, so there is no
-        stepping and no wrapping: up and down cost the same.
+        That is from the live-verified SC Live 4 port (knobshim2.c
+        handle_fx_select), and it is why a rotate with a delta, a rotate with
+        an absolute position, and a press and release all left the player on
+        DELAY: none of them is what that control takes.
+
+        The player shows whichever effect that position is, so the ORDER of
+        the list here has to be the switch's order.  `launch.py fxhunt
+        --positions` walks all fourteen so the real order can be written
+        down; correct it in /etc/rb4r5/fx-list.json.
         """
         count = len(self.fx)
         index = max(0, min(index, count - 1))
@@ -413,16 +427,10 @@ class Overlay:
             self.fx_index = index
             return f"marked {self.fx[index]} as the selected effect"
 
-        span = max(1, count - 1)
-        norm = index / span
-        ten_bit = min(1023, max(0, round(norm * 1023)))
         mode = str(self.cfg.get("overlay.fx_mode", "position")).lower()
-
-        pos14 = min(16383, max(0, round(norm * 16383)))
         landed = True
         if mode == "tap":
-            steps = (index - self.fx_index) % count
-            for _ in range(steps):
+            for _ in range((index - self.fx_index) % count):
                 landed &= keys.tap_ctrl("bfxtype", 1)
                 time.sleep(0.02)
         elif mode == "delta":
@@ -430,19 +438,21 @@ class Overlay:
             for _ in range(abs(steps)):
                 landed &= keys.rotate("bfxtype", 1, 1 if steps > 0 else -1)
                 time.sleep(0.02)
-        elif mode == "value":
-            landed = keys.value("bfxtype", 1, ten_bit, norm)
+        elif mode == "tenbit":
+            span = max(1, count - 1)
+            norm = index / span
+            landed = keys.rotate("bfxtype", 1, round(norm * 1023), norm,
+                                 round(norm * 16383))
         else:
-            landed = keys.rotate("bfxtype", 1, ten_bit, norm, pos14)
+            # the verified one: the switch position, as a VALUE
+            landed = keys.value("bfxtype", 1, index, index / max(1, count - 1))
 
         self.fx_index = index
         if not landed:
-            # Silence here is what let three different message formats look
-            # identical from the outside: nothing arrived, every time.
             util.warn(f"overlay: nothing is reading {config.FIFO_CTRL} - the "
                       "effect was not sent to the player")
             return f"{self.fx[index]} (NOT SENT - no reader on the control fifo)"
-        return f"selected {self.fx[index]} ({mode} {ten_bit}/1023)"
+        return f"selected {self.fx[index]} (switch position {index})"
 
     def step_fx(self, direction: int) -> str:
         """Move the selection one effect down (+1) or up (-1)."""

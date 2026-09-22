@@ -181,5 +181,24 @@ path.write_text("{ not json")
 check(overlay.load_json(str(path), ["X"]) == ["X"],
       "and so does a broken one")
 
+
+print("\n== how often the meter can redraw")
+#
+# Touch wakes the daemon's loop by itself; the meter does not, so the select
+# timeout is what sets its frame rate.  At 0.2s it could only redraw five
+# times a second however often audioshim published a level - which reads as
+# lag rather than as a meter.
+class _FakeDaemon(overlay.OverlayDaemon):
+    def __init__(self, meter_on, mode):
+        self.meter_on = meter_on
+        self.overlay = type("o", (), {"mode": mode})()
+
+check(_FakeDaemon(True, "bar").idle_wait() <= 0.05,
+      "the loop turns fast enough for the meter to keep up")
+check(_FakeDaemon(False, "bar").idle_wait() >= 0.15,
+      "with the meter off it can idle")
+check(_FakeDaemon(True, "splash").idle_wait() >= 0.15,
+      "and it idles behind the splash too")
+
 print("\n" + ("all overlay tests passed" if not FAIL else f"{FAIL} FAILURES"))
 sys.exit(1 if FAIL else 0)

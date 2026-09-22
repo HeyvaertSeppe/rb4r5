@@ -251,6 +251,13 @@ static int (*real_get_channels)(const snd_pcm_hw_params_t *, unsigned int *) = N
 static int (*real_get_rate)(const snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
 static int (*real_get_period_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *) = NULL;
 static int (*real_get_buffer_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *) = NULL;
+static int (*real_sw_malloc)(snd_pcm_sw_params_t **) = NULL;
+static void (*real_sw_free)(snd_pcm_sw_params_t *) = NULL;
+static int (*real_sw_set_avail_min)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
+
+/* what the hardware actually settled on, for our own sw_params */
+static snd_pcm_uframes_t g_hw_period = 512;
+static snd_pcm_uframes_t g_hw_buffer = 2048;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t) = NULL;
 static int (*real_snd_pcm_state)(snd_pcm_t *) = NULL;
 
@@ -301,6 +308,9 @@ static void init_real_alsa(void)
     real_get_rate = dlsym(lib, "snd_pcm_hw_params_get_rate");
     real_get_period_size = dlsym(lib, "snd_pcm_hw_params_get_period_size");
     real_get_buffer_size = dlsym(lib, "snd_pcm_hw_params_get_buffer_size");
+    real_sw_malloc = dlsym(lib, "snd_pcm_sw_params_malloc");
+    real_sw_free = dlsym(lib, "snd_pcm_sw_params_free");
+    real_sw_set_avail_min = dlsym(lib, "snd_pcm_sw_params_set_avail_min");
     real_snd_pcm_writei = dlsym(lib, "snd_pcm_writei");
     real_snd_pcm_state = dlsym(lib, "snd_pcm_state");
     real_snd_ctl_open = dlsym(lib, "snd_ctl_open");
@@ -592,6 +602,68 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
     return 0;
 }
 
+/* Give the real device software parameters that match the buffer it really
+ * has - because the engine's do not.
+ *
+ * Every hardware parameter is overridden for this device (access, format,
+ * channels, period, periods), so the buffer it ends up with is nothing like
+ * the 128 frames the engine believes in.  Its SOFTWARE parameters were being
+ * forwarded verbatim all the same, and a stop_threshold of 128 frames on a
+ * 2048-frame buffer stops the stream the moment it is prepared: avail is the
+ * whole empty buffer, which is already past the threshold.  So prepare()
+ * reported success, the state went straight back to SETUP, and the first
+ * write returned EBADFD:
+ *
+ *   the device was in state 1 (not ready to be written); prepare() res=0
+ *   the output device stopped accepting audio (File descriptor in bad state,
+ *   errno 77, after 1 writes, state 1)
+ *
+ * stop_threshold is the boundary here, so an underrun never stops the
+ * stream - the write loop handles EPIPE itself and can carry on.
+ */
+static void apply_sw_params(void)
+{
+    snd_pcm_sw_params_t *sw = NULL;
+    snd_pcm_uframes_t boundary = 0x40000000;
+    int err;
+
+    if (!real_sw_malloc || !real_sw_free || !real_snd_pcm_sw_params_current ||
+        !real_snd_pcm_sw_params || !g_real_playback)
+        return;
+    if (real_sw_malloc(&sw) < 0 || !sw)
+        return;
+    if (real_snd_pcm_sw_params_current(g_real_playback, sw) < 0) {
+        real_sw_free(sw);
+        return;
+    }
+    if (real_snd_pcm_sw_params_get_boundary)
+        real_snd_pcm_sw_params_get_boundary(sw, &boundary);
+    if (real_snd_pcm_sw_params_set_stop_threshold)
+        real_snd_pcm_sw_params_set_stop_threshold(g_real_playback, sw, boundary);
+    if (real_snd_pcm_sw_params_set_start_threshold)
+        real_snd_pcm_sw_params_set_start_threshold(g_real_playback, sw,
+                                                   g_hw_period);
+    if (real_snd_pcm_sw_params_set_silence_threshold)
+        real_snd_pcm_sw_params_set_silence_threshold(g_real_playback, sw, 0);
+    if (real_snd_pcm_sw_params_set_silence_size)
+        real_snd_pcm_sw_params_set_silence_size(g_real_playback, sw, 0);
+    if (real_sw_set_avail_min)
+        real_sw_set_avail_min(g_real_playback, sw, g_hw_period);
+
+    err = real_snd_pcm_sw_params(g_real_playback, sw);
+    alog("audioshim: our own sw_params (start=%lu, stop=boundary %lu, "
+         "avail_min=%lu) res=%d\n", (unsigned long)g_hw_period,
+         (unsigned long)boundary, (unsigned long)g_hw_period, err);
+    real_sw_free(sw);
+
+    if (real_snd_pcm_prepare) {
+        err = real_snd_pcm_prepare(g_real_playback);
+        alog("audioshim: prepare after setup res=%d, state now %d "
+             "(2 = PREPARED, which is what writei needs)\n", err,
+             real_snd_pcm_state ? real_snd_pcm_state(g_real_playback) : -1);
+    }
+}
+
 int snd_pcm_close(snd_pcm_t *pcm)
 {
     init_real_alsa();
@@ -804,6 +876,9 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
                  access, format, channels, rate, (unsigned long)period,
                  (unsigned long)buffer,
                  rate ? (double)buffer * 1000.0 / (double)rate : 0.0);
+            if (period) g_hw_period = period;
+            if (buffer) g_hw_buffer = buffer;
+            apply_sw_params();
         }
         if (err >= 0 && g_pcm_dead) {
             /* A fresh, accepted configuration deserves a fresh chance: one
@@ -842,40 +917,54 @@ int snd_pcm_sw_params_get_boundary(const snd_pcm_sw_params_t *params, snd_pcm_uf
 int snd_pcm_sw_params_set_silence_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_sw_params_set_silence_threshold)
-        real_snd_pcm_sw_params_set_silence_threshold(g_real_playback, params, val);
+    /* Not forwarded for the real device: the engine sizes these for the
+     * 128-frame buffer it believes in, and applying them to the real one
+     * stops the stream dead.  apply_sw_params() sets them from the buffer
+     * the hardware actually has. */
+    (void)params; (void)val;
     return 0; /* always succeed */
 }
 
 int snd_pcm_sw_params_set_silence_size(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_sw_params_set_silence_size)
-        real_snd_pcm_sw_params_set_silence_size(g_real_playback, params, val);
+    /* Not forwarded for the real device: the engine sizes these for the
+     * 128-frame buffer it believes in, and applying them to the real one
+     * stops the stream dead.  apply_sw_params() sets them from the buffer
+     * the hardware actually has. */
+    (void)params; (void)val;
     return 0;
 }
 
 int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_sw_params_set_start_threshold)
-        real_snd_pcm_sw_params_set_start_threshold(g_real_playback, params, val);
+    /* Not forwarded for the real device: the engine sizes these for the
+     * 128-frame buffer it believes in, and applying them to the real one
+     * stops the stream dead.  apply_sw_params() sets them from the buffer
+     * the hardware actually has. */
+    (void)params; (void)val;
     return 0;
 }
 
 int snd_pcm_sw_params_set_stop_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_sw_params_set_stop_threshold)
-        real_snd_pcm_sw_params_set_stop_threshold(g_real_playback, params, val);
+    /* Not forwarded for the real device: the engine sizes these for the
+     * 128-frame buffer it believes in, and applying them to the real one
+     * stops the stream dead.  apply_sw_params() sets them from the buffer
+     * the hardware actually has. */
+    (void)params; (void)val;
     return 0;
 }
 
 int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_sw_params)
-        real_snd_pcm_sw_params(g_real_playback, params);
+    /* Deliberately not applied to the real device - apply_sw_params() has
+     * already set software parameters that match its actual buffer, and the
+     * engine's would undo them. */
+    (void)pcm; (void)params;
     return 0;
 }
 
@@ -1103,11 +1192,14 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
                 g_pcm_fails = 0;
                 continue;
             }
-            if (written == -EPIPE || written == -EINTR) {
+            if (written == -EPIPE || written == -EINTR || written == -EBADFD) {
+                /* EPIPE is an underrun.  EBADFD means the stream is not in a
+                 * state that takes writes - prepare() puts it back.  Both are
+                 * worth recovering from rather than giving up on the device. */
                 if (real_snd_pcm_prepare)
                     real_snd_pcm_prepare(g_real_playback);
                 if (++g_pcm_fails < 32)
-                    continue;              /* an underrun: recover and go on */
+                    continue;
             }
             /* Anything else - or too many underruns in a row - means this
              * device is not taking audio.  Stop pretending it is. */

@@ -325,3 +325,38 @@ leading up to it suggested.
 
 A device that fails a write is no longer written off for the whole run: a
 later `hw_params()` that succeeds clears the flag and gives it another chance.
+
+## Software parameters have to match the real buffer
+
+Every *hardware* parameter is overridden for the real device — access,
+format, channels, period, periods — so the buffer it ends up with is nothing
+like the 128 frames the engine believes in. Its *software* parameters were
+being forwarded verbatim all the same, and that is fatal:
+
+```
+the device was in state 1 (not ready to be written); prepare() res=0
+the output device stopped accepting audio (File descriptor in bad state,
+errno 77, after 1 writes, state 1)
+```
+
+A `stop_threshold` of 128 frames on a 2048-frame buffer stops the stream the
+moment it is prepared — `avail` is the whole empty buffer, already past the
+threshold. So `prepare()` reported success, the state fell straight back to
+SETUP, and the first `writei()` returned `EBADFD`.
+
+`apply_sw_params()` now sets them from the buffer the hardware actually has,
+right after `hw_params()` succeeds:
+
+| parameter | value | why |
+|---|---|---|
+| `stop_threshold` | the boundary | an underrun must never stop the stream; the write loop recovers from `EPIPE` itself |
+| `start_threshold` | one period | start playing as soon as there is a period to play |
+| `avail_min` | one period | wake the writer when a period is free |
+| `silence_threshold` / `silence_size` | 0 | the shim fills the buffer itself |
+
+The engine's own `sw_params` calls are **not** forwarded to the real device,
+for the same reason its `hw_params` are overridden: they describe a device it
+is not actually writing to.
+
+`EBADFD` is now treated like `EPIPE` in the write loop — prepare and retry —
+rather than as a reason to give up on the device.

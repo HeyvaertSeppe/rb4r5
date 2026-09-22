@@ -622,6 +622,16 @@ class OverlayDaemon:
             return b""
         return blob
 
+    # How long to wait for touch before going round the loop again.  The
+    # meter is the only thing that needs the loop to turn on its own.
+    METER_TICK = 0.03
+    IDLE_TICK = 0.2
+
+    def idle_wait(self) -> float:
+        if self.meter_on and self.overlay.mode != "splash":
+            return self.METER_TICK
+        return self.IDLE_TICK
+
     def poll_meter(self) -> None:
         """Redraw the master meter, but only when it would look different.
 
@@ -780,7 +790,12 @@ class OverlayDaemon:
             try:
                 while True:
                     watch = [self.reader.fd] + ([self.fifo] if self.fifo else [])
-                    ready, _, _ = select.select(watch, [], [], 0.2)
+                    # Touch wakes this loop by itself; the meter does not, so
+                    # the timeout is what sets its frame rate.  At 0.2s it
+                    # could only ever redraw five times a second however
+                    # often the level was published, which looks like lag
+                    # rather than like a meter.
+                    ready, _, _ = select.select(watch, [], [], self.idle_wait())
                     if self.fifo in ready:
                         self.read_commands()
                     if self.reader.fd in ready:

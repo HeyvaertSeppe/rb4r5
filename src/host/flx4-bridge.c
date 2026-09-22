@@ -115,6 +115,7 @@
 #define K_OVERLAY_FXUP 0xf002     /* SHIFT+FX SELECT: one effect up */
 
 #define K_BFXTYPE     0x448b
+#define K_MASTERCUE   0x4407
 #define K_BFXCH       0x448c
 #define K_BFX         0x448d
 #define K_DEPTH       0x448f
@@ -750,6 +751,9 @@ static const struct led_rule led_rules[] = {
     { K_MASTER,   LED_TOGGLE, 0 },
     { K_BFX,      LED_TOGGLE, 0 },
     { K_RELOOP,   LED_TOGGLE, 0 },
+    { K_MASTERCUE, LED_TOGGLE, 0 },   /* headphone CUE stays lit while on */
+    { K_LOOPIN,   LED_TOGGLE, 0 },
+    { K_LOOPOUT,  LED_TOGGLE, 0 },
     /* the four pad modes are one group per deck */
     { K_HOTCUE,   LED_RADIO,  1 },
     { K_ALOOP,    LED_RADIO,  1 },
@@ -883,8 +887,15 @@ static void handle_pad(int ch, int deck, int note, int on)
 
     /* Pads take their own path rather than the note table - the note is
      * computed from the mode and the pad number - so they were missed by the
-     * lighting, which is why every button lit except these. */
+     * lighting, which is why every button lit except these.
+     *
+     * The light has to be sent on the SHIFT channel too.  The FLX4 keeps a
+     * separate lamp state per channel, so a pad lit on ch 0x97 goes dark the
+     * moment SHIFT is held unless ch 0x98 was told as well - which is why
+     * hot cues and loops "stop working" whenever a finger is on SHIFT. */
     led_set(ch, note, on);
+    led_set((ch == MC_PAD1 || ch == MC_PAD1_SH) ? MC_PAD1_SH : MC_PAD2_SH,
+            note, on);
 
     pad_select_bank(deck, base);
     send_ctrl(K_PAD1 + idx, on ? OP_PRESS : OP_RELEASE, deck + 1, 0, 0.0f, 0);
@@ -919,6 +930,14 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_DECK2, 0x0E, K_REV,  0, "SHIFT+PLAY (censor/reverse)" },
     { MC_DECK1, 0x0C, K_CUE,  0, "CUE" },
     { MC_DECK2, 0x0C, K_CUE,  0, "CUE" },
+    /* The headphone CUE buttons - note 0x54, per deck, lit on the same note.
+     * They were not bound at all, which is why they did nothing and never
+     * lit.  The RX3's per-channel PFL keycode is not among the ones verified
+     * so far, so this goes to MASTER CUE: the headphones follow, which is
+     * most of what the button is for.  Bind it properly from the map file
+     * once the right keycode is known. */
+    { MC_DECK1, 0x54, K_MASTERCUE, CH_GLOBAL, "headphone CUE (deck 1)" },
+    { MC_DECK2, 0x54, K_MASTERCUE, CH_GLOBAL, "headphone CUE (deck 2)" },
     { MC_DECK1, 0x58, K_SYNC, 0, "BEAT SYNC" },
     { MC_DECK2, 0x58, K_SYNC, 0, "BEAT SYNC" },
     { MC_DECK1, 0x5C, K_MASTER, 0, "BEAT SYNC long (master)" },
@@ -947,8 +966,13 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_DECK2, 0x6D, K_ALOOP,    0, "PAD MODE beat loop" },
     { MC_DECK1, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
     { MC_DECK2, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
-    { MC_DECK1, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler -> slip loop" },
-    { MC_DECK2, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler -> slip loop" },
+    /* The RX3's fourth bank is release FX / slip loop, and it belongs on PAD
+     * FX1 (note 0x1E) where the RX3 puts it - not behind two presses of
+     * SAMPLER (0x22), which is where it was.  The FLX4's own pad-mode notes:
+     *   0x1B HOT CUE   0x1E PAD FX1   0x20 BEAT JUMP   0x22 SAMPLER
+     *   0x69 KEYBOARD  0x6B PAD FX2   0x6D BEAT LOOP   0x6F KEY SHIFT */
+    { MC_DECK1, 0x1E, K_SLIPLOOP, 0, "PAD MODE pad FX1 -> release FX" },
+    { MC_DECK2, 0x1E, K_SLIPLOOP, 0, "PAD MODE pad FX1 -> release FX" },
 
     /* ---- BEAT FX (ch 5, and ch 6 when the FX is assigned to CH2) ---- */
     /* Pressing FX SELECT opens the picker, because that is what pressing it
@@ -1395,7 +1419,15 @@ static void handle_cc(int ch, int cc, int val)
     if ((ch == MC_DECK1 || ch == MC_DECK2) &&
         (cc == 0x21 || cc == 0x22 || cc == 0x23 || cc == 0x29)) {
         int delta = (val >= 64) ? val - 128 : val;
-        int mode = (cc == 0x22) ? JOG_SCRATCH
+        /* From the FLX4's own MIDI map:
+         *   CC 0x22  PLATTER, vinyl mode ON   - the top
+         *   CC 0x23  PLATTER, vinyl mode OFF  - still the top
+         *   CC 0x21  SIDE                     - the rim
+         *   CC 0x29  PLATTER + SHIFT          - search
+         * 0x23 was being treated as the rim, so with vinyl mode off,
+         * touching the top and turning was a quarter-speed nudge.  That is
+         * "captive touch feels like the side". */
+        int mode = (cc == 0x22 || cc == 0x23) ? JOG_SCRATCH
                  : (cc == 0x29) ? JOG_SEARCH : JOG_BEND;
         jog_delta(ch, delta, mode);
         return;

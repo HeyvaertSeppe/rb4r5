@@ -518,3 +518,54 @@ pitch fader. `sniff` while flicking the switch gives the number:
 ```
 smartfader ch<n> <cc|note> <number>
 ```
+
+## The FLX4's own numbers
+
+From the DDJ-FLX4 controller mapping. Several of these were wrong here, and
+each one was a reported fault.
+
+### The jog wheel has two platter CCs, not one
+
+```
+CC 0x22   PLATTER, vinyl mode ON    - the top
+CC 0x23   PLATTER, vinyl mode OFF   - still the top
+CC 0x21   SIDE                      - the rim
+CC 0x29   PLATTER + SHIFT           - search
+```
+
+`0x23` was being treated as the rim. With vinyl mode off — which is the
+default — touching the top and turning was therefore a quarter-speed nudge.
+That is what "captive touch feels like the side" was, and no amount of
+tuning the wheel could have fixed it.
+
+### Buttons that were never bound
+
+| button | note | goes to |
+|---|---|---|
+| headphone CUE | `0x54` | `K_MASTERCUE` |
+
+The headphone CUE buttons were not in the table at all, so they did nothing
+and never lit. The RX3's **per-channel** PFL keycode is not among the ones
+verified so far, so they drive MASTER CUE for now: the headphones follow,
+which is most of what the button is for. Bind it properly from the map file
+when the right keycode turns up.
+
+### The pad modes
+
+```
+0x1B HOT CUE    0x1E PAD FX1    0x20 BEAT JUMP   0x22 SAMPLER
+0x69 KEYBOARD   0x6B PAD FX2    0x6D BEAT LOOP   0x6F KEY SHIFT
+```
+
+The RX3's fourth bank is release FX, and it now sits on **PAD FX1** (`0x1E`)
+where the RX3 puts it, rather than behind two presses of SAMPLER.
+
+### A pad's lamp needs both channels
+
+The FLX4 keeps a separate lamp state per MIDI channel. A pad lit on `0x97`
+goes dark the moment SHIFT is held unless `0x98` was told as well — which is
+why hot cues and loops appeared to "stop working" with a finger on SHIFT.
+Every pad light is now sent on both.
+
+Loop in, loop out and headphone cue also stay lit while they are on, instead
+of only flashing on the press.

@@ -34,6 +34,8 @@ failures = []
 os.environ["RB_AUDIO_DEV"] = "plughw:CARD=TESTCARD,DEV=0"
 os.environ["RB_AUDIO_CH"] = "4"
 os.environ["RB_AUDIO_RATE"] = "44100"
+os.environ["RB_AUDIO_PERIOD"] = "512"
+os.environ["RB_AUDIO_PERIODS"] = "4"
 
 FAKE_ASOUND = r"""
 /* Just enough libasound for audioshim to talk to, and a params struct that
@@ -90,8 +92,15 @@ int snd_pcm_hw_params_set_access(void *a, void *b, int c) { (void)a;(void)b;(voi
 int snd_pcm_hw_params_set_format(void *a, void *b, int c) { (void)a;(void)b;(void)c; return 0; }
 int snd_pcm_hw_params_set_channels(void *a, void *b, unsigned c) { (void)a;(void)b;(void)c; return 0; }
 int snd_pcm_hw_params_set_rate_near(void *a, void *b, unsigned *c, int *d) { (void)a;(void)b;(void)c;(void)d; return 0; }
-int snd_pcm_hw_params_set_period_size_near(void *a, void *b, unsigned long *c, int *d) { (void)a;(void)b;(void)c;(void)d; return 0; }
-int snd_pcm_hw_params_set_periods_near(void *a, void *b, unsigned *c, int *d) { (void)a;(void)b;(void)c;(void)d; return 0; }
+/* record what the shim actually asks the hardware for */
+static unsigned long asked_period = 0;
+static unsigned asked_periods = 0;
+int snd_pcm_hw_params_set_period_size_near(void *a, void *b, unsigned long *c, int *d)
+{ (void)a;(void)b;(void)d; if (c) asked_period = *c; return 0; }
+int snd_pcm_hw_params_set_periods_near(void *a, void *b, unsigned *c, int *d)
+{ (void)a;(void)b;(void)d; if (c) asked_periods = *c; return 0; }
+unsigned long fake_period(void) { return asked_period; }
+unsigned fake_periods(void) { return asked_periods; }
 int snd_pcm_sw_params_current(void *a, void *b) { (void)a;(void)b; return 0; }
 int snd_pcm_sw_params_get_boundary(const void *a, unsigned long *b) { (void)a; if (b) *b = 0; return 0; }
 int snd_pcm_sw_params_set_silence_threshold(void *a, void *b, unsigned long c) { (void)a;(void)b;(void)c; return 0; }
@@ -232,6 +241,29 @@ with tempfile.TemporaryDirectory() as tmp:
     # lost its device and stopped advancing.
     check("closing the master never closes the card",
           asound.fake_closed_count(), 0)
+
+    # --- the hardware buffer must be big enough for USB ----------------
+    #
+    # The engine asks for two periods of 64 frames: 2.9 ms, which suits the
+    # RX3's local I2S output and underruns on every period over USB, until
+    # the shim gives up on the device and there is no sound at all.
+    period = ctypes.c_ulong(64)
+    periods = ctypes.c_uint(2)
+    lib.snd_pcm_hw_params_set_period_size_near(
+        master2, ctypes.byref(params), ctypes.byref(period), None)
+    lib.snd_pcm_hw_params_set_periods_near(
+        master2, ctypes.byref(params), ctypes.byref(periods), None)
+    asound.fake_period.restype = ctypes.c_ulong
+    check("a 64-frame period is raised to something USB can hold",
+          asound.fake_period(), 512)
+    check("and two periods become four", asound.fake_periods(), 4)
+
+    # a request that is already generous is left alone
+    period = ctypes.c_ulong(2048)
+    lib.snd_pcm_hw_params_set_period_size_near(
+        master2, ctypes.byref(params), ctypes.byref(period), None)
+    check("a period that is already large enough is not shrunk",
+          asound.fake_period(), 2048)
 
 print()
 if failures:

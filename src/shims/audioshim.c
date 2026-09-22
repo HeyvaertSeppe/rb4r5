@@ -146,6 +146,29 @@ static int   g_rate         = 44100;
 static int   g_format       = SND_PCM_FORMAT_S24_LE;
 static int   g_cue_on_2ch   = 0;
 static int   g_cue_mirror   = 0;
+/* Floors for the REAL device's buffer.
+ *
+ * The RX3's own output is local I2S, so the engine asks for what suits that:
+ * two periods of 64 frames, a 2.9 ms buffer.  A USB controller cannot hold
+ * to that - it underruns on essentially every period, and after enough
+ * underruns in a row the shim gives up on the device and there is no sound
+ * at all.  The engine is not harmed by a larger hardware buffer: it still
+ * writes whatever size it likes, and writei still blocks once the buffer is
+ * full, which is what clocks its transport. */
+static unsigned long g_min_period  = 512;
+static unsigned long g_min_periods = 4;
+
+/* What a full-scale sample from the engine looks like.
+ *
+ * The engine asks for S24_LE, whose samples are 24 bits right-justified in a
+ * 32-bit container, so full scale is 8388607.  If what actually arrives is
+ * larger than that it cannot be S24_LE data, and the only thing it can
+ * sensibly be is 32-bit - in which case the meter needs the bigger scale (or
+ * it sits pinned at the top regardless of what is playing) and the samples
+ * need shifting down before they go to a device that was configured for 24.
+ * Detected rather than assumed, because guessing wrong is silent either way. */
+static int32_t g_full_scale   = 8388607;
+static int     g_sample_shift = 0;
 
 static void cfg_init(void)
 {
@@ -176,9 +199,18 @@ static void cfg_init(void)
     s = getenv("RB_AUDIO_CUE_MIRROR");
     if (s && *s && *s != '0') g_cue_mirror = 1;
 
-    alog("audioshim: cfg dev='%s' ch=%d rate=%d fmt=%d cue_on_2ch=%d cue_mirror=%d\n",
+    s = getenv("RB_AUDIO_PERIOD");
+    if (s && *s) g_min_period = strtoul(s, NULL, 10);
+    if (g_min_period < 32 || g_min_period > 8192) g_min_period = 512;
+
+    s = getenv("RB_AUDIO_PERIODS");
+    if (s && *s) g_min_periods = strtoul(s, NULL, 10);
+    if (g_min_periods < 2 || g_min_periods > 32) g_min_periods = 4;
+
+    alog("audioshim: cfg dev='%s' ch=%d rate=%d fmt=%d cue_on_2ch=%d "
+         "cue_mirror=%d period>=%lu periods>=%lu\n",
          g_dev_list[0] ? g_dev_list : "(auto)", g_real_ch, g_rate, g_format,
-         g_cue_on_2ch, g_cue_mirror);
+         g_cue_on_2ch, g_cue_mirror, g_min_period, g_min_periods);
 }
 
 /* Real ALSA function pointers */
@@ -648,8 +680,13 @@ int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *
 {
     init_real_alsa();
     if (is_real(pcm) && real_snd_pcm_hw_params_set_period_size_near) {
+        snd_pcm_uframes_t asked = val ? *val : 0;
+        if (val && *val < g_min_period)
+            *val = (snd_pcm_uframes_t)g_min_period;
         int err = real_snd_pcm_hw_params_set_period_size_near(g_real_playback, params, val, dir);
-        alog("audioshim: real set_period_size_near res=%d period=%lu\n", err, val ? *val : 0);
+        alog("audioshim: real set_period_size_near(req=%lu -> %lu) res=%d period=%lu\n",
+             (unsigned long)asked, (unsigned long)g_min_period, err,
+             val ? (unsigned long)*val : 0UL);
         return err;
     }
     return 0;
@@ -659,8 +696,12 @@ int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *para
 {
     init_real_alsa();
     if (is_real(pcm) && real_snd_pcm_hw_params_set_periods_near) {
+        unsigned int asked = val ? *val : 0;
+        if (val && *val < (unsigned)g_min_periods)
+            *val = (unsigned)g_min_periods;
         int err = real_snd_pcm_hw_params_set_periods_near(g_real_playback, params, val, dir);
-        alog("audioshim: real set_periods_near res=%d periods=%u\n", err, val ? *val : 0);
+        alog("audioshim: real set_periods_near(req=%u -> %lu) res=%d periods=%u\n",
+             asked, g_min_periods, err, val ? *val : 0);
         return err;
     }
     return 0;
@@ -776,15 +817,14 @@ int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
  * fast" is a ratio and this is where the ratio is known. */
 static void pace_report(struct pace *p, snd_pcm_uframes_t frames)
 {
-    static long long last = 0;
     long long now = rb4r5_now_us();
     unsigned int rate = g_rate ? g_rate : 44100;
 
     (void)frames;
-    if (last == 0) last = now;
-    if (now - last < 5000000)
+    if (p->reported_us == 0) p->reported_us = now;
+    if (now - p->reported_us < 5000000)
         return;
-    last = now;
+    p->reported_us = now;
     if (p->started && now > p->t0_us) {
         double elapsed = (double)(now - p->t0_us) / 1000000.0;
         double audio = (double)p->frames / (double)rate;
@@ -815,7 +855,7 @@ static void publish_levels(int32_t left, int32_t right, int32_t phones)
     record[1] = left;
     record[2] = right;
     record[3] = phones;
-    record[4] = 8388607;                 /* full scale, so the reader scales */
+    record[4] = g_full_scale;            /* full scale, so the reader scales */
 
     fd = open(RB_LEVELS_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK, 0666);
     if (fd < 0)
@@ -845,7 +885,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
          * The master stream is what actually drives the write to the device -
          * but this one still has to keep to real time, or the engine clocks
          * itself off it and the whole deck runs fast. */
-        static struct pace pace_hp = { 0, 0, 0, "the headphone stream", 0 };
+        static struct pace pace_hp = { 0, 0, 0, "the headphone stream", 0, 0 };
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
             int32_t l = src[i * 2 + 0];
             int32_t r = src[i * 2 + 1];
@@ -863,7 +903,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     if (pcm == (snd_pcm_t *)&g_h_booth || pcm == (snd_pcm_t *)&g_h_dummy) {
-        static struct pace pace_booth = { 0, 0, 0, "the booth stream", 0 };
+        static struct pace pace_booth = { 0, 0, 0, "the booth stream", 0, 0 };
         pace_stream(&pace_booth, size, g_rate);  /* the FLX4 has no booth output, but
                                           * the engine still counts on it
                                           * taking real time */
@@ -880,6 +920,14 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         if (ar > s_peak_master) s_peak_master = ar;
         if (al > s_peak_l) s_peak_l = al;
         if (ar > s_peak_r) s_peak_r = ar;
+        if (!g_sample_shift && (al > 8388607 || ar > 8388607)) {
+            g_sample_shift = 8;
+            g_full_scale = 2147483647;
+            alog("audioshim: the engine is sending 32-bit samples, not the "
+                 "S24_LE it asked for (saw %d, 24-bit full scale is 8388607) "
+                 "- shifting them down by 8 and scaling the meter to "
+                 "match\n", al > ar ? al : ar);
+        }
         g_mix4ch[i * 4 + 0] = l;
         g_mix4ch[i * 4 + 1] = r;
         /* Mirror master into the cue pair only while the engine has not
@@ -896,14 +944,19 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     /* Build the hardware buffer */
     if (g_real_ch == 4) {
         /* DDJ-FLX4: 1/2 = MASTER out, 3/4 = HEADPHONES out */
-        memcpy(g_out, g_mix4ch, (size_t)size * 4 * sizeof(int32_t));
+        if (g_sample_shift == 0) {
+            memcpy(g_out, g_mix4ch, (size_t)size * 4 * sizeof(int32_t));
+        } else {
+            for (snd_pcm_uframes_t i = 0; i < size * 4; i++)
+                g_out[i] = g_mix4ch[i] >> g_sample_shift;
+        }
     } else {
         /* stereo sink (HDMI): master, or the cue mix when it has audio and the
          * operator asked for cue-on-stereo */
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
             int use_cue = (g_cue_on_2ch && s_has_hp_audio);
-            g_out[i * 2 + 0] = g_mix4ch[i * 4 + (use_cue ? 2 : 0)];
-            g_out[i * 2 + 1] = g_mix4ch[i * 4 + (use_cue ? 3 : 1)];
+            g_out[i * 2 + 0] = g_mix4ch[i * 4 + (use_cue ? 2 : 0)] >> g_sample_shift;
+            g_out[i * 2 + 1] = g_mix4ch[i * 4 + (use_cue ? 3 : 1)] >> g_sample_shift;
         }
     }
 
@@ -1007,7 +1060,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     /* The master stream, governed too.  A working device paces it and this
      * never sleeps; a dead or missing one would otherwise free-run. */
     {
-        static struct pace pace_master = { 0, 0, 0, "the master stream", 0 };
+        static struct pace pace_master = { 0, 0, 0, "the master stream", 0, 0 };
         pace_stream(&pace_master, size, g_rate);
         pace_report(&pace_master, size);
     }
@@ -1029,8 +1082,11 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     if ((g_write_count % 500) == 1) {
-        alog("audioshim: writei #%lu frames=%lu written=%ld ch=%d peak_m=%d peak_cue=%d\n",
-             g_write_count, size, (long)written, g_real_ch, s_peak_master, s_peak_hp);
+        alog("audioshim: writei #%lu frames=%lu written=%ld ch=%d peak_m=%d "
+             "peak_cue=%d of %d (%d%% of full scale)\n",
+             g_write_count, size, (long)written, g_real_ch, s_peak_master,
+             s_peak_hp, g_full_scale,
+             (int)((long long)s_peak_master * 100 / g_full_scale));
         s_peak_master = 0;
         s_peak_hp = 0;
     }

@@ -32,6 +32,11 @@ struct pace {
     unsigned long long frames;      /* frames accepted since then          */
     const char        *name;
     unsigned long long slept_us;    /* how much we have had to hold it back */
+    long long          reported_us;  /* when this stream last reported; the
+                                      * timer is PER STREAM, because one
+                                      * shared between them means whichever
+                                      * writes first is the only one that is
+                                      * ever heard from */
 };
 
 /* Two seconds behind means the engine (or the device) stalled somewhere else.

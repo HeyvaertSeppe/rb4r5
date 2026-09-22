@@ -79,6 +79,11 @@ DEFAULTS: dict = {
         "rate": 44100,
         "format": 6,                     # SND_PCM_FORMAT_S24_LE
         "plug": True,                    # use plughw: (lets alsa-lib convert)
+        # The engine asks for 2 x 64 frames, a 2.9 ms buffer: right for the
+        # RX3's local I2S output, far too small for anything over USB, which
+        # then underruns on every period until the shim gives up on it.
+        "period_frames": 512,
+        "periods": 4,
         "cue_mirror": False,             # mirror master into the phones until PFL
         "cue_on_stereo": False,          # on a stereo sink, follow the cue mix
         # The engine picks its output once, at startup.  If the controller is

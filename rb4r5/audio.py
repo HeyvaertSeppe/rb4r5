@@ -236,6 +236,10 @@ def env(cfg, chosen: dict | None = None) -> dict:
         "RB_AUDIO_CH": str(chosen["channels"]),
         "RB_AUDIO_RATE": str(chosen["rate"]),
         "RB_AUDIO_FMT": str(chosen["format"]),
+        # The engine asks for two periods of 64 frames, which suits the RX3's
+        # local I2S output and underruns continuously on anything USB.
+        "RB_AUDIO_PERIOD": str(int(cfg.get("audio.period_frames", 512))),
+        "RB_AUDIO_PERIODS": str(int(cfg.get("audio.periods", 4))),
         "RB_AUDIO_CUE_MIRROR": "1" if cfg.get("audio.cue_mirror") else "0",
         "RB_AUDIO_CUE_ON_2CH": "1" if cfg.get("audio.cue_on_stereo") else "0",
         "STARTUP_MUTE_MS": str(int(cfg.get("audio.startup_mute_ms", 1500))),

@@ -31,6 +31,10 @@ DEFAULTS: dict = {
     },
     # ---- display -----------------------------------------------------------
     "display": {
+        # A PNG for the boot screen.  Nothing vendor-owned ships here, so
+        # none is bundled: point this at one you own, or drop it at
+        # /etc/rb4r5/boot-logo.png.  The player's own firmware carries one.
+        "boot_logo": None,
         "fbdev": "/dev/fb0",
         # The UI the RX3 renders; the patched DirectFB driver scales this to
         # whatever the real framebuffer mode is.  Do not change.

@@ -47,6 +47,42 @@ class Canvas:
             start = line * self.stride + x0 * self.bpp
             self.buf[start:start + len(row)] = row
 
+    def round_rect(self, x: int, y: int, w: int, h: int,
+                   colour: tuple[int, int, int], radius: int = 0,
+                   bottom: tuple[int, int, int] | None = None) -> None:
+        """A rectangle with its corners taken off, optionally shaded.
+
+        Square corners and one flat colour are what make a drawn button look
+        drawn.  A few pixels of radius and a slight top-to-bottom shade are
+        most of the difference between that and something that belongs on a
+        player.
+        """
+        if w <= 0 or h <= 0:
+            return
+        radius = max(0, min(radius, min(w, h) // 2))
+        for line in range(max(0, y), min(self.h, y + h)):
+            dy = line - y
+            inset = 0
+            if radius:
+                # how far in this row starts, following the corner arc
+                if dy < radius:
+                    edge = radius - dy - 1
+                elif dy >= h - radius:
+                    edge = dy - (h - radius)
+                else:
+                    edge = -1
+                if edge >= 0:
+                    span = radius * radius - edge * edge
+                    reach = int(span ** 0.5) if span > 0 else 0
+                    inset = radius - reach
+            if bottom is None:
+                shade = colour
+            else:
+                mix = dy / max(1, h - 1)
+                shade = tuple(int(round(colour[i] + (bottom[i] - colour[i]) * mix))
+                              for i in range(3))
+            self.rect(x + inset, line, w - 2 * inset, 1, shade)
+
     def frame(self, x: int, y: int, w: int, h: int,
               colour: tuple[int, int, int], thickness: int = 1) -> None:
         self.rect(x, y, w, thickness, colour)
@@ -97,6 +133,40 @@ class Canvas:
         return 1
 
     # -- output ------------------------------------------------------------
+    def image(self, x: int, y: int, width: int, height: int, rgba: bytes,
+              src_w: int, src_h: int,
+              under: tuple[int, int, int] = (0, 0, 0)) -> None:
+        """Draw RGBA pixels into the canvas, scaled to fit, over what is there.
+
+        Nearest neighbour: a logo is flat colour and a hard edge, and the
+        cheap resampler keeps the edge instead of smearing it.  Partly
+        transparent pixels are blended against `under`, the colour the canvas
+        was filled with.
+        """
+        if width <= 0 or height <= 0 or src_w <= 0 or src_h <= 0:
+            return
+        for row in range(max(0, -y), height):
+            line = y + row
+            if line < 0 or line >= self.h:
+                continue
+            sy = row * src_h // height
+            for col in range(max(0, -x), width):
+                column = x + col
+                if column < 0 or column >= self.w:
+                    continue
+                at = (sy * src_w + col * src_w // width) * 4
+                alpha = rgba[at + 3]
+                if not alpha:
+                    continue
+                pixel = rgba[at:at + 3]
+                if alpha < 255:
+                    # a logo sits on a flat background, so blend against the
+                    # colour it was drawn on rather than reading pixels back
+                    pixel = bytes(
+                        (pixel[i] * alpha + under[i] * (255 - alpha)) // 255
+                        for i in range(3))
+                self.rect(column, line, 1, 1, tuple(pixel))
+
     def blit(self, target: str = "/dev/fb0") -> None:
         """Copy the canvas into the framebuffer, one row per seek."""
         stride = self.info["line_length"]

@@ -379,18 +379,29 @@ are usually driven on Pioneer hardware. Narrow the walk with `--first` and
 
 ## The level meter lamps
 
-Which MIDI message lights which segment of the FLX4's meters is not
-published, so it is **not compiled in**. The bridge reads the master peak
-audioshim publishes and sends it wherever a map-file line says to:
+A DDJ-FLX4's channel meter is lit by **one message whose value is the
+level** — `ch1 CC 0x02` lights the whole left column — not by one message per
+segment. Found with `ledsweep`.
+
+The bridge reads the master peak audioshim publishes and sends it twenty
+times a second, scaled over 48 dBFS so the top of the travel behaves like a
+meter rather than a volume control. It only sends on a change, so an idle
+deck costs nothing.
+
+The defaults are `left = ch1 CC 0x02` and `right = ch2 CC 0x02`. A controller
+that numbers them differently needs a map file line, not a rebuild:
 
 ```
-meter ch<n> cc   <first> <segments per column>
-meter ch<n> note <first> <segments per column>
+meter <left|right> ch<n> <cc|note> <number>
+meter <left|right> off
 ```
 
-`<first>` is the lowest segment of the left column; the right column follows
-immediately after it. The scale is dBFS, so the top fifth is the red, as on
-the player. Until there is such a line the meters stay dark.
+On other hardware, find the numbers with:
 
-Find the numbers with `ledsweep`, then put the line in
-`/etc/rb4r5/flx4-map.conf` — no rebuild.
+```
+sudo python3 launch.py stop
+sudo python3 launch.py ledsweep --channel 1 --cc
+```
+
+It lights one lamp at a time, naming each message before it sends it, and
+turns everything back off on the way out.

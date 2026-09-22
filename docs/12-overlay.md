@@ -165,3 +165,37 @@ The picker was a 70% box in the middle of the screen. It held the player off
 while it was up, the master meter drew straight over it twenty times a
 second, and it had to be opened before it could tell you anything. All of
 that is gone: `Overlay.mode` is now only `none` or `splash`.
+
+## The look
+
+The palette is the player's own: near-black panels, cool grey lettering, the
+amber a selected control lights, and the cool blue of the trim. None of it is
+a brand asset — it is matched by eye so the launcher's bar does not look
+bolted onto the player's screen.
+
+Buttons and effect rows are drawn with `Canvas.round_rect()`: a few pixels of
+corner radius and a slight top-to-bottom shade. Square corners and one flat
+colour are most of what made them look drawn rather than moulded.
+
+**One text size per row.** Sizing each label to its own cell makes "ROLL"
+twice the height of "MOBIUS SAW", and a column of those reads as a jumble.
+`bar_scale()` and `fx_scale()` take the largest size *every* label fits in —
+the shortest name comes down to the longest one's size, not the other way
+round.
+
+## The boot screen
+
+A logo and a bar filling, on black. No words: the player's own boot screen
+has none, so neither does this. `draw_splash()` still takes a message and the
+launcher still logs it; it just does not go on the screen.
+
+Nothing vendor-owned ships with this project, so **no logo is bundled** — the
+same rule the firmware follows. Point `display.boot_logo` at a PNG you own,
+or drop one at `/etc/rb4r5/boot-logo.png`; the player's own firmware payload
+carries one, which is where most people will get it. Without a logo the boot
+screen is the bar on black, which is closer to the player's than any stand-in
+would be.
+
+`fb.read_png()` reads it: 8-bit, non-interlaced, greyscale or truecolour with
+or without alpha, and palette images. Anything else raises rather than
+drawing something wrong.

@@ -44,6 +44,7 @@ def build(info=None, **overrides):
     over.fx_index = 0
     over.mode = "none"
     over.splash_progress, over.splash_message = 0.0, ""
+    over._logo = None
     over.layout_buttons()
     return over
 
@@ -200,25 +201,91 @@ sent.clear()
 over.choose_fx(99)
 check(over.fx_index == len(over.fx) - 1, "an index past the end clamps")
 
-print("\n== the splash")
+print("\n== the boot screen")
+#
+# The player's own boot screen has no words on it, so neither does this: a
+# logo, a bar filling, and black.  Nothing vendor-owned ships here, so no
+# logo is bundled - without one it is the bar on black, which is closer to
+# the player's than any stand-in would be.
 screen = over.draw_splash(0.5, "loading", target=False)
 check(screen.w == over.layout.fw and screen.h == over.layout.fh,
-      "the splash covers the whole panel")
-srgb = fb.to_rgb(bytes(screen.buf),
-                 dict(screen.info, width=screen.w, height=screen.h,
-                      line_length=screen.stride))
+      "the boot screen covers the whole panel")
 
 
-def row_bright(y):
-    return sum(1 for x in range(0, screen.w, 4)
-               if sum(srgb[((y * screen.w + x) * 3):((y * screen.w + x) * 3) + 3]) > 300)
+_seen = {}
 
 
-bar_y = screen.h // 2 + screen.h // 14
-check(row_bright(bar_y + 1) > 10, "the progress bar is drawn")
-half = over.draw_splash(0.5, "x", target=False)
-full = over.draw_splash(1.0, "x", target=False)
-check(bytes(half.buf) != bytes(full.buf), "progress changes what is drawn")
+def _rgb(shot):
+    """Convert once: this is a 2880x1620 screen, not a thumbnail."""
+    key = id(shot)
+    if key not in _seen:
+        _seen[key] = fb.to_rgb(bytes(shot.buf),
+                               dict(shot.info, width=shot.w, height=shot.h,
+                                    line_length=shot.stride))
+    return _seen[key]
+
+
+def lit(shot, y):
+    rgb = _rgb(shot)
+    return sum(1 for x in range(0, shot.w, 16)
+               if sum(rgb[((y * shot.w + x) * 3):((y * shot.w + x) * 3) + 3]) > 300)
+
+
+def bar_row(shot):
+    """Find the brightest row: that is the bar, wherever it was put."""
+    return max(range(shot.h // 2, shot.h - 1, 2), key=lambda y: lit(shot, y))
+
+
+row = bar_row(screen)
+check(lit(screen, row) > 10, f"the bar is drawn (row {row})")
+
+quarter = over.draw_splash(0.25, target=False)
+full = over.draw_splash(1.0, target=False)
+check(lit(quarter, row) < lit(full, row),
+      "and it grows as the boot goes on")
+check(bytes(quarter.buf) != bytes(full.buf), "progress changes what is drawn")
+
+# nothing is written on it, whatever the caller passes
+wordy = over.draw_splash(0.5, "IMPORTING THE DATABASE", target=False)
+plain = over.draw_splash(0.5, target=False)
+check(bytes(wordy.buf) == bytes(plain.buf),
+      "a message does not put words on the boot screen")
+
+# a logo, when one is supplied
+import struct as _struct, zlib as _zlib, tempfile as _tf            # noqa: E402
+_w, _h = 16, 8
+_rows = bytearray()
+for _y in range(_h):
+    _rows.append(0)
+    _rows += bytes((255, 255, 255, 255)) * _w
+
+
+def _chunk(kind, body):
+    return (_struct.pack(">I", len(body)) + kind + body +
+            _struct.pack(">I", _zlib.crc32(kind + body)))
+
+
+_png = (b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", _struct.pack(">IIBBBBB", _w, _h, 8, 6, 0, 0, 0))
+        + _chunk(b"IDAT", _zlib.compress(bytes(_rows)))
+        + _chunk(b"IEND", b""))
+_logo = Path(_tf.mkdtemp()) / "logo.png"
+_logo.write_bytes(_png)
+
+check(fb.read_png(_logo)[:2] == (_w, _h), "a PNG reads back at its own size")
+
+over._logo = None
+over.cfg.set("display.boot_logo", str(_logo))
+with_logo = over.draw_splash(0.5, target=False)
+over._logo = None
+over.cfg.set("display.boot_logo", "/nonexistent/logo.png")
+without = over.draw_splash(0.5, target=False)
+check(bytes(with_logo.buf) != bytes(without.buf),
+      "a supplied logo is drawn on the boot screen")
+check(lit(without, bar_row(without)) > 10,
+      "and without one the bar is still there")
+over._logo = None
+over.cfg.set("display.boot_logo", None)
 
 print("\n== the state file tells the touch daemon to keep off")
 # The splash is the only thing that covers the picture now - the effect list

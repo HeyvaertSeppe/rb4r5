@@ -870,38 +870,46 @@ static const char *note_name(int ch, int note)
 
 /* ---------------- the level meter lamps ----------------
  *
- * The FLX4's meters are lit by the host, and which message lights which
- * segment is not published.  So the mapping is not compiled in: a map file
- * line says where to send it, and until there is one the meters stay dark
- * and the log says how to find out.
+ * A DDJ-FLX4's channel meter is lit by ONE message whose VALUE is the level -
+ * ch1 CC 0x02 lights the whole left column - not by one message per segment.
+ * (Found with `launch.py ledsweep`; see docs/06-controller.md.)
  *
- *     meter ch<n> cc <first> <count>      # <count> CCs from <first>
- *     meter ch<n> note <first> <count>    # ... or notes
+ * Where each column comes from is a map file line, so a controller that
+ * numbers them differently needs no rebuild:
  *
- * Find the numbers with:  sudo python3 launch.py ledsweep --channel <n>
+ *     meter <left|right> ch<n> <cc|note> <number>
  *
  * The levels come from audioshim, which publishes the master peak it is
  * actually sending to the card (docs/05-audio.md).
  */
 #define LEVELS_PATH "/tmp/rb-levels.dat"
 
-static int       g_meter_ch    = -1;    /* -1 = not mapped, nothing is sent */
-static int       g_meter_note  = 0;     /* notes instead of control changes */
-static int       g_meter_first = 0;
-static int       g_meter_count = 0;
-static long long g_meter_at    = 0;
-static int       g_meter_last[2] = { -1, -1 };
+struct meter_out {
+    int ch;                 /* MIDI channel, -1 = not mapped */
+    int note;               /* send a note instead of a control change */
+    int number;             /* the CC or note number */
+    int last;               /* what was sent last, so it is only sent on change */
+};
 
-static void meter_send(int column, int lit)
+/* Confirmed on a DDJ-FLX4: the left column is ch1 CC 0x02.  The right is the
+ * same control one channel up, which is how the pair is laid out on every
+ * Pioneer controller this could be checked against - change it here or in
+ * the map file if yours differs. */
+static struct meter_out g_meter[2] = {
+    { 0, 0, 0x02, -1 },     /* left  */
+    { 1, 0, 0x02, -1 },     /* right */
+};
+static long long g_meter_at = 0;
+
+static void meter_send(int column, int level)
 {
-    int base = g_meter_first + column * g_meter_count;
-    int status = (g_meter_note ? 0x90 : 0xb0) | (g_meter_ch & 0x0f);
+    struct meter_out *out = &g_meter[column];
 
-    if (g_meter_last[column] == lit)
+    if (out->ch < 0 || out->last == level)
         return;
-    g_meter_last[column] = lit;
-    for (int seg = 0; seg < g_meter_count; seg++)
-        midi_send3(status, base + seg, seg < lit ? 0x7f : 0x00);
+    out->last = level;
+    midi_send3((out->note ? 0x90 : 0xb0) | (out->ch & 0x0f),
+               out->number, level & 0x7f);
 }
 
 static void meter_tick(void)
@@ -911,7 +919,7 @@ static void meter_tick(void)
     int fd;
     ssize_t n;
 
-    if (g_meter_ch < 0 || g_meter_count <= 0)
+    if (g_meter[0].ch < 0 && g_meter[1].ch < 0)
         return;
     t = now_ms();
     if (t - g_meter_at < 50)              /* twenty times a second is plenty */
@@ -930,17 +938,17 @@ static void meter_tick(void)
         int32_t full = record[4] ? record[4] : 8388607;
         for (int column = 0; column < 2; column++) {
             int32_t peak = record[1 + column];
-            int lit = 0;
+            int level = 0;
             if (peak > 0 && full > 0) {
-                /* dBFS, so the top of the scale behaves like a meter: the
-                 * last fifth is the red, as on the RX3 */
+                /* dBFS over 48 dB, so the top of the scale behaves like a
+                 * meter rather than like a volume control */
                 double db = 20.0 * log10((double)peak / (double)full);
                 double share = (db + 48.0) / 48.0;
                 if (share < 0.0) share = 0.0;
                 if (share > 1.0) share = 1.0;
-                lit = (int)(share * g_meter_count + 0.5);
+                level = (int)(share * 127.0 + 0.5);
             }
-            meter_send(column, lit);
+            meter_send(column, level);
         }
     }
 }
@@ -1023,19 +1031,25 @@ static void load_map_file(const char *path)
                      schan, got >= 7 ? signed_norm : 0, "(map file)");
             n++;
         } else if (!strcmp(kind, "meter")) {
-            char how[16];
-            int first = 0, count = 0;
-            int got = sscanf(line, "%15s %15s %15s %i %i",
-                             kind, chs, how, &first, &count);
+            char which[16], how[16];
+            int number = 0;
+            int got = sscanf(line, "%15s %15s %15s %15s %i",
+                             kind, which, chs, how, &number);
             if (got < 5) { logmsg("flx4: bad map line: %s", line); continue; }
-            g_meter_ch    = parse_ch(chs) - 1;
-            if (g_meter_ch < 0) g_meter_ch = 0;
-            g_meter_note  = !strcmp(how, "note");
-            g_meter_first = first;
-            g_meter_count = count;
-            logmsg("flx4: level meters on ch%d, %d %s from %#x\n",
-                   g_meter_ch + 1, count, g_meter_note ? "notes" : "CCs",
-                   first);
+            int column = !strcmp(which, "right") ? 1 : 0;
+            if (!strcmp(chs, "off") || !strcmp(how, "off")) {
+                g_meter[column].ch = -1;
+                logmsg("flx4: %s level meter off\n", which);
+            } else {
+                g_meter[column].ch = parse_ch(chs) - 1;
+                if (g_meter[column].ch < 0) g_meter[column].ch = 0;
+                g_meter[column].note = !strcmp(how, "note");
+                g_meter[column].number = number;
+                g_meter[column].last = -1;
+                logmsg("flx4: %s level meter on ch%d %s %#x\n", which,
+                       g_meter[column].ch + 1,
+                       g_meter[column].note ? "note" : "CC", number);
+            }
             n++;
         } else {
             logmsg("flx4: unknown map directive '%s'\n", kind);

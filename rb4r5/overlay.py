@@ -42,24 +42,31 @@ MODAL_FILE = "/tmp/rb-overlay.modal"    # while this exists the player holds off
 FRAMES_FILE = "/tmp/rb-frames.dat"      # the driver's frame counter
 
 # --- colours, near enough to the RX3's own panel ---------------------------
-BG          = (10, 11, 14)
-BUTTON_BG   = (26, 28, 34)
-BUTTON_EDGE = (52, 56, 66)
-LABEL       = (196, 202, 214)
-LIT_BG      = (196, 150, 40)          # the amber the RX3 lights its buttons
-LIT_LABEL   = (16, 14, 10)
-ACCENT      = (70, 160, 255)
-PICK_BG     = (16, 18, 23)
-PICK_EDGE   = (70, 160, 255)
+# The player's own scheme: near-black panels, cool grey lettering, and the
+# amber that lights a selected control.  Nothing here is a brand asset - it
+# is the palette the hardware uses, matched by eye so the launcher's bar does
+# not look bolted onto the player's screen.
+BG          = (8, 9, 12)              # the panel between the controls
+BUTTON_TOP  = (34, 37, 44)            # a button body, lit from above
+BUTTON_BOT  = (22, 24, 29)
+BUTTON_EDGE = (58, 63, 74)
+LABEL       = (208, 214, 226)
+LIT_TOP     = (255, 176, 44)          # the amber a selected control lights
+LIT_BOT     = (226, 138, 18)
+LIT_LABEL   = (18, 14, 6)
+LIT_EDGE    = (255, 206, 120)
+ACCENT      = (0, 156, 222)           # the cool blue of the player's own trim
 # the meter, in the RX3's own three bands
-METER_OK    = (60, 210, 120)
-METER_WARM  = (230, 190, 50)
-METER_HOT   = (235, 60, 50)
-METER_OFF   = (28, 30, 36)
-# the effect list down the left border: the selected one in the RX3's amber
-FX_ON_BG    = LIT_BG
+METER_OK    = (54, 206, 122)
+METER_WARM  = (240, 196, 48)
+METER_HOT   = (238, 62, 48)
+METER_OFF   = (24, 26, 31)
+# the effect list down the left border
+FX_ON_BG    = LIT_TOP
+FX_ON_BOT   = LIT_BOT
 FX_ON       = LIT_LABEL
-FX_OFF      = (128, 134, 148)
+FX_OFF      = (138, 145, 160)
+FX_ROW      = (16, 18, 22)            # an unselected row, barely lifted
 
 # Beat FX, in the order the player steps through them.  Choosing one sends
 # that many steps of the player's own FX-select control, so the ORDER is what
@@ -149,6 +156,7 @@ class Overlay:
         self.fx = [str(name).upper() for name in
                    load_json(cfg.get("overlay.fx_file"), DEFAULT_FX)]
         self.fx_index = 0                  # what we believe is selected
+        self._logo = None                  # None = not looked yet, () = none
         self.mode = "none"                 # none | splash
         self.splash_progress = 0.0
         self.splash_message = ""
@@ -178,25 +186,77 @@ class Overlay:
                             self.layout.fw, self.layout.bar_h)
         bar.fill(BG)
         pad = max(3, self.layout.bar_h // 12)
+        height = self.layout.bar_h - 2 * pad
+        radius = max(2, height // 6)
+
+        # One size for every label, chosen so the longest still fits.  Picking
+        # a size per button makes a row of buttons look like a ransom note.
+        scale = self.bar_scale(pad)
+
         for button in self.buttons:
             lit = button.lit or (button.until > time.monotonic())
-            body = LIT_BG if lit else BUTTON_BG
+            top = LIT_TOP if lit else BUTTON_TOP
+            bottom = LIT_BOT if lit else BUTTON_BOT
             ink = LIT_LABEL if lit else LABEL
-            bar.rect(button.x, pad, button.w, self.layout.bar_h - 2 * pad, body)
-            bar.frame(button.x, pad, button.w, self.layout.bar_h - 2 * pad,
-                      ACCENT if lit else BUTTON_EDGE, max(1, pad // 3))
-            scale = bar.fit_scale(button.label, button.w - pad * 4,
-                                  self.layout.bar_h - pad * 5)
+            bar.round_rect(button.x, pad, button.w, height, top, radius, bottom)
+            bar.round_rect(button.x, pad, button.w, 1,
+                           LIT_EDGE if lit else BUTTON_EDGE, radius)
             bar.text_centred(button.x + button.w // 2,
                              (self.layout.bar_h - font.text_height(scale)) // 2,
                              button.label, ink, scale)
+        # the player's own trim line under the row
+        bar.rect(0, self.layout.bar_h - 1, self.layout.fw, 1, ACCENT)
         if target is not False:
             bar.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return bar
 
+    def bar_scale(self, pad: int) -> int:
+        """One text size for the whole row: the largest every label fits in."""
+        probe = canvas.Canvas(self.layout.info, 0, 0, 1, 1)
+        sizes = [probe.fit_scale(button.label, button.w - pad * 4,
+                                 self.layout.bar_h - pad * 5)
+                 for button in self.buttons]
+        return min(sizes) if sizes else 1
+
     # -- the splash --------------------------------------------------------
+    def boot_logo(self) -> tuple[int, int, bytes] | None:
+        """The image on the boot screen, if there is one to show.
+
+        Nothing vendor-owned ships with this project, so no logo is bundled
+        - the same rule the firmware follows (docs/03-payload.md).  Point
+        `display.boot_logo` at a PNG you own and it is used; the player's own
+        firmware payload carries one, which is where most people will get it.
+        Without one the boot screen is the bar on black, which is closer to
+        the player's than any stand-in would be.
+        """
+        if self._logo is not None:
+            return self._logo or None
+        self._logo = ()                      # remember that we looked
+        wanted = self.cfg.get("display.boot_logo")
+        places = [wanted] if wanted else []
+        places += [str(Path(self.cfg.chroot) / "root/gui/logo.png"),
+                   "/etc/rb4r5/boot-logo.png"]
+        for place in places:
+            if not place or not Path(place).exists():
+                continue
+            try:
+                self._logo = fb.read_png(place)
+                util.info(f"overlay: boot logo from {place} "
+                          f"({self._logo[0]}x{self._logo[1]})")
+                return self._logo
+            except (OSError, ValueError) as exc:
+                util.warn(f"overlay: cannot use {place} as the boot logo "
+                          f"({exc})")
+        return None
+
     def draw_splash(self, progress: float = 0.0, message: str = "",
                     target: str | None = None) -> canvas.Canvas:
+        """The boot screen: a logo and a bar filling, and nothing else.
+
+        The player's own boot screen has no words on it, so neither does
+        this.  `message` is still accepted and still logged by the caller -
+        it just does not go on the screen.
+        """
         self.splash_progress = max(0.0, min(1.0, progress))
         self.splash_message = message or self.splash_message
         screen = canvas.Canvas(self.layout.info, 0, 0,
@@ -204,29 +264,31 @@ class Overlay:
         screen.fill(BG)
 
         cx, cy = self.layout.fw // 2, self.layout.fh // 2
-        title = "XDJ-RX3"
-        tscale = screen.fit_scale(title, self.layout.fw // 2,
-                                  self.layout.fh // 6, cap=24)
-        screen.text_centred(cx, cy - font.text_height(tscale) - self.layout.fh // 12,
-                            title, LABEL, tscale)
 
-        sub = "ON RASPBERRY PI 5"
-        sscale = max(1, tscale // 4)
-        screen.text_centred(cx, cy - self.layout.fh // 20, sub, (110, 118, 132),
-                            sscale)
-
-        # the progress bar: a thin white line filling left to right
+        # the bar sits below the middle, where the player puts it
         bar_w = self.layout.fw // 3
         bar_h = max(4, self.layout.fh // 180)
-        bx, by = cx - bar_w // 2, cy + self.layout.fh // 14
-        screen.rect(bx, by, bar_w, bar_h, (38, 41, 48))
-        screen.rect(bx, by, int(bar_w * self.splash_progress), bar_h,
-                    (235, 238, 245))
+        bx, by = cx - bar_w // 2, cy + self.layout.fh // 10
+        screen.round_rect(bx, by, bar_w, bar_h, (30, 33, 40), bar_h // 2)
+        filled = int(bar_w * self.splash_progress)
+        if filled > 0:
+            screen.round_rect(bx, by, filled, bar_h, (238, 241, 248),
+                              bar_h // 2)
 
-        if self.splash_message:
-            mscale = max(1, tscale // 6)
-            screen.text_centred(cx, by + bar_h * 4, self.splash_message.upper(),
-                                (120, 128, 142), mscale)
+        logo = self.boot_logo()
+        if logo:
+            src_w, src_h, rgba = logo
+            # a third of the width, never more than a sixth of the height,
+            # and never scaled up past its own size
+            width = min(src_w * 4, self.layout.fw // 3)
+            height = round(width * src_h / src_w)
+            ceiling = self.layout.fh // 6
+            if height > ceiling:
+                height = ceiling
+                width = round(height * src_w / src_h)
+            screen.image(cx - width // 2, by - self.layout.fh // 12 - height,
+                         width, height, rgba, src_w, src_h, under=BG)
+
         if target is not False:
             screen.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return screen
@@ -281,6 +343,20 @@ class Overlay:
                 return index
         return None
 
+    def fx_scale(self, w: int, h: int) -> int:
+        """One text size for the whole list: the largest every name fits in.
+
+        Sized per row, "ROLL" comes out twice the height of "MOBIUS SAW" and
+        the list reads as a jumble.  The shortest name has to come down to
+        the longest one's size, not the other way round.
+        """
+        if not self.fx:
+            return 1
+        probe = canvas.Canvas(self.layout.info, 0, 0, 1, 1)
+        rows = self.fx_rows(w, h)
+        return min(probe.fit_scale(name, w - 8, height - 6)
+                   for name, _top, height in rows)
+
     def draw_fx_strip(self, target: str | None = None) -> canvas.Canvas | None:
         """The effect list, with the selected one lit."""
         x, y, w, h = self.fx_rect()
@@ -288,14 +364,19 @@ class Overlay:
             return None
         strip = canvas.Canvas(self.layout.info, x, y, w, h)
         strip.fill(BG)
+        scale = self.fx_scale(w, h)
+        text_h = font.text_height(scale)
+        radius = max(2, w // 12)
+
         for index, (name, top, height) in enumerate(self.fx_rows(w, h)):
             live = index == self.fx_index
+            body_h = height - 2
             if live:
-                strip.rect(0, top, w, height - 1, FX_ON_BG)
-            scale = strip.fit_scale(name, w - 4, height - 4)
-            text_h = font.text_height(scale)
-            strip.text(2, top + max(0, (height - text_h) // 2), name,
-                       FX_ON if live else FX_OFF, scale)
+                strip.round_rect(0, top, w, body_h, FX_ON_BG, radius, FX_ON_BOT)
+            else:
+                strip.round_rect(0, top, w, body_h, FX_ROW, radius)
+            strip.text_centred(w // 2, top + max(0, (body_h - text_h) // 2),
+                               name, FX_ON if live else FX_OFF, scale)
         if target is not False:
             strip.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return strip

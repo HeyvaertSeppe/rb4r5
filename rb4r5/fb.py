@@ -394,3 +394,117 @@ def legend(info: dict) -> list[str]:
         "  * the dashed rectangle is where the player's UI will be drawn",
     ]
     return lines
+
+
+# --------------------------------------------------------------------------
+# reading a PNG, for the boot logo
+# --------------------------------------------------------------------------
+_PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+
+def read_png(path) -> tuple[int, int, bytes]:
+    """A PNG on disk -> (width, height, RGBA bytes).
+
+    Enough of the format for a logo: 8 bits per channel, not interlaced,
+    greyscale or truecolour with or without alpha.  Anything else raises,
+    because a boot screen that draws something wrong is worse than one that
+    says it could not read the file.
+    """
+    import struct
+    import zlib
+
+    blob = Path(path).read_bytes()
+    if blob[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+
+    at = 8
+    width = height = depth = colour = 0
+    idat = bytearray()
+    palette = b""
+    trns = b""
+    while at + 8 <= len(blob):
+        length, kind = struct.unpack(">I4s", blob[at:at + 8])
+        body = blob[at + 8:at + 8 + length]
+        at += 12 + length                      # header + body + CRC
+        if kind == b"IHDR":
+            (width, height, depth, colour,
+             _comp, _filt, interlace) = struct.unpack(">IIBBBBB", body)
+            if depth != 8:
+                raise ValueError(f"{depth}-bit PNG: only 8-bit is supported")
+            if interlace:
+                raise ValueError("interlaced PNG is not supported")
+            if colour not in _PNG_CHANNELS:
+                raise ValueError(f"colour type {colour} is not supported")
+        elif kind == b"PLTE":
+            palette = body
+        elif kind == b"tRNS":
+            trns = body
+        elif kind == b"IDAT":
+            idat += body
+        elif kind == b"IEND":
+            break
+
+    if not width or not height:
+        raise ValueError("no image header")
+    channels = _PNG_CHANNELS[colour]
+    raw = zlib.decompress(bytes(idat))
+    stride = width * channels
+    if len(raw) < (stride + 1) * height:
+        raise ValueError("truncated image data")
+
+    # undo the per-row filters
+    out = bytearray(stride * height)
+    previous = bytearray(stride)
+    pos = 0
+    for row in range(height):
+        method = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        if method == 1:                        # Sub
+            for i in range(channels, stride):
+                line[i] = (line[i] + line[i - channels]) & 0xff
+        elif method == 2:                      # Up
+            for i in range(stride):
+                line[i] = (line[i] + previous[i]) & 0xff
+        elif method == 3:                      # Average
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                line[i] = (line[i] + ((left + previous[i]) >> 1)) & 0xff
+        elif method == 4:                      # Paeth
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                up = previous[i]
+                upleft = previous[i - channels] if i >= channels else 0
+                guess = left + up - upleft
+                dl, du, dul = (abs(guess - left), abs(guess - up),
+                               abs(guess - upleft))
+                near = left if (dl <= du and dl <= dul) else (
+                    up if du <= dul else upleft)
+                line[i] = (line[i] + near) & 0xff
+        elif method != 0:
+            raise ValueError(f"unknown row filter {method}")
+        out[row * stride:(row + 1) * stride] = line
+        previous = line
+
+    # and widen whatever it is to RGBA
+    rgba = bytearray(width * height * 4)
+    for index in range(width * height):
+        src = index * channels
+        dst = index * 4
+        if colour == 0:
+            grey = out[src]
+            rgba[dst:dst + 4] = bytes((grey, grey, grey, 255))
+        elif colour == 2:
+            rgba[dst:dst + 3] = out[src:src + 3]
+            rgba[dst + 3] = 255
+        elif colour == 3:
+            entry = out[src] * 3
+            rgba[dst:dst + 3] = palette[entry:entry + 3]
+            rgba[dst + 3] = trns[out[src]] if out[src] < len(trns) else 255
+        elif colour == 4:
+            grey = out[src]
+            rgba[dst:dst + 4] = bytes((grey, grey, grey, out[src + 1]))
+        else:
+            rgba[dst:dst + 4] = out[src:src + 4]
+    return width, height, bytes(rgba)

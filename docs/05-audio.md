@@ -433,3 +433,16 @@ function begins by asking:
 A new interposed function must make that check its first line. Forgetting it
 does not fail loudly — it returns success and silently breaks the layer
 underneath.
+
+There is a fourth kind, `H_NONE`, for a **null** handle. The engine really
+does call `snd_pcm_close(NULL)` — it is in the logs. That was harmless while
+anything unrecognised was swallowed; the moment unrecognised came to mean
+"hand it to alsa-lib", a null handle became a `SIGSEGV` inside alsa-lib. It
+belongs to nobody, so nothing happens to it.
+
+Two accessors still cannot be told apart, because they take only a
+`snd_pcm_hw_params_t` and no handle: `snd_pcm_hw_params_get_channels_min()`
+and `..._max()`, which always answer 2 for the stereo stream the engine
+believes in. If alsa-lib is ever seen making its own channel decisions
+through those public accessors rather than its internal ones, that is the
+place to look.

@@ -234,6 +234,7 @@ static int (*real_snd_pcm_hw_params_set_channels)(snd_pcm_t *, snd_pcm_hw_params
 static int (*real_snd_pcm_hw_params_set_rate_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
 static int (*real_snd_pcm_hw_params_set_period_size_near)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *) = NULL;
 static int (*real_snd_pcm_hw_params_set_periods_near)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
+static int (*real_test_rate)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int) = NULL;
 static int (*real_snd_pcm_sw_params_current)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
 static int (*real_snd_pcm_sw_params_get_boundary)(const snd_pcm_sw_params_t *, snd_pcm_uframes_t *) = NULL;
 static int (*real_snd_pcm_sw_params_set_silence_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
@@ -294,6 +295,7 @@ static void init_real_alsa(void)
     real_snd_pcm_hw_params_set_rate_near = dlsym(lib, "snd_pcm_hw_params_set_rate_near");
     real_snd_pcm_hw_params_set_period_size_near = dlsym(lib, "snd_pcm_hw_params_set_period_size_near");
     real_snd_pcm_hw_params_set_periods_near = dlsym(lib, "snd_pcm_hw_params_set_periods_near");
+    real_test_rate = dlsym(lib, "snd_pcm_hw_params_test_rate");
     real_snd_pcm_sw_params_current = dlsym(lib, "snd_pcm_sw_params_current");
     real_snd_pcm_sw_params_get_boundary = dlsym(lib, "snd_pcm_sw_params_get_boundary");
     real_snd_pcm_sw_params_set_silence_threshold = dlsym(lib, "snd_pcm_sw_params_set_silence_threshold");
@@ -411,14 +413,22 @@ static inline int is_real(snd_pcm_t *pcm)
 #define H_ALSA    0     /* alsa-lib's internal slave - pass through */
 #define H_MASTER  1     /* the master, as the engine holds it */
 #define H_VIRTUAL 2     /* one of our fake streams */
+#define H_NONE    3     /* no handle at all - do nothing, touch nothing */
 
 static int whose(snd_pcm_t *pcm)
 {
+    /* The engine really does call snd_pcm_close(NULL), among others.  That
+     * used to land in "not one of mine, return 0" and was harmless; now that
+     * anything unrecognised is passed through to alsa-lib, a null handle
+     * would be dereferenced inside it.  It is nobody's, so nothing happens
+     * to it. */
+    if (!pcm)
+        return H_NONE;
     if (pcm == (snd_pcm_t *)&g_h_master || pcm == (snd_pcm_t *)&g_h_hp ||
         pcm == (snd_pcm_t *)&g_h_booth  || pcm == (snd_pcm_t *)&g_h_dummy ||
         pcm == (snd_pcm_t *)&g_h_cap)
         return H_VIRTUAL;
-    if (pcm && pcm == g_real_playback)
+    if (pcm == g_real_playback)
         return H_MASTER;
     return H_ALSA;
 }
@@ -853,9 +863,10 @@ static void apply_sw_params(void)
 int snd_pcm_close(snd_pcm_t *pcm)
 {
     init_real_alsa();
+    alog("audioshim: snd_pcm_close(handle=%p)\n", pcm);
     if (whose(pcm) == H_ALSA)
         return real_snd_pcm_close ? real_snd_pcm_close(pcm) : 0;
-    if (whose(pcm) == H_VIRTUAL)
+    if (whose(pcm) != H_MASTER)
         return 0;
 
     /* The master.  Do NOT close the card: the engine opens and closes it
@@ -876,6 +887,8 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
     snd_pcm_t *donor;
 
     init_real_alsa();
+    if (whose(pcm) == H_NONE || !params)
+        return 0;
     if (whose(pcm) != H_VIRTUAL)
         return real_snd_pcm_hw_params_any ?
                real_snd_pcm_hw_params_any(pcm, params) : 0;
@@ -975,8 +988,9 @@ int snd_pcm_hw_params_get_channels_max(const snd_pcm_hw_params_t *params, unsign
 int snd_pcm_hw_params_test_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int rate)
 {
     cfg_init();
+    init_real_alsa();
     if (whose(pcm) == H_ALSA)
-        return 0;
+        return real_test_rate ? real_test_rate(pcm, params, rate) : 0;
     return ((int)rate == g_rate) ? 0 : -EINVAL;
 }
 
@@ -1131,6 +1145,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         return real_snd_pcm_writei ?
                real_snd_pcm_writei(pcm, buffer, size) : (snd_pcm_sframes_t)size;
     if (!buffer || size == 0) return size;
+    if (whose(pcm) == H_NONE) return size;
 
     if (size > MAX_FRAMES)
         size = MAX_FRAMES;

@@ -81,7 +81,10 @@ int snd_pcm_open(void **pcm, const char *name, int stream, int mode)
 }
 
 static int n_closed = 0;
-int snd_pcm_close(void *pcm) { (void)pcm; n_closed++; return 0; }
+static int nulls_seen = 0;
+int fake_nulls(void) { return nulls_seen; }
+int snd_pcm_close(void *pcm)
+{ if (!pcm) nulls_seen++; n_closed++; return 0; }
 int fake_closed_count(void) { return n_closed; }
 int snd_pcm_drop(void *pcm) { (void)pcm; return 0; }
 int snd_pcm_hw_free(void *pcm) { (void)pcm; return 0; }
@@ -98,7 +101,8 @@ int snd_pcm_hw_params_any(void *pcm, void *params)
 
 static int applied_access = -1;
 int snd_pcm_hw_params(void *a, void *b)
-{ (void)b; if (a == (void *)&slave_pcm) slave_configured++; return 0; }
+{ (void)b; if (!a) nulls_seen++;
+  if (a == (void *)&slave_pcm) slave_configured++; return 0; }
 int snd_pcm_hw_params_set_access(void *a, void *b, int c)
 { (void)a;(void)b; applied_access = c; return 0; }
 int fake_access(void) { return applied_access; }
@@ -144,7 +148,7 @@ int snd_pcm_sw_params_set_stop_threshold(void *a, void *b, unsigned long c)
 { (void)a;(void)b; sw_stop = (int)c; return 0; }
 int snd_pcm_sw_params(void *a, void *b) { (void)a;(void)b; sw_applied++; return 0; }
 int snd_pcm_prepare(void *a)
-{ if (a == (void *)&slave_pcm) slave_prepared++; return 0; }
+{ if (!a) nulls_seen++; if (a == (void *)&slave_pcm) slave_prepared++; return 0; }
 int snd_pcm_hw_params_get_period_size(const void *a, unsigned long *b, int *c)
 { (void)a;(void)c; if (b) *b = 512; return 0; }
 int snd_pcm_hw_params_get_buffer_size(const void *a, unsigned long *b)
@@ -389,6 +393,28 @@ with tempfile.TemporaryDirectory() as tmp:
     lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params), 0)
     check("while the engine's master is still handled here",
           asound.fake_access(), -1)
+
+    # --- a handle that is not a handle ----------------------------------
+    #
+    # The engine really does call snd_pcm_close(NULL) - it is in the logs.
+    # That was harmless while anything unrecognised was swallowed; once
+    # unrecognised means "pass it to alsa-lib", a null handle is a SIGSEGV
+    # inside alsa-lib.  It belongs to nobody, so nothing may happen to it.
+    before = asound.fake_nulls()
+    lib.snd_pcm_close(None)
+    lib.snd_pcm_prepare(None)
+    lib.snd_pcm_hw_params(None, ctypes.byref(params))
+    lib.snd_pcm_hw_params_any(None, ctypes.byref(params))
+    lib.snd_pcm_hw_params_set_access(None, ctypes.byref(params), 3)
+    lib.snd_pcm_sw_params(None, ctypes.byref(params))
+    lib.snd_pcm_sw_params_set_stop_threshold(None, ctypes.byref(params),
+                                             ctypes.c_ulong(128))
+    check("a null handle never reaches alsa-lib", asound.fake_nulls(), before)
+
+    lib.snd_pcm_writei.restype = ctypes.c_long
+    check("and a null handle does not crash the write path",
+          lib.snd_pcm_writei(None, ctypes.create_string_buffer(64), 
+                             ctypes.c_ulong(8)), 8)
 
     # --- what a sample actually says ------------------------------------
     #

@@ -76,8 +76,12 @@
 #define K_SYNC        0x4112
 #define K_JOG_TOUCH   0x4306
 #define K_JOG_ROT     0x4305
-#define K_TEMPO_RANGE 0x4107
-#define K_TEMPO_SLIDER 0x4109
+/* The tempo (pitch) fader is 0x4107 - op 5, f in [-1..+1] with 0 at the
+ * detent - verified against onKey_TempoSlider -> DjEngineIF::setTempoSlider
+ * in the SC Live 4 port.  These two were the other way round, so the fader
+ * was driving whatever 0x4109 is. */
+#define K_TEMPO_SLIDER 0x4107
+#define K_TEMPO_RANGE  0x4109
 #define K_ALOOP       0x4114
 #define K_HOTCUE      0x4113
 #define K_SLIPLOOP    0x4115

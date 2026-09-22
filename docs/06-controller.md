@@ -438,3 +438,58 @@ masterlevel ch<n> cc <number>
 
 The bridge publishes the position to `/tmp/rb-master.dat`, which is what the
 launcher's meter reads.
+
+## The keycodes, checked against a verified port
+
+Every keycode this port uses was compared against the SC Live 4 / knobshim2
+work, which drives the **same engine** and was verified on live hardware.
+Thirty-nine agreed. Two did not, and both were real bugs:
+
+### BEAT FX SELECT is a fourteen-position switch
+
+```c
+send_rx_key(K_BFXTYPE, OP_VALUE, CH_GLOBAL, g_fx_type_pos);
+```
+
+`onEv_BeatEffectType(SW_BFX_TYPE)` takes **op 5 VALUE** carrying the **switch
+position, 0..13**. Not a rotate with a delta. Not a rotate with a 10-bit
+absolute position. Not a button press. All three were tried on hardware and
+the player stayed on DELAY every time.
+
+Because what is sent *is* the position, the order of the effect list has to
+be the selector's order. The list was also wrong — it carried DJM-900
+effects (ENIGMA JET, MOBIUS SAW, MOBIUS TRI) and was missing four of the
+RX3's. If the player lands on a different effect from the one tapped, fix the
+order in `fx-list.json`; the mechanism is right.
+
+### The tempo fader is 0x4107
+
+`onKey_TempoSlider` → `DjEngineIF::setTempoSlider(ch, f)`, op 5, `f` in
+[-1..+1] with 0 at the detent. This project had `0x4107` and `0x4109` the
+other way round, so the pitch fader was driving whatever `0x4109` is.
+
+### Aliases that sent the wrong control
+
+`play1` / `play2` and `cue1` / `cue2` are gone. There is **one** play key and
+the deck is the channel — `0x4102` is CUE, not deck 2's play, and `0x4104` is
+VINYL, not deck 2's cue. Use `play 1` / `play 2`.
+
+`tools/tests/test_keycodes.py` pins all of this so it cannot drift back.
+
+## What the LEDs would take
+
+rbp computes its real LED state into **`uif::LedStat`** and encodes it for the
+panel's micons, sent to `/dev/subucom_spi1.0` — which this port stubs as a
+FIFO and does not decode. So the lights here are *modelled* from what we
+send, which is right until the player changes something by itself.
+
+Matching the player exactly needs one of two things, and neither is a guess
+that can be made from here:
+
+* **decode the panel link** — `launch.py subucom --learn` captures it while a
+  named control changes, which is the data that would make the decode
+  possible; or
+* **read `LedStat` in-process** — the pointer chain is
+  `IUiObjManager::getLedManager()` → `LedManager+0x30`, with `Led` entries of
+  `0x2c` bytes holding id, channel and state. The addresses are specific to
+  each rbp build, so the RX3's have to be found in the RX3's binary.

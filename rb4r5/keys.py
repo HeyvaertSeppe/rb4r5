@@ -39,8 +39,12 @@ KEYS: dict[str, tuple[int, bool]] = {
     "cue": (0x4102, True),
     "sync": (0x4112, True),
     "master": (0x4111, True),
-    "temporange": (0x4107, True),
-    "tempo": (0x4109, True),
+    # The tempo (pitch) fader is 0x4107, op 5, f in [-1..+1] with 0 at the
+    # detent - verified in the SC Live 4 port against onKey_TempoSlider ->
+    # DjEngineIF::setTempoSlider.  These two were the other way round here,
+    # so the fader was driving whatever 0x4109 is instead.
+    "tempo": (0x4107, True),
+    "temporange": (0x4109, True),
     "loopin": (0x410C, True),
     "loopout": (0x410D, True),
     "reloop": (0x410E, True),
@@ -72,14 +76,33 @@ KEYS: dict[str, tuple[int, bool]] = {
     "beatprev": (0x4490, False),
     "beatnext": (0x4491, False),
     "tap": (0x4492, False),
-    # per-deck aliases kept for compatibility with the old press-key.sh
-    "play1": (0x4101, False),
-    "play2": (0x4102, False),
-    "cue1": (0x4103, False),
-    "cue2": (0x4104, False),
-    "load1": (0x4311, False),
-    "load2": (0x4312, False),
+    # more of the engine's keys, from the live-verified SC Live 4 port.
+    # Every code this project already had agreed with it; these are the ones
+    # it did not have at all.
+    "vinyl": (0x4104, True),          # VINYL / CDJ mode
+    "keylock": (0x4108, True),        # master tempo
+    "slip": (0x4110, True),
+    "searchfwd": (0x411F, True),
+    "searchrev": (0x4120, True),
+    "trackfwd": (0x4214, False),
+    "trackrev": (0x4215, False),
+    "masterlvl": (0x4403, False),
+    "mastercue": (0x4407, False),
+    "bfxtime": (0x448E, False),
+    "crush": (0x50A1, True),          # sound colour FX
+    "dubecho": (0x50A2, True),
+    "sweep": (0x50A3, True),
+    "noise": (0x50A4, True),
+    "space": (0x50A5, True),
+    "mic": (0x0814, False),
+    "effectquant": (0x0493, False),
 }
+
+# The old press-key.sh aliases are gone.  play1/play2 and cue1/cue2 read as
+# "deck 1's play, deck 2's play", and that is not how the engine works: there
+# is ONE play key and the deck is the channel.  0x4102 is CUE, not deck 2's
+# play, and 0x4104 is VINYL, not deck 2's cue - so those two sent the wrong
+# control entirely.  Use `play 1` / `play 2` and `cue 1` / `cue 2`.
 
 
 def resolve(name: str) -> int:

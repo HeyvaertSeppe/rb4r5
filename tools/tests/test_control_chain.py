@@ -220,7 +220,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a 14-bit fader arrives as a 10-bit value",
           "key=0000501e\n         op=4\n         ch=1\n         param=512" in text)
     check("the tempo slider arrives as a value op",
-          "key=00004109\n         op=5" in text)
+          "key=00004107\n         op=5" in text)
     check("the jog carries a rotate op", "key=00004305\n         op=4" in text)
 
     # Pads take their own path through the bridge (the note is computed from

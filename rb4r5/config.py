@@ -59,6 +59,11 @@ DEFAULTS: dict = {
     },
     # ---- overlay (what the launcher draws itself) ---------------------------
     "overlay": {
+        # How the player's BEAT FX selector is driven.  "position" sends an
+        # absolute 10-bit knob position, which is what a selector knob on the
+        # RX3 takes; "delta" and "tap" are here so the other two readings of
+        # that control can be tried without a rebuild.
+        "fx_mode": "position",
         "enabled": True,
         "buttons_file": "/etc/rb4r5/top-bar.json",
         "fx_file": "/etc/rb4r5/fx-list.json",

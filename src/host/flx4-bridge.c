@@ -51,6 +51,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <math.h>
 #include <poll.h>
 #include <time.h>
 #include <dirent.h>
@@ -867,6 +868,83 @@ static const char *note_name(int ch, int note)
     return "";
 }
 
+/* ---------------- the level meter lamps ----------------
+ *
+ * The FLX4's meters are lit by the host, and which message lights which
+ * segment is not published.  So the mapping is not compiled in: a map file
+ * line says where to send it, and until there is one the meters stay dark
+ * and the log says how to find out.
+ *
+ *     meter ch<n> cc <first> <count>      # <count> CCs from <first>
+ *     meter ch<n> note <first> <count>    # ... or notes
+ *
+ * Find the numbers with:  sudo python3 launch.py ledsweep --channel <n>
+ *
+ * The levels come from audioshim, which publishes the master peak it is
+ * actually sending to the card (docs/05-audio.md).
+ */
+#define LEVELS_PATH "/tmp/rb-levels.dat"
+
+static int       g_meter_ch    = -1;    /* -1 = not mapped, nothing is sent */
+static int       g_meter_note  = 0;     /* notes instead of control changes */
+static int       g_meter_first = 0;
+static int       g_meter_count = 0;
+static long long g_meter_at    = 0;
+static int       g_meter_last[2] = { -1, -1 };
+
+static void meter_send(int column, int lit)
+{
+    int base = g_meter_first + column * g_meter_count;
+    int status = (g_meter_note ? 0x90 : 0xb0) | (g_meter_ch & 0x0f);
+
+    if (g_meter_last[column] == lit)
+        return;
+    g_meter_last[column] = lit;
+    for (int seg = 0; seg < g_meter_count; seg++)
+        midi_send3(status, base + seg, seg < lit ? 0x7f : 0x00);
+}
+
+static void meter_tick(void)
+{
+    int32_t record[5];
+    long long t;
+    int fd;
+    ssize_t n;
+
+    if (g_meter_ch < 0 || g_meter_count <= 0)
+        return;
+    t = now_ms();
+    if (t - g_meter_at < 50)              /* twenty times a second is plenty */
+        return;
+    g_meter_at = t;
+
+    fd = open(LEVELS_PATH, O_RDONLY);
+    if (fd < 0)
+        return;
+    n = read(fd, record, sizeof(record));
+    close(fd);
+    if (n < (ssize_t)sizeof(record))
+        return;
+
+    {
+        int32_t full = record[4] ? record[4] : 8388607;
+        for (int column = 0; column < 2; column++) {
+            int32_t peak = record[1 + column];
+            int lit = 0;
+            if (peak > 0 && full > 0) {
+                /* dBFS, so the top of the scale behaves like a meter: the
+                 * last fifth is the red, as on the RX3 */
+                double db = 20.0 * log10((double)peak / (double)full);
+                double share = (db + 48.0) / 48.0;
+                if (share < 0.0) share = 0.0;
+                if (share > 1.0) share = 1.0;
+                lit = (int)(share * g_meter_count + 0.5);
+            }
+            meter_send(column, lit);
+        }
+    }
+}
+
 /* ---------------- optional map file ----------------
  * Lines (# starts a comment):
  *    note <midi_ch> <note> <keycode> <send_ch|deck> [name...]
@@ -943,6 +1021,21 @@ static void load_map_file(const char *path)
             add_cc14(midich, num, key,
                      !strcmp(ops, "value") ? OP_VALUE : OP_ROTATE,
                      schan, got >= 7 ? signed_norm : 0, "(map file)");
+            n++;
+        } else if (!strcmp(kind, "meter")) {
+            char how[16];
+            int first = 0, count = 0;
+            int got = sscanf(line, "%15s %15s %15s %i %i",
+                             kind, chs, how, &first, &count);
+            if (got < 5) { logmsg("flx4: bad map line: %s", line); continue; }
+            g_meter_ch    = parse_ch(chs) - 1;
+            if (g_meter_ch < 0) g_meter_ch = 0;
+            g_meter_note  = !strcmp(how, "note");
+            g_meter_first = first;
+            g_meter_count = count;
+            logmsg("flx4: level meters on ch%d, %d %s from %#x\n",
+                   g_meter_ch + 1, count, g_meter_note ? "notes" : "CCs",
+                   first);
             n++;
         } else {
             logmsg("flx4: unknown map directive '%s'\n", kind);
@@ -1355,6 +1448,7 @@ static void run_device(int fd)
             break;
         }
         fx_lamp_tick();
+        meter_tick();
         if (pr == 0) {
             jog_tick();
             continue;

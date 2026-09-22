@@ -301,12 +301,21 @@ class Overlay:
         return strip
 
     def choose_fx(self, index: int, resync: bool = False) -> str:
-        """Step the player's effect selector to the one that was chosen.
+        """Put the player's effect selector on the effect that was chosen.
 
-        There is no way to ask the player which effect is selected, so the
-        index is tracked here.  A long press on a row says "it is already on
-        this one" and re-syncs without sending anything, which is the repair
-        when the two drift apart.
+        BEAT FX SELECT is a *selector knob* on the RX3, not a button and not
+        an endless encoder, so the engine wants an ABSOLUTE position:
+
+            op 4 ROTATE: param = 10-bit absolute (faders, EQ, trim,
+                         crossfader) or relative delta (browse knob)
+
+        Sending a delta of +1 reads as position 1 out of 1023 - the very
+        bottom of the knob's travel, which is the first effect in the list.
+        That is why it sat on DELAY however many times it was pressed.  A
+        press and release does nothing at all, because it is not a button.
+
+        One message puts the knob where it needs to be, so there is no
+        stepping and no wrapping: up and down cost the same.
         """
         count = len(self.fx)
         index = max(0, min(index, count - 1))
@@ -314,21 +323,28 @@ class Overlay:
             self.fx_index = index
             return f"marked {self.fx[index]} as the selected effect"
 
-        # Send exactly what the controller's own BEAT FX SELECT button sends:
-        # a press and a release of the FX-type key, which is how the engine
-        # is built to be told to move on.  A rotate carries a delta and the
-        # engine does nothing with it.
-        #
-        # A button only goes one way, so the route is forwards through the
-        # end of the list and round.
-        steps = (index - self.fx_index) % count
-        for _ in range(steps):
-            keys.tap_ctrl("bfxtype", 1)
-            time.sleep(0.02)
+        span = max(1, count - 1)
+        norm = index / span
+        ten_bit = min(1023, max(0, round(norm * 1023)))
+        mode = str(self.cfg.get("overlay.fx_mode", "position")).lower()
+
+        if mode == "tap":
+            steps = (index - self.fx_index) % count
+            for _ in range(steps):
+                keys.tap_ctrl("bfxtype", 1)
+                time.sleep(0.02)
+        elif mode == "delta":
+            steps = index - self.fx_index
+            for _ in range(abs(steps)):
+                keys.rotate("bfxtype", 1, 1 if steps > 0 else -1)
+                time.sleep(0.02)
+        else:
+            keys.rotate("bfxtype", 1, ten_bit, norm,
+                        min(16383, max(0, round(norm * 16383))))
+
         self.fx_index = index
-        if not steps:
-            return f"{self.fx[index]} was already selected"
-        return f"selected {self.fx[index]} ({steps} step(s) on)"
+        return (f"selected {self.fx[index]} "
+                f"({mode} {ten_bit}/1023)")
 
     def step_fx(self, direction: int) -> str:
         """Move the selection one effect down (+1) or up (-1)."""

@@ -376,3 +376,21 @@ lights, and put it in `/etc/rb4r5/flx4-map.conf`.
 `--cc` sweeps control changes instead of notes, which is how level-meter LEDs
 are usually driven on Pioneer hardware. Narrow the walk with `--first` and
 `--last`, and slow it down with `--hold`.
+
+## The level meter lamps
+
+Which MIDI message lights which segment of the FLX4's meters is not
+published, so it is **not compiled in**. The bridge reads the master peak
+audioshim publishes and sends it wherever a map-file line says to:
+
+```
+meter ch<n> cc   <first> <segments per column>
+meter ch<n> note <first> <segments per column>
+```
+
+`<first>` is the lowest segment of the left column; the right column follows
+immediately after it. The scale is dBFS, so the top fifth is the red, as on
+the player. Until there is such a line the meters stay dark.
+
+Find the numbers with `ledsweep`, then put the line in
+`/etc/rb4r5/flx4-map.conf` — no rebuild.

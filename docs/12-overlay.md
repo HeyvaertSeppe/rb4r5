@@ -130,19 +130,34 @@ at all before: the branch in the bridge that handles it returns before
 
 ### How the effect actually changes
 
-Choosing an effect sends what the controller's own BEAT FX SELECT button
-sends — a press and a release of the FX-type key — once per step. It used to
-send a *rotate* carrying a delta, and the engine does nothing with that,
-which is why tapping an effect moved the highlight and changed nothing in the
-player.
+BEAT FX SELECT is a **selector knob** on the RX3 — not a button, and not an
+endless encoder. The engine therefore wants an absolute position:
 
-A button only goes one way, so "up" is the long way round: `(target - current)
-mod count` steps forward. There is no way to ask the player which effect is
-selected, so the index is tracked in the launcher; if the two drift apart, a
-long press on the right row puts them back in step.
+```
+op 4 ROTATE: param = 10-bit absolute (faders, EQ, trim, crossfader)
+             or relative delta (browse knob)
+```
 
-The order in the list is what matters, not the spelling — it has to match the
-order the player cycles through. Fix it in `/etc/rb4r5/fx-list.json`.
+Sending a delta of `+1` reads as position **1 out of 1023** — the bottom of
+the knob's travel, which is the first effect in the list. That is why it sat
+on DELAY however many times it was pressed. A press and release does nothing
+at all, because it is not a button.
+
+One message puts the knob where it belongs, so there is no stepping and no
+wrapping: up and down cost the same.
+
+| effect | position |
+|---|---|
+| first (DELAY) | 0 |
+| middle | ~511 |
+| last | 1023 |
+
+If that reading of the control turns out to be wrong too, the other two can
+be tried without a rebuild:
+
+```
+sudo python3 launch.py config --set overlay.fx_mode=delta   # or: tap
+```
 
 ### There is no popup any more
 

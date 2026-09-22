@@ -20,8 +20,9 @@ all: $(TOOLS)
 $(OUT):
 	mkdir -p $(OUT)
 
+# -lm: the level meters scale in dBFS, like the ones on the player
 $(OUT)/flx4-bridge: flx4-bridge.c | $(OUT)
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(OUT)/rbkeyd: rbkeyd.c | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $<

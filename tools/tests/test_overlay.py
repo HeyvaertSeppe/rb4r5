@@ -149,37 +149,48 @@ over.fx_index = 0
 over.step_fx(-1)
 check(over.fx_index == len(over.fx) - 1, "and up from the top wraps to the end")
 
-print("\n== choosing an effect steps the player's selector to it")
+print("\n== choosing an effect puts the player's selector on it")
 #
-# The effect is chosen by sending what the controller's own BEAT FX SELECT
-# button sends: a press and a release of the FX-type key.  A rotate carries a
-# delta and the engine does nothing with it - which is why tapping an effect
-# moved the highlight here and changed nothing in the player.  A button only
-# goes one way, so the route is forwards and round.
+# BEAT FX SELECT is a selector KNOB on the RX3 - not a button, not an endless
+# encoder - so the engine wants an absolute position:
+#
+#   op 4 ROTATE: param = 10-bit absolute (faders, EQ, trim, crossfader)
+#                or relative delta (browse knob)
+#
+# A delta of +1 reads as position 1 out of 1023: the bottom of the knob's
+# travel, which is the first effect.  That is why it sat on DELAY however
+# many times it was pressed, and why a press and release did nothing at all.
 sent = []
 import rb4r5.keys as keys                                  # noqa: E402
-keys.tap_ctrl = lambda *a, **k: sent.append(a)
-keys.rotate = lambda *a, **k: sent.append(("ROTATE",) + a)
+keys.rotate = lambda *a, **k: sent.append(a)
+keys.tap_ctrl = lambda *a, **k: sent.append(("TAP",) + a)
 count = len(over.fx)
 
-over.fx_index = 2
-over.choose_fx(6)
-check(len(sent) == 4, f"2 -> 6 is four steps on ({len(sent)} sent)")
-check(all(s[0] == "bfxtype" for s in sent),
-      "each one is the FX-type key")
-check(not any(s[0] == "ROTATE" for s in sent),
-      "and none of them is a rotate, which the engine ignores")
-check(over.fx_index == 6, "and the tracked index follows")
+over.fx_index = 0
+over.choose_fx(7)
+check(len(sent) == 1, f"one message puts the knob where it belongs ({len(sent)})")
+check(sent[0][0] == "bfxtype", "on the FX-type control")
+check(not any(s[0] == "TAP" for s in sent),
+      "and it is not a button press, which that control ignores")
+_key, _ch, ten_bit, norm, pos14 = sent[0]
+check(ten_bit == round(7 / (count - 1) * 1023),
+      f"the position is where that effect sits on the knob ({ten_bit}/1023)")
+check(abs(norm - 7 / (count - 1)) < 0.001, "with a matching normalised value")
+check(pos14 == round(7 / (count - 1) * 16383), "and the raw 14-bit position")
+check(over.fx_index == 7, "and the tracked index follows")
 
 sent.clear()
-over.choose_fx(1)
-check(len(sent) == (1 - 6) % count,
-      f"6 -> 1 wraps forward rather than going back ({len(sent)} sent)")
-check(over.fx_index == 1, "and lands on the right effect")
-
+over.choose_fx(0)
+check(sent[0][2] == 0, "the first effect is the bottom of the travel")
 sent.clear()
-over.choose_fx(1)
-check(sent == [], "choosing the effect already selected sends nothing")
+over.choose_fx(count - 1)
+check(sent[0][2] == 1023, "and the last is the top")
+
+# up and down cost the same now - there is no stepping and no wrapping
+sent.clear()
+over.fx_index = 1
+over.choose_fx(0)
+check(len(sent) == 1, "going up is one message, not a lap of the list")
 
 sent.clear()
 over.choose_fx(9, resync=True)

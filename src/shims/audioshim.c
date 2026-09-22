@@ -251,6 +251,8 @@ static int (*real_get_channels)(const snd_pcm_hw_params_t *, unsigned int *) = N
 static int (*real_get_rate)(const snd_pcm_hw_params_t *, unsigned int *, int *) = NULL;
 static int (*real_get_period_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *, int *) = NULL;
 static int (*real_get_buffer_size)(const snd_pcm_hw_params_t *, snd_pcm_uframes_t *) = NULL;
+static int (*real_hw_malloc)(snd_pcm_hw_params_t **) = NULL;
+static void (*real_hw_free)(snd_pcm_hw_params_t *) = NULL;
 static int (*real_sw_malloc)(snd_pcm_sw_params_t **) = NULL;
 static void (*real_sw_free)(snd_pcm_sw_params_t *) = NULL;
 static int (*real_sw_set_avail_min)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
@@ -308,6 +310,8 @@ static void init_real_alsa(void)
     real_get_rate = dlsym(lib, "snd_pcm_hw_params_get_rate");
     real_get_period_size = dlsym(lib, "snd_pcm_hw_params_get_period_size");
     real_get_buffer_size = dlsym(lib, "snd_pcm_hw_params_get_buffer_size");
+    real_hw_malloc = dlsym(lib, "snd_pcm_hw_params_malloc");
+    real_hw_free = dlsym(lib, "snd_pcm_hw_params_free");
     real_sw_malloc = dlsym(lib, "snd_pcm_sw_params_malloc");
     real_sw_free = dlsym(lib, "snd_pcm_sw_params_free");
     real_sw_set_avail_min = dlsym(lib, "snd_pcm_sw_params_set_avail_min");
@@ -451,6 +455,8 @@ static int pick_device(char *out, size_t n)
     return 0;
 }
 
+static int configure_real_device(void);
+
 /* Open the first device of RB_AUDIO_DEV (comma separated) that works. */
 static void open_real_playback(int mode)
 {
@@ -504,8 +510,14 @@ static void open_real_playback(int mode)
         }
         alog("audioshim: opened real '%s' for Master (mode=%d), res=%d handle=%p\n",
              p, mode, err, g_real_playback);
-        if (err == 0 && g_real_playback)
+        if (err == 0 && g_real_playback) {
+            /* Configure it now, from our own parameters, while nothing else
+             * has touched it. */
+            if (configure_real_device() < 0)
+                alog("audioshim: the device opened but could not be set up; "
+                     "the write path will try again\n");
             return;
+        }
         g_real_playback = NULL;
     }
     alog("audioshim: NO usable playback device (last res=%d) - the transport "
@@ -600,6 +612,125 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
          "software, with no sound\n");
     *pcm = (snd_pcm_t *)&g_h_master;
     return 0;
+}
+
+/* Configure the real device ourselves, from a clean parameter set.
+ *
+ * The engine's snd_pcm_hw_params_t describes the RX3's own output, and it is
+ * built by calls this shim intercepts - so it arrives carrying whatever the
+ * engine refined it against.  Applying it to a USB controller has now failed
+ * three times over, each for a different reason, and the last one could not
+ * even be named: hw_params returned 0, sw_params returned 0, prepare()
+ * returned 0, and the device sat in SETUP refusing every write with EBADFD.
+ *
+ * So the real device stops being configured from the engine's struct.  This
+ * allocates its own, fills it from the device's actual capabilities, sets
+ * only what this shim needs, and applies it once.  The engine's own
+ * hw_params calls are accepted and ignored, exactly as its sw_params already
+ * are - they describe a device it is not writing to.
+ */
+static void apply_sw_params(void);
+
+static int configure_real_device(void)
+{
+    snd_pcm_hw_params_t *hw = NULL;
+    unsigned int rate = (unsigned)g_rate;
+    unsigned int periods = (unsigned)g_min_periods;
+    snd_pcm_uframes_t period = (snd_pcm_uframes_t)g_min_period;
+    int err, state;
+
+    if (!g_real_playback || !real_hw_malloc || !real_hw_free ||
+        !real_snd_pcm_hw_params_any || !real_snd_pcm_hw_params) {
+        alog("audioshim: cannot configure the device - alsa-lib did not give "
+             "up all the symbols needed for it\n");
+        return -1;
+    }
+    if (real_hw_malloc(&hw) < 0 || !hw)
+        return -1;
+
+    err = real_snd_pcm_hw_params_any(g_real_playback, hw);
+    if (err < 0) {
+        alog("audioshim: hw_params_any on the real device res=%d\n", err);
+        real_hw_free(hw);
+        return err;
+    }
+
+    if (real_snd_pcm_hw_params_set_access) {
+        err = real_snd_pcm_hw_params_set_access(g_real_playback, hw,
+                                                SND_PCM_ACCESS_RW_INTERLEAVED);
+        alog("audioshim: setup access=RW_INTERLEAVED res=%d\n", err);
+    }
+    if (real_snd_pcm_hw_params_set_format) {
+        err = real_snd_pcm_hw_params_set_format(g_real_playback, hw, g_format);
+        alog("audioshim: setup format=%d res=%d\n", g_format, err);
+    }
+    if (real_snd_pcm_hw_params_set_channels) {
+        err = real_snd_pcm_hw_params_set_channels(g_real_playback, hw,
+                                                  (unsigned)g_real_ch);
+        alog("audioshim: setup channels=%d res=%d\n", g_real_ch, err);
+        if (err < 0 && g_real_ch != 2) {
+            err = real_snd_pcm_hw_params_set_channels(g_real_playback, hw, 2);
+            alog("audioshim: %d channels refused, stereo res=%d\n",
+                 g_real_ch, err);
+            if (err >= 0)
+                g_real_ch = 2;
+        }
+    }
+    if (real_snd_pcm_hw_params_set_rate_near) {
+        err = real_snd_pcm_hw_params_set_rate_near(g_real_playback, hw,
+                                                   &rate, NULL);
+        alog("audioshim: setup rate=%u res=%d\n", rate, err);
+    }
+    if (real_snd_pcm_hw_params_set_period_size_near) {
+        err = real_snd_pcm_hw_params_set_period_size_near(g_real_playback, hw,
+                                                          &period, NULL);
+        alog("audioshim: setup period=%lu res=%d\n",
+             (unsigned long)period, err);
+    }
+    if (real_snd_pcm_hw_params_set_periods_near) {
+        err = real_snd_pcm_hw_params_set_periods_near(g_real_playback, hw,
+                                                      &periods, NULL);
+        alog("audioshim: setup periods=%u res=%d\n", periods, err);
+    }
+
+    err = real_snd_pcm_hw_params(g_real_playback, hw);
+    alog("audioshim: setup hw_params res=%d\n", err);
+    if (err >= 0) {
+        unsigned int gaccess = 0, gch = 0, grate = 0;
+        int gfmt = 0;
+        snd_pcm_uframes_t gperiod = 0, gbuffer = 0;
+        if (real_get_access) real_get_access(hw, &gaccess);
+        if (real_get_format) real_get_format(hw, &gfmt);
+        if (real_get_channels) real_get_channels(hw, &gch);
+        if (real_get_rate) real_get_rate(hw, &grate, NULL);
+        if (real_get_period_size) real_get_period_size(hw, &gperiod, NULL);
+        if (real_get_buffer_size) real_get_buffer_size(hw, &gbuffer);
+        if (gperiod) g_hw_period = gperiod;
+        if (gbuffer) g_hw_buffer = gbuffer;
+        if (gch) g_real_ch = (int)gch;
+        alog("audioshim: the device is now access=%u format=%d channels=%u "
+             "rate=%u period=%lu buffer=%lu (%.1f ms)\n",
+             gaccess, gfmt, gch, grate, (unsigned long)g_hw_period,
+             (unsigned long)g_hw_buffer,
+             grate ? (double)g_hw_buffer * 1000.0 / (double)grate : 0.0);
+    }
+    real_hw_free(hw);
+    if (err < 0)
+        return err;
+
+    apply_sw_params();
+
+    state = real_snd_pcm_state ? real_snd_pcm_state(g_real_playback) : -1;
+    if (state == 2 || state == 3) {
+        g_pcm_dead = 0;
+        g_pcm_fails = 0;
+        alog("audioshim: the device is ready to take audio (state %d)\n",
+             state);
+        return 0;
+    }
+    alog("audioshim: the device configured but will not leave state %d "
+         "(2 = PREPARED); writes are going to fail\n", state);
+    return -1;
 }
 
 /* Give the real device software parameters that match the buffer it really
@@ -728,67 +859,44 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
     return -EINVAL;
 }
 
+/* ---- the engine's hardware parameters -----------------------------------
+ *
+ * All of these are accepted and NOT applied to the real device.  The engine
+ * is describing the RX3's own output; configure_real_device() has already set
+ * up the one that actually exists, from its own clean parameter set, using
+ * numbers that suit it.  Feeding the engine's here is what left the device
+ * configured-but-unpreparable, and it took three separate repairs before the
+ * pattern was clear enough to stop doing it.
+ *
+ * They still have to SUCCEED: the engine checks, and a failure here stops it
+ * opening its audio at all.
+ */
 int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int access)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_access) {
-        /* Whatever the engine wants for its own device, THIS shim reaches the
-         * hardware through snd_pcm_writei(), and writei on a PCM configured
-         * for mmap access returns -EINVAL.  So the real device is always
-         * RW_INTERLEAVED. */
-        int err = real_snd_pcm_hw_params_set_access(g_real_playback, params,
-                                                    SND_PCM_ACCESS_RW_INTERLEAVED);
-        alog("audioshim: real set_access(req=%d -> %d RW_INTERLEAVED) res=%d\n",
-             access, SND_PCM_ACCESS_RW_INTERLEAVED, err);
-        return err;
-    }
+    (void)pcm; (void)params; (void)access;
     return 0;
 }
 
 int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int format)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_format) {
-        int err = real_snd_pcm_hw_params_set_format(g_real_playback, params, g_format);
-        alog("audioshim: real set_format(req=%d -> %d) res=%d\n", format, g_format, err);
-        return err;
-    }
+    (void)pcm; (void)params; (void)format;
     return 0;
 }
 
 int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_channels) {
-        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params,
-                                                      (unsigned)g_real_ch);
-        alog("audioshim: real set_channels(req=%u -> %d) res=%d\n", val, g_real_ch, err);
-        if (err < 0 && g_real_ch == 4) {
-            /* the device would not take 4 channels after all: fall back to
-             * stereo so the engine still gets its clock */
-            err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, 2);
-            alog("audioshim: 4ch refused, fell back to stereo res=%d\n", err);
-            if (err >= 0)
-                g_real_ch = 2;
-        }
-        return err;
-    }
+    (void)pcm; (void)params; (void)val;
     return 0;
 }
 
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_rate_near) {
-        if (val) *val = (unsigned)g_rate;
-        int err = real_snd_pcm_hw_params_set_rate_near(g_real_playback, params, val, dir);
-        alog("audioshim: real set_rate_near res=%d rate=%u\n", err, val ? *val : 0);
-        if (err >= 0 && val && (int)*val != g_rate) {
-            alog("audioshim: WARNING device runs at %u Hz, engine feeds %d Hz "
-                 "(use a plughw: device so alsa-lib resamples)\n", *val, g_rate);
-        }
-        return err;
-    }
+    (void)pcm; (void)params; (void)dir;
+    /* the engine reads this back and clocks itself from it */
     if (val) *val = (unsigned)g_rate;
     return 0;
 }
@@ -796,31 +904,14 @@ int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params,
 int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val, int *dir)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_period_size_near) {
-        snd_pcm_uframes_t asked = val ? *val : 0;
-        if (val && *val < g_min_period)
-            *val = (snd_pcm_uframes_t)g_min_period;
-        int err = real_snd_pcm_hw_params_set_period_size_near(g_real_playback, params, val, dir);
-        alog("audioshim: real set_period_size_near(req=%lu -> %lu) res=%d period=%lu\n",
-             (unsigned long)asked, (unsigned long)g_min_period, err,
-             val ? (unsigned long)*val : 0UL);
-        return err;
-    }
+    (void)pcm; (void)params; (void)dir; (void)val;
     return 0;
 }
 
 int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params_set_periods_near) {
-        unsigned int asked = val ? *val : 0;
-        if (val && *val < (unsigned)g_min_periods)
-            *val = (unsigned)g_min_periods;
-        int err = real_snd_pcm_hw_params_set_periods_near(g_real_playback, params, val, dir);
-        alog("audioshim: real set_periods_near(req=%u -> %lu) res=%d periods=%u\n",
-             asked, g_min_periods, err, val ? *val : 0);
-        return err;
-    }
+    (void)pcm; (void)params; (void)dir; (void)val;
     return 0;
 }
 
@@ -847,60 +938,16 @@ int snd_pcm_hw_params_test_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, uns
 int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
     init_real_alsa();
-    if (is_real(pcm) && real_snd_pcm_hw_params) {
-        int err;
-
-        /* The engine does not always ask for an access type - it leaves the
-         * RX3's device on whatever it defaults to.  Left alone, hw_params
-         * picks the first access the hardware offers, which for a USB card is
-         * mmap, and then every snd_pcm_writei() returns -EINVAL:
-         *
-         *   writei #1 frames=64 written=-22
-         *   the output device stopped accepting audio (Invalid argument)
-         *
-         * So set it here too, whether or not set_access was ever called. */
-        if (real_snd_pcm_hw_params_set_access) {
-            int aerr = real_snd_pcm_hw_params_set_access(
-                g_real_playback, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-            if (aerr < 0)
-                alog("audioshim: the device will not do RW_INTERLEAVED "
-                     "access (res=%d) - writei cannot work on it\n", aerr);
+    (void)params;
+    if (is_real(pcm)) {
+        /* Already configured at open.  If an earlier attempt left it
+         * unusable, this is a good moment to try again. */
+        int state = real_snd_pcm_state ? real_snd_pcm_state(g_real_playback) : -1;
+        if (state != 2 && state != 3) {
+            alog("audioshim: the engine is configuring its output and ours is "
+                 "in state %d; setting the device up again\n", state);
+            configure_real_device();
         }
-
-        err = real_snd_pcm_hw_params(g_real_playback, params);
-        alog("audioshim: real hw_params res=%d\n", err);
-        if (err >= 0) {
-            /* Say what the device actually settled on.  Every "no sound" so
-             * far has been one of these numbers not being what it looked
-             * like it should be, and reading them back beats inferring them
-             * from the set_* calls that led here. */
-            unsigned int access = 0, channels = 0, rate = 0;
-            int format = 0;
-            snd_pcm_uframes_t period = 0, buffer = 0;
-            if (real_get_access) real_get_access(params, &access);
-            if (real_get_format) real_get_format(params, &format);
-            if (real_get_channels) real_get_channels(params, &channels);
-            if (real_get_rate) real_get_rate(params, &rate, NULL);
-            if (real_get_period_size) real_get_period_size(params, &period, NULL);
-            if (real_get_buffer_size) real_get_buffer_size(params, &buffer);
-            alog("audioshim: the device is now access=%u (3 = RW_INTERLEAVED, "
-                 "which is what writei needs) format=%d channels=%u rate=%u "
-                 "period=%lu buffer=%lu (%.1f ms)\n",
-                 access, format, channels, rate, (unsigned long)period,
-                 (unsigned long)buffer,
-                 rate ? (double)buffer * 1000.0 / (double)rate : 0.0);
-            if (period) g_hw_period = period;
-            if (buffer) g_hw_buffer = buffer;
-            apply_sw_params();
-        }
-        if (err >= 0 && g_pcm_dead) {
-            /* A fresh, accepted configuration deserves a fresh chance: one
-             * bad write at startup should not silence the rest of the run. */
-            g_pcm_dead = 0;
-            g_pcm_fails = 0;
-            alog("audioshim: the device was reconfigured; trying it again\n");
-        }
-        return err;
     }
     return 0;
 }
@@ -1206,11 +1253,20 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
                 continue;
             }
             if (written == -EPIPE || written == -EINTR || written == -EBADFD) {
-                /* EPIPE is an underrun.  EBADFD means the stream is not in a
-                 * state that takes writes - prepare() puts it back.  Both are
-                 * worth recovering from rather than giving up on the device. */
+                /* EPIPE is an underrun: prepare() is the whole recovery.
+                 * EBADFD means the stream is not in a state that takes
+                 * writes at all, and if prepare() will not fix that, a full
+                 * re-setup is the only thing left that can. */
                 if (real_snd_pcm_prepare)
                     real_snd_pcm_prepare(g_real_playback);
+                if (written == -EBADFD && real_snd_pcm_state &&
+                    real_snd_pcm_state(g_real_playback) < 2 &&
+                    g_pcm_fails == 8) {
+                    alog("audioshim: prepare() will not bring the device out "
+                         "of state %d; setting it up again from scratch\n",
+                         real_snd_pcm_state(g_real_playback));
+                    configure_real_device();
+                }
                 if (++g_pcm_fails < 32)
                     continue;
             }

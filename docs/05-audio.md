@@ -360,3 +360,30 @@ is not actually writing to.
 
 `EBADFD` is now treated like `EPIPE` in the write loop — prepare and retry —
 rather than as a reason to give up on the device.
+
+## The real device is configured by the shim, not by the engine
+
+The engine's `snd_pcm_hw_params_t` describes the **RX3's own output**. Every
+value in it — access, format, channels, period, periods, and the software
+parameters derived from them — is right for local I2S hardware that is not
+present, and wrong for a USB controller that is. Applying it failed three
+separate times, each for a different reason, and the last failure could not be
+named at all: `hw_params` returned 0, `sw_params` returned 0, `prepare()`
+returned 0, and the device sat in SETUP refusing every write with `EBADFD`.
+
+So the real device is no longer configured from that struct. When it opens,
+`configure_real_device()` allocates its own `hw_params`, fills it from the
+device's actual capabilities with `hw_params_any()`, sets only what this shim
+needs, applies it once, applies matching software parameters, prepares, and
+verifies the state reached PREPARED.
+
+The engine's own calls — `set_access`, `set_format`, `set_channels`,
+`set_rate_near`, `set_period_size_near`, `set_periods_near`, `hw_params`, and
+every `sw_params` setter — are accepted and **not** applied. They must still
+*succeed*, because the engine checks the return value and will not open its
+audio otherwise; `set_rate_near` still reports back the rate, because the
+engine clocks itself from it.
+
+If the device is ever found outside PREPARED or RUNNING, the whole setup runs
+again: from `hw_params()` when the engine reconfigures, and from the write
+path when `prepare()` alone will not recover it.

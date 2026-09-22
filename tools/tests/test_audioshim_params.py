@@ -109,6 +109,9 @@ unsigned long fake_period(void) { return asked_period; }
 unsigned fake_periods(void) { return asked_periods; }
 static int sw_start = -1, sw_stop = -1, sw_applied = 0;
 static char sw_params_store[4096];
+static char hw_params_store[8192];
+int snd_pcm_hw_params_malloc(void **p) { *p = hw_params_store; return 0; }
+void snd_pcm_hw_params_free(void *p) { (void)p; }
 int snd_pcm_sw_params_malloc(void **p) { *p = sw_params_store; return 0; }
 void snd_pcm_sw_params_free(void *p) { (void)p; }
 int snd_pcm_sw_params_set_avail_min(void *a, void *b, unsigned long c)
@@ -118,6 +121,9 @@ int fake_sw_start(void) { return sw_start; }
 int fake_sw_stop(void) { return sw_stop; }
 int fake_sw_applied(void) { return sw_applied; }
 void fake_forget_sw(void) { sw_start = -1; sw_stop = -1; }
+void fake_forget(void)
+{ sw_start = -1; sw_stop = -1; applied_access = -1;
+  asked_period = 0; asked_periods = 0; }
 static unsigned long boundary_reply = 0x40000000;
 int snd_pcm_sw_params_get_boundary(const void *a, unsigned long *b)
 { (void)a; if (b) *b = boundary_reply; return 0; }
@@ -139,7 +145,9 @@ int snd_pcm_hw_params_get_format(const void *a, int *b) { (void)a; if (b) *b = 6
 int snd_pcm_hw_params_get_channels(const void *a, unsigned *b) { (void)a; if (b) *b = 4; return 0; }
 int snd_pcm_hw_params_get_rate(const void *a, unsigned *b, int *c) { (void)a;(void)c; if (b) *b = 44100; return 0; }
 long snd_pcm_writei(void *a, const void *b, unsigned long c) { (void)a;(void)b; return (long)c; }
-int snd_pcm_state(void *a) { (void)a; return 3; }
+static int pcm_state = 3;
+int snd_pcm_state(void *a) { (void)a; return pcm_state; }
+void fake_set_state(int n) { pcm_state = n; }
 int snd_ctl_open(void **a, const char *b, int c) { (void)b;(void)c; *a = (void *)1; return 0; }
 int snd_ctl_close(void *a) { (void)a; return 0; }
 """
@@ -273,82 +281,63 @@ with tempfile.TemporaryDirectory() as tmp:
     check("closing the master never closes the card",
           asound.fake_closed_count(), 0)
 
-    # --- the hardware buffer must be big enough for USB ----------------
+    # --- the device is configured by US, at open ------------------------
     #
-    # The engine asks for two periods of 64 frames: 2.9 ms, which suits the
-    # RX3's local I2S output and underruns on every period over USB, until
-    # the shim gives up on the device and there is no sound at all.
-    period = ctypes.c_ulong(64)
-    periods = ctypes.c_uint(2)
-    lib.snd_pcm_hw_params_set_period_size_near(
-        master2, ctypes.byref(params), ctypes.byref(period), None)
-    lib.snd_pcm_hw_params_set_periods_near(
-        master2, ctypes.byref(params), ctypes.byref(periods), None)
+    # The engine's parameters describe the RX3's own output.  Applying them
+    # to a USB controller failed three times over, the last time in a way
+    # that could not even be named: hw_params 0, sw_params 0, prepare 0, and
+    # the device sitting in SETUP refusing every write with EBADFD.  So the
+    # real device is configured from a clean parameter set of our own, once,
+    # when it is opened - and the engine's calls are accepted and ignored.
     asound.fake_period.restype = ctypes.c_ulong
-    check("a 64-frame period is raised to something USB can hold",
-          asound.fake_period(), 512)
-    check("and two periods become four", asound.fake_periods(), 4)
-
-    # a request that is already generous is left alone
-    period = ctypes.c_ulong(2048)
-    lib.snd_pcm_hw_params_set_period_size_near(
-        master2, ctypes.byref(params), ctypes.byref(period), None)
-    check("a period that is already large enough is not shrunk",
-          asound.fake_period(), 2048)
-
-    # --- access ---------------------------------------------------------
-    #
-    # This shim reaches the hardware through snd_pcm_writei(), and writei on
-    # a PCM configured for mmap access returns -EINVAL on every call:
-    #
-    #   writei #1 frames=64 written=-22
-    #   the output device stopped accepting audio (Invalid argument)
-    #
-    # The engine does not always ask for an access type at all, so setting it
-    # only when it does is not enough.
-    SND_PCM_ACCESS_MMAP_INTERLEAVED = 0
-    SND_PCM_ACCESS_RW_INTERLEAVED = 3
-
-    lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params),
-                                     SND_PCM_ACCESS_MMAP_INTERLEAVED)
-    check("an mmap access request is overridden, because writei cannot use it",
-          asound.fake_access(), SND_PCM_ACCESS_RW_INTERLEAVED)
-
-    # and it is set even when the engine never asks
-    asound.fake_forget_access()
-    lib.snd_pcm_hw_params(master2, ctypes.byref(params))
-    check("access is set by hw_params even when the engine never asked",
-          asound.fake_access(), SND_PCM_ACCESS_RW_INTERLEAVED)
-
-    # --- software parameters must match the REAL buffer -----------------
-    #
-    # Every hardware parameter is overridden for this device, so its buffer
-    # is nothing like the 128 frames the engine believes in.  Forwarding the
-    # engine's stop_threshold of 128 onto a 2048-frame buffer stops the
-    # stream the moment it is prepared - avail is the whole empty buffer,
-    # already past the threshold - and the first write returns EBADFD.
-    check("the shim applies software parameters of its own",
+    check("opening the master sets an access writei can use",
+          asound.fake_access(), 3)
+    check("and a period big enough for USB", asound.fake_period(), 512)
+    check("and enough periods to ride out a late write",
+          asound.fake_periods(), 4)
+    check("and software parameters of its own",
           asound.fake_sw_applied() > 0, True)
-    check("start_threshold comes from the real period, not the engine's",
+    check("start_threshold comes from the real period",
           asound.fake_sw_start(), 512)
     check("stop_threshold is the boundary, so an underrun cannot stop the "
           "stream", asound.fake_sw_stop(), 0x40000000)
 
+    # None of the engine's own hardware parameters may reach the device.
+    asound.fake_forget()
+    period = ctypes.c_ulong(64)
+    periods = ctypes.c_uint(2)
+    lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params), 0)
+    lib.snd_pcm_hw_params_set_period_size_near(
+        master2, ctypes.byref(params), ctypes.byref(period), None)
+    lib.snd_pcm_hw_params_set_periods_near(
+        master2, ctypes.byref(params), ctypes.byref(periods), None)
+    lib.snd_pcm_hw_params_set_channels(master2, ctypes.byref(params), 2)
+    lib.snd_pcm_hw_params_set_stop_threshold = getattr(
+        lib, "snd_pcm_sw_params_set_stop_threshold")
+    lib.snd_pcm_sw_params_set_stop_threshold(
+        master2, ctypes.byref(params), ctypes.c_ulong(128))
+    check("the engine's access never reaches the device",
+          asound.fake_access(), -1)
+    check("nor its 64-frame period", asound.fake_period(), 0)
+    check("nor its stop threshold", asound.fake_sw_stop(), -1)
+
     # A device can report a boundary of zero, and a stop_threshold of zero
     # stops the stream harder than any real value - it has to be computed
-    # rather than passed through.
+    # rather than passed straight through.
     asound.fake_boundary_says_zero()
-    asound.fake_forget_sw()
+    asound.fake_forget()
+    asound.fake_set_state(1)          # not PREPARED: forces a fresh setup
     lib.snd_pcm_hw_params(master2, ctypes.byref(params))
     check("a reported boundary of zero is never used as a stop threshold",
           asound.fake_sw_stop() > 2048, True)
+    asound.fake_set_state(3)
 
-    # and the engine's own values must never reach the device
-    asound.fake_forget_sw()
-    lib.snd_pcm_sw_params_set_stop_threshold(master2, ctypes.byref(params),
-                                             ctypes.c_ulong(128))
-    check("the engine's stop_threshold is not forwarded",
-          asound.fake_sw_stop(), -1)
+    # but every one of them must still SUCCEED, or the engine gives up on
+    # opening its audio at all
+    check("the engine's set_access still succeeds",
+          lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params), 0), 0)
+    check("and its hw_params still succeeds",
+          lib.snd_pcm_hw_params(master2, ctypes.byref(params)), 0)
 
     # --- what a sample actually says ------------------------------------
     #

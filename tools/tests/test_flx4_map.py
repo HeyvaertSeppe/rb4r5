@@ -57,22 +57,47 @@ for note, key, what in (
     (0x11, "K_LOOPOUT", "LOOP OUT"),
     (0x4D, "K_RELOOP", "RELOOP/EXIT"),
     (0x58, "K_SYNC", "BEAT SYNC"),
-    (0x1B, "K_HOTCUE", "PAD MODE hot cue"),
-    (0x20, "K_BEATJUMP", "PAD MODE beat jump"),
-    (0x6D, "K_ALOOP", "PAD MODE beat loop"),
-    (0x1E, "K_SLIPLOOP", "PAD MODE pad FX1 -> release FX"),
+    (0x51, "K_BEATPREV", "LOOP CALL left (halve the loop)"),
+    (0x53, "K_BEATNEXT", "LOOP CALL right (double the loop)"),
+    (0x50, "K_EFFECTQUANT", "SHIFT+RELOOP (quantize)"),
 ):
     check(f"note 0x{note:02X} is {what}", bound(note, key))
+
+print("\n== the pad-mode buttons")
+# These are NOT in the note table on purpose: it sends the key on every
+# press, and a second press of an RX3 bank key moves on to that bank's second
+# function - which is how release FX slid over to slip loop.  They go through
+# pad_modes[] / pad_mode_enter() instead, which sends nothing when the deck is
+# already in that bank.
+modes = SRC[SRC.index("} pad_modes[] = {"):]
+modes = modes[:modes.index("};")]
+for note, key, what in (
+    (0x1B, "K_HOTCUE", "hot cue"),
+    (0x20, "K_BEATJUMP", "beat jump"),
+    (0x6D, "K_ALOOP", "beat loop"),
+    (0x1E, "K_SLIPLOOP", "pad FX1 -> release FX"),
+):
+    check(f"note 0x{note:02X} selects {what}",
+          bool(re.search(rf"0x{note:02X},\s*{key}\b", modes, re.I)))
+    check(f"and note 0x{note:02X} is not in the note table too",
+          bound(note, key), False)
 
 check("the release FX bank is NOT on SAMPLER any more",
       bound(0x22, "K_SLIPLOOP"), False)
 
+enter = SRC[SRC.index("static void pad_mode_enter("):]
+enter = enter[:enter.index("\n}\n")]
+check("pressing the mode you are already in sends nothing",
+      "pad_mode_key[deck] == key" in enter and "return;" in enter)
+check("and a pad press enters its bank the same way",
+      "pad_mode_enter(deck, pad_bank_key(base))" in SRC)
+
 print("\n== the lamps")
 pad = SRC[SRC.index("static void handle_pad("):]
 pad = pad[:pad.index("\n}\n")]
-check("a pad lights", "led_set(ch, note, on)" in pad)
+check("a pad lights", "led_set(plain, note, lit)" in pad)
 check("and lights on the SHIFT channel too, or it goes dark under SHIFT",
-      "MC_PAD1_SH" in pad and "MC_PAD2_SH" in pad)
+      "led_set(shift, note, lit)" in pad)
 
 rules = SRC[SRC.index("static const struct led_rule led_rules[]"):]
 rules = rules[:rules.index("};")]
@@ -80,8 +105,27 @@ for key, what in (("K_PLAY", "play"), ("K_SYNC", "sync"),
                   ("K_RELOOP", "reloop"), ("K_MASTERCUE", "headphone cue"),
                   ("K_LOOPIN", "loop in"), ("K_LOOPOUT", "loop out")):
     check(f"{what} stays lit while it is on", key in rules)
-check("the four pad modes are one group, so only one lights",
-      rules.count("LED_RADIO"), 4)
+check("the pad modes light themselves, not through this table",
+      "K_HOTCUE" in rules, False)
+
+lamp = SRC[SRC.index("static void pad_mode_light("):]
+lamp = lamp[:lamp.index("\n}\n")]
+check("the mode you are in is lit and the other three are dark",
+      "pad_modes[i].key == key" in lamp)
+check("on the plain channel and the SHIFT one",
+      "MC_PAD1_SH" in lamp and "MC_PAD1" in lamp)
+
+print("\n== the lamps that have to stay put")
+check("a hot cue stays lit after the finger comes off",
+      "hotcue_set[deck][idx]" in pad)
+check("and SHIFT+pad, which deletes it, puts it out", "!shifted" in pad)
+
+reloop = SRC[SRC.index("if (on && notemap[i].key == K_RELOOP)"):]
+reloop = reloop[:reloop.index("}") + 1]
+check("RELOOP/EXIT puts the LOOP IN lamp out", "led_set(ch, 0x10, 0)" in reloop)
+check("and the LOOP OUT lamp", "led_set(ch, 0x11, 0)" in reloop)
+check("and forgets them, so one press relights them",
+      "led_forget(ch, 0x10)" in reloop)
 
 print("\n== the Beat FX channel switch")
 fxch = SRC[SRC.index("static int handle_fxch("):]

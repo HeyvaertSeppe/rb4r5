@@ -26,6 +26,12 @@ export.pdb
 *.pdb
 gui/
 
+# Host helpers, built by src/host/Makefile
+/src/host/flx4-bridge
+/src/host/rbkeyd
+/src/host/fakekbd
+/src/host/fbpublish
+
 # Local state
 *.bak
 *.rb4r5-tmp

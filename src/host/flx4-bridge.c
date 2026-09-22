@@ -119,6 +119,7 @@
 #define K_BFXCH       0x448c
 #define K_BFX         0x448d
 #define K_DEPTH       0x448f
+#define K_EFFECTQUANT 0x0493
 #define K_BEATPREV    0x4490
 #define K_BEATNEXT    0x4491
 #define K_TAP         0x4492
@@ -157,7 +158,11 @@ static const char *opt_overlay = "/tmp/rb-overlay.fifo";
  * to do) makes every turn look far slower than it is, and letting the
  * position run to 16 bits hands the engine an angle it cannot mean. */
 static float jog_ppr = 1800.0f;    /* engine units per revolution         */
-static float jog_tpr = 1800.0f;    /* FLX4 messages per revolution        */
+static float jog_tpr = 600.0f;     /* FLX4 messages per revolution        */
+/* 600 is the FLX4's, and it has to match controller.jog_ticks_per_rev in the
+ * config.  It was 1800 - the RX3's own wheel - so whenever /tmp/rb-jog.conf
+ * was missing the wheel came out three times too slow with nothing to say
+ * why. */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 static int   jog_touch_timeout_ms = 4000;  /* 0 = never let a touch go     */
 static int   jog_emit_ms = 10;     /* one speed per this many ms          */
@@ -586,7 +591,7 @@ static void jog_emit(struct jog *s, long long t)
 
     if (dt < 0.001f)
         dt = 0.001f;
-    revs = (float)s->pending / (jog_tpr > 0.5f ? jog_tpr : 1800.0f);
+    revs = (float)s->pending / (jog_tpr > 0.5f ? jog_tpr : 600.0f);
     s->pending = 0;
     s->last_emit_ms = t;
     s->moving = 1;
@@ -692,6 +697,7 @@ static void midi_send3(int status, int d1, int d2)
         logmsg("  (led write failed: %s)\n", strerror(errno));
 }
 
+
 static void led_set(int ch, int note, int on)
 {
     midi_send3(0x90 | (ch & 0x0f), note, on ? 0x7f : 0x00);
@@ -754,17 +760,26 @@ static const struct led_rule led_rules[] = {
     { K_MASTERCUE, LED_TOGGLE, 0 },   /* headphone CUE stays lit while on */
     { K_LOOPIN,   LED_TOGGLE, 0 },
     { K_LOOPOUT,  LED_TOGGLE, 0 },
-    /* the four pad modes are one group per deck */
-    { K_HOTCUE,   LED_RADIO,  1 },
-    { K_ALOOP,    LED_RADIO,  1 },
-    { K_SLIPLOOP, LED_RADIO,  1 },
-    { K_BEATJUMP, LED_RADIO,  1 },
+    /* The four pad modes were LED_RADIO here.  They no longer pass through
+     * this table at all - they light in pad_mode_light(), which is also the
+     * only place that knows the deck is in that bank - so the rules were
+     * dead.  LED_RADIO itself stays: it is what the kind field is for. */
 };
 
 /* the state we are showing, per (channel, note) */
 #define LED_MAX 128
 static struct { int ch, note, key, on, sch; } led_state[LED_MAX];
 static int led_n = 0;
+
+/* Drop what we think a lamp is showing, so the next press starts from off.
+ * A toggle lamp whose control was cancelled some other way (RELOOP takes the
+ * loop away) would otherwise need two presses to come back on. */
+static void led_forget(int ch, int note)
+{
+    for (int i = 0; i < led_n; i++)
+        if (led_state[i].ch == ch && led_state[i].note == note)
+            led_state[i].on = 0;
+}
 
 static int led_kind_of(int key, int *group)
 {
@@ -851,8 +866,6 @@ static void led_for_press(int ch, int note, int key, int sch, int on)
  *   base 0x60 BEAT LOOP    -> RX3 AUTO LOOP bank
  *   base 0x40 KEYBOARD, 0x70 KEY SHIFT, PAD FX  -> no RX3 equivalent
  */
-static int pad_bank[2] = { -1, -1 };
-
 static int pad_bank_key(int base)
 {
     switch (base) {
@@ -864,19 +877,106 @@ static int pad_bank_key(int base)
     }
 }
 
-static void pad_select_bank(int deck, int base)
+/* The pad-mode buttons.
+ *
+ * These used to go through the note table, which sends the key on every
+ * press - and pressing the RX3's bank key again moves it on to that bank's
+ * SECOND function.  So a second press of PAD FX1 slid release FX over to
+ * slip loop, and there was no way back.  Pressing a mode you are already in
+ * does nothing now.
+ *
+ * One deck is in exactly one bank, and BOTH ways in have to agree on which:
+ * the mode button, and pressing a pad that belongs to another bank.  They
+ * used to keep separate state, so after choosing a mode the first pad press
+ * sent the bank key a second time - the same slide, by the other door.  That
+ * is what pad_mode_key is for, and both paths go through pad_mode_enter().
+ */
+static int pad_mode_key[2] = { 0, 0 };
+
+static const struct { int note; int key; const char *name; } pad_modes[] = {
+    { 0x1B, K_HOTCUE,   "HOT CUE" },
+    { 0x6D, K_ALOOP,    "BEAT LOOP" },
+    { 0x20, K_BEATJUMP, "BEAT JUMP" },
+    { 0x1E, K_SLIPLOOP, "PAD FX1 (release FX)" },
+};
+
+/* The mode you are in is lit and the other three are dark, which is what the
+ * RX3 does.  Both the plain and the SHIFT channel are told, or the lamps go
+ * dark the moment a finger lands on SHIFT. */
+static void pad_mode_light(int deck, int key)
 {
-    int key = pad_bank_key(base);
-    if (!key || pad_bank[deck] == base)
-        return;
-    pad_bank[deck] = base;
-    send_tap(key, deck + 1);
+    int plain = deck == 0 ? MC_PAD1 : MC_PAD2;
+    int shift = deck == 0 ? MC_PAD1_SH : MC_PAD2_SH;
+    size_t i;
+
+    for (i = 0; i < sizeof(pad_modes) / sizeof(pad_modes[0]); i++) {
+        int lit = pad_modes[i].key == key;
+        led_set(plain, pad_modes[i].note, lit);
+        led_set(shift, pad_modes[i].note, lit);
+    }
 }
+
+/* Enter a bank.  Sends the RX3's bank key only if we are not already there,
+ * because a second press of it moves on to the bank's second function. */
+static void pad_mode_enter(int deck, int key)
+{
+    const char *name = "that bank";
+    size_t i;
+
+    if (!key)
+        return;
+    for (i = 0; i < sizeof(pad_modes) / sizeof(pad_modes[0]); i++)
+        if (pad_modes[i].key == key)
+            name = pad_modes[i].name;
+    pad_mode_light(deck, key);
+    if (pad_mode_key[deck] == key) {
+        if (opt_verbose)
+            logmsg("  pad mode deck%d already %s; not sending it again "
+                   "(that would move it on to the next bank)\n",
+                   deck + 1, name);
+        return;
+    }
+    pad_mode_key[deck] = key;
+    send_tap(key, deck + 1);
+    if (opt_verbose)
+        logmsg("  pad mode deck%d -> %s\n", deck + 1, name);
+}
+
+static int handle_padmode(int ch, int deck, int note, int on)
+{
+    size_t i;
+
+    (void)ch;
+    for (i = 0; i < sizeof(pad_modes) / sizeof(pad_modes[0]); i++)
+        if (pad_modes[i].note == note) {
+            if (on)                     /* a mode is chosen on the press */
+                pad_mode_enter(deck, pad_modes[i].key);
+            return 1;
+        }
+    return 0;
+}
+
+/* Hot cues do not follow the finger.
+ *
+ * On the RX3 a hot cue pad is lit when that slot holds a cue and dark when
+ * it does not, and on the FLX4 the pad was going dark again the instant it
+ * was released - "the hot cues don't light".  There is no cue-point feedback
+ * coming back from the player (that lives in uif::LedStat, which this port
+ * stubs), so the lamps follow what was just done on the pads instead: a
+ * plain press sets the cue, so the pad stays lit; SHIFT+pad deletes it, so
+ * it goes dark.  Loading a different track does not reach us, so the lamps
+ * can be a track behind until the pads are touched again.
+ */
+static int hotcue_set[2][8];
 
 static void handle_pad(int ch, int deck, int note, int on)
 {
     int base = (note >> 4) & 0x0F;
     int idx  = note & 0x0F;
+    int shifted = (ch == MC_PAD1_SH || ch == MC_PAD2_SH);
+    int plain = deck == 0 ? MC_PAD1 : MC_PAD2;
+    int shift = deck == 0 ? MC_PAD1_SH : MC_PAD2_SH;
+    int lit;
 
     if (opt_verbose)
         logmsg("  pad deck%d note 0x%02x (base 0x%x pad %d) %s%s\n",
@@ -893,11 +993,17 @@ static void handle_pad(int ch, int deck, int note, int on)
      * separate lamp state per channel, so a pad lit on ch 0x97 goes dark the
      * moment SHIFT is held unless ch 0x98 was told as well - which is why
      * hot cues and loops "stop working" whenever a finger is on SHIFT. */
-    led_set(ch, note, on);
-    led_set((ch == MC_PAD1 || ch == MC_PAD1_SH) ? MC_PAD1_SH : MC_PAD2_SH,
-            note, on);
+    if (base == 0x0) {
+        if (on)
+            hotcue_set[deck][idx] = !shifted;
+        lit = hotcue_set[deck][idx];
+    } else {
+        lit = on;
+    }
+    led_set(plain, note, lit);
+    led_set(shift, note, lit);
 
-    pad_select_bank(deck, base);
+    pad_mode_enter(deck, pad_bank_key(base));
     send_ctrl(K_PAD1 + idx, on ? OP_PRESS : OP_RELEASE, deck + 1, 0, 0.0f, 0);
 }
 
@@ -936,6 +1042,15 @@ static struct notemap notemap[NMAP_MAX] = {
      * so far, so this goes to MASTER CUE: the headphones follow, which is
      * most of what the button is for.  Bind it properly from the map file
      * once the right keycode is known. */
+    /* CUE/LOOP CALL arrows: halve and double the loop, which is what the
+     * RX3's BEAT arrows do to an active loop. */
+    { MC_DECK1, 0x51, K_BEATPREV, 0, "LOOP CALL < (halve the loop)" },
+    { MC_DECK2, 0x51, K_BEATPREV, 0, "LOOP CALL < (halve the loop)" },
+    { MC_DECK1, 0x53, K_BEATNEXT, 0, "LOOP CALL > (double the loop)" },
+    { MC_DECK2, 0x53, K_BEATNEXT, 0, "LOOP CALL > (double the loop)" },
+    /* SHIFT + RELOOP/EXIT toggles quantize */
+    { MC_DECK1, 0x50, K_EFFECTQUANT, CH_GLOBAL, "SHIFT+RELOOP (quantize)" },
+    { MC_DECK2, 0x50, K_EFFECTQUANT, CH_GLOBAL, "SHIFT+RELOOP (quantize)" },
     { MC_DECK1, 0x54, K_MASTERCUE, CH_GLOBAL, "headphone CUE (deck 1)" },
     { MC_DECK2, 0x54, K_MASTERCUE, CH_GLOBAL, "headphone CUE (deck 2)" },
     { MC_DECK1, 0x58, K_SYNC, 0, "BEAT SYNC" },
@@ -960,19 +1075,11 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_DECK2, 0x67, K_JOG_TOUCH, 0, "SHIFT+jog plate touch" },
 
     /* ---- pad mode buttons (the pads themselves carry their mode) ---- */
-    { MC_DECK1, 0x1B, K_HOTCUE,   0, "PAD MODE hot cue" },
-    { MC_DECK2, 0x1B, K_HOTCUE,   0, "PAD MODE hot cue" },
-    { MC_DECK1, 0x6D, K_ALOOP,    0, "PAD MODE beat loop" },
-    { MC_DECK2, 0x6D, K_ALOOP,    0, "PAD MODE beat loop" },
-    { MC_DECK1, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
-    { MC_DECK2, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
     /* The RX3's fourth bank is release FX / slip loop, and it belongs on PAD
      * FX1 (note 0x1E) where the RX3 puts it - not behind two presses of
      * SAMPLER (0x22), which is where it was.  The FLX4's own pad-mode notes:
      *   0x1B HOT CUE   0x1E PAD FX1   0x20 BEAT JUMP   0x22 SAMPLER
      *   0x69 KEYBOARD  0x6B PAD FX2   0x6D BEAT LOOP   0x6F KEY SHIFT */
-    { MC_DECK1, 0x1E, K_SLIPLOOP, 0, "PAD MODE pad FX1 -> release FX" },
-    { MC_DECK2, 0x1E, K_SLIPLOOP, 0, "PAD MODE pad FX1 -> release FX" },
 
     /* ---- BEAT FX (ch 5, and ch 6 when the FX is assigned to CH2) ---- */
     /* Pressing FX SELECT opens the picker, because that is what pressing it
@@ -1306,6 +1413,9 @@ static void handle_note(int ch, int note, int on)
                ch + 1, note, note, on ? "on" : "off", note_name(ch, note));
         return;
     }
+    if ((ch == MC_DECK1 || ch == MC_DECK2) &&
+        handle_padmode(ch, ch == MC_DECK1 ? 0 : 1, note, on))
+        return;
     if ((ch == MC_FX1 || ch == MC_FX2) && handle_fxch(ch, note))
         return;
     if (ch == MC_PAD1 || ch == MC_PAD1_SH) {
@@ -1361,6 +1471,15 @@ static void handle_note(int ch, int note, int on)
          * keeps a stopped deck's level meter dark (see g_playing). */
         if (on && notemap[i].key == K_PLAY && sch >= 1 && sch <= 2)
             g_playing[sch - 1] = !g_playing[sch - 1];
+        /* RELOOP/EXIT takes the loop away, so the LOOP IN and LOOP OUT lamps
+         * have to go out with it - they are toggles and would otherwise stay
+         * lit over a loop that is no longer there. */
+        if (on && notemap[i].key == K_RELOOP) {
+            led_set(ch, 0x10, 0);
+            led_set(ch, 0x11, 0);
+            led_forget(ch, 0x10);
+            led_forget(ch, 0x11);
+        }
         send_ctrl(notemap[i].key, on ? OP_PRESS : OP_RELEASE, sch, 0, 0.0f, 0);
         led_for_press(ch, note, notemap[i].key, sch, on);
         note_latency(notemap[i].name);

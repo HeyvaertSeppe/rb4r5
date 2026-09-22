@@ -231,7 +231,7 @@ with tempfile.TemporaryDirectory() as tmp:
                           bridge_src.index("/* ---------------- note mapping")]
     check("pads light up on their own path", "led_set(" in pad_body)
     check("pads switch the bank before the pad press",
-          pad_body.index("pad_select_bank") < pad_body.index("K_PAD1 + idx"))
+          pad_body.index("pad_mode_enter") < pad_body.index("K_PAD1 + idx"))
 
 
 print()

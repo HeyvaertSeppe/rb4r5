@@ -80,9 +80,10 @@ DEFAULT_FX = [
     #
     # ENIGMA JET, MOBIUS SAW and MOBIUS TRI were in this list and are DJM-900
     # effects, not the RX3's; PITCH, VINYL BRAKE, HELIX and FILTER were
-    # missing.
-    "DELAY", "ECHO", "PING PONG", "SPIRAL", "REVERB", "TRANS", "FILTER",
-    "FLANGER", "PHASER", "PITCH", "SLIP ROLL", "ROLL", "VINYL BRAKE", "HELIX",
+    # missing.  HELIX sits at position 4, between SPIRAL and REVERB, which
+    # is where the player itself stops when the strip is stepped to it.
+    "DELAY", "ECHO", "PING PONG", "SPIRAL", "HELIX", "REVERB", "TRANS",
+    "FILTER", "FLANGER", "PHASER", "PITCH", "SLIP ROLL", "ROLL", "VINYL BRAKE",
 ]
 
 # The buttons above the RX3's screen.  "key" is a name from rb4r5/keys.py;

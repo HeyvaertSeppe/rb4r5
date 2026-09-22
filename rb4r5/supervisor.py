@@ -274,7 +274,7 @@ class Supervisor:
             if bridge.exists():
                 argv = [str(bridge), "-f", config.FIFO_CTRL,
                         "-J", str(cfg.get("controller.jog_ppr", 1800)),
-                        "-T", str(cfg.get("controller.jog_ticks_per_rev", 1800)),
+                        "-T", str(cfg.get("controller.jog_ticks_per_rev", 600)),
                         "-S", str(cfg.get("controller.jog_scale", 1.0)),
                         "-H", str(cfg.get("controller.jog_touch_timeout_ms", 4000)),
                         "-B", str(cfg.get("controller.jog_bend_scale", 0.25)),

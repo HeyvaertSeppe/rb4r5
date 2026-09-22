@@ -493,3 +493,28 @@ that can be made from here:
   `IUiObjManager::getLedManager()` → `LedManager+0x30`, with `Led` entries of
   `0x2c` bytes holding id, channel and state. The addresses are specific to
   each rbp build, so the RX3's have to be found in the RX3's binary.
+
+## The jog: what makes a turn a scratch
+
+The plate being **held** is what makes a turn a scratch — not which CC
+carried it. Deciding on the CC alone meant that touching the top and turning
+still counted as the rim, a quarter-speed nudge, whenever the FLX4 sent the
+rim's CC. That is what "captive touch feels like the side" was.
+
+A released wheel now runs down instead of stopping dead, so a backspin
+carries on turning and the platter feels heavier than it is. `spindown` in
+`/tmp/rb-jog.conf` is how long that takes (900 ms; `0` turns it off), and it
+can be changed while the wheel is in your hand.
+
+## SMART FADER
+
+With it on, the player sets the tempo itself and the pitch faders should stop
+fighting it — so the bridge holds them. One switch holds **both** decks,
+which is how the controller works.
+
+It is **not** mapped by default, because a wrong guess silently swallows the
+pitch fader. `sniff` while flicking the switch gives the number:
+
+```
+smartfader ch<n> <cc|note> <number>
+```

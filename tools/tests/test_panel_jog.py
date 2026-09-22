@@ -11,7 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
 from rb4r5 import config, jogcal, overlay, subucom          # noqa: E402
 
 FAIL = 0
@@ -83,6 +84,50 @@ counter = jogcal.Counter()
 jogcal.parse(bytes([0xB0, 0x0A, 64, 0xB0, 0x22, 5]), counter, [])
 check(list(counter.ticks) == [(0, 0x22)],
       "CCs that are not the jog are ignored")
+
+
+print("\n== the jog: what makes a turn a scratch")
+#
+# The plate being HELD is what makes a turn a scratch, not which CC carried
+# it.  Deciding on the CC alone meant touching the top and turning still
+# counted as the rim - a quarter-speed nudge - whenever the FLX4 sent the
+# rim's CC.  That is "captive touch feels like the side".
+bridge_src = (REPO / "src/host/flx4-bridge.c").read_text()
+emit = bridge_src[bridge_src.index("static void jog_emit("):]
+emit = emit[:emit.index("\n}\n")]
+check("s->mode == JOG_BEND && !s->touched" in emit,
+      "a held plate is never scaled down to a nudge")
+check("s->last_speed = speed" in emit,
+      "and the speed is remembered, so it can spin down")
+
+tick = bridge_src[bridge_src.index("static void jog_tick("):]
+tick = tick[:tick.index("\n}\n")]
+check("jog_spindown_ms" in tick,
+      "a let-go wheel runs down instead of stopping dead")
+check("!s->touched" in tick,
+      "and only while nobody is holding it")
+
+print("\n== SMART FADER holds the pitch")
+check("K_TEMPO_SLIDER && g_smart_on" in bridge_src,
+      "the tempo fader is held while it is on")
+check("hold both" in bridge_src or "BOTH" in bridge_src,
+      "one switch holds both decks")
+check("g_smart_ch = -1" in bridge_src,
+      "and it is not mapped by a guess")
+
+print("\n== the Beat FX channel is an index from zero")
+#
+# EnBeatEffectSelectChannel: 0 = PLAYER_0, 1 = PLAYER_1, 2 = MIC_0, 5 = MASTER.
+# Sending 1 for channel 1 selected channel 2, and 2 for channel 2 selected
+# the microphone.
+fxch = bridge_src[bridge_src.index("static int handle_fxch("):]
+fxch = fxch[:fxch.index("\n}\n")]
+check("note == 0x10)      v = 0;" in fxch,
+      "channel 1 is PLAYER_0")
+check("note == 0x11) v = 1;" in fxch,
+      "channel 2 is PLAYER_1")
+check("v = 5;" in fxch,
+      "and master is 5")
 
 print("\n== the master meter")
 info = dict(dev="/dev/fb0", present=True, fmt="RGB565", bpp=16,

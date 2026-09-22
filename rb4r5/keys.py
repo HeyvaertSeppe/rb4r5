@@ -39,12 +39,12 @@ KEYS: dict[str, tuple[int, bool]] = {
     "cue": (0x4102, True),
     "sync": (0x4112, True),
     "master": (0x4111, True),
-    # The tempo (pitch) fader is 0x4107, op 5, f in [-1..+1] with 0 at the
-    # detent - verified in the SC Live 4 port against onKey_TempoSlider ->
-    # DjEngineIF::setTempoSlider.  These two were the other way round here,
-    # so the fader was driving whatever 0x4109 is instead.
-    "tempo": (0x4107, True),
-    "temporange": (0x4109, True),
+    # The SC Live 4 port puts onKey_TempoSlider at 0x4107.  Swapping these two
+    # onto that reading BROKE the fader on the RX3's build, which works on
+    # 0x4109 - so hardware wins over inference from another product, and this
+    # stays as it was found.
+    "tempo": (0x4109, True),
+    "temporange": (0x4107, True),
     "loopin": (0x410C, True),
     "loopout": (0x410D, True),
     "reloop": (0x410E, True),

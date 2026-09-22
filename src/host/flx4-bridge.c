@@ -76,12 +76,18 @@
 #define K_SYNC        0x4112
 #define K_JOG_TOUCH   0x4306
 #define K_JOG_ROT     0x4305
-/* The tempo (pitch) fader is 0x4107 - op 5, f in [-1..+1] with 0 at the
- * detent - verified against onKey_TempoSlider -> DjEngineIF::setTempoSlider
- * in the SC Live 4 port.  These two were the other way round, so the fader
- * was driving whatever 0x4109 is. */
-#define K_TEMPO_SLIDER 0x4107
-#define K_TEMPO_RANGE  0x4109
+/* The tempo (pitch) fader.
+ *
+ * The SC Live 4 port has onKey_TempoSlider at 0x4107, and on that reading
+ * these two were swapped here - but swapping them BROKE the fader on the
+ * RX3's own build, which had been working on 0x4109.  Hardware beats
+ * inference from a different product: 0x4109 it is.
+ *
+ * Both builds are rbp, so one of them has the keys the other way round, or
+ * the RX3 routes its fader through a different one.  Left as found, because
+ * that is what works here. */
+#define K_TEMPO_SLIDER 0x4109
+#define K_TEMPO_RANGE  0x4107
 #define K_ALOOP       0x4114
 #define K_HOTCUE      0x4113
 #define K_SLIPLOOP    0x4115
@@ -158,6 +164,20 @@ static const char *jog_conf = "/tmp/rb-jog.conf";  /* live tuning          */
 static float jog_bend_scale = 0.25f;   /* the rim, relative to the plate  */
 static int   jog_reverse = 0;      /* the platter turns the other way     */
 static float jog_scale = 1.0f;     /* how hard a turn pushes the engine   */
+static int   jog_spindown_ms = 900; /* how long a let-go wheel keeps turning */
+
+/* SMART FADER holds the pitch.
+ *
+ * With it on, the player is meant to match tempo by itself and the pitch
+ * fader should stop moving the deck - otherwise nudging the fader fights
+ * whatever the player just set.  There is one switch and it holds BOTH
+ * decks, which is how the controller works.
+ *
+ * Not mapped by default: the note it sends has to come from `launch.py
+ * sniff`, and a wrong guess here would silently swallow the pitch fader. */
+static int g_smart_ch = -1;
+static int g_smart_note = 0;
+static int g_smart_on = 0;
 
 static int fifo_fd = -1;
 
@@ -280,6 +300,25 @@ static int cc14_n = 0;
  * not what the deck is playing. */
 static float g_fader[2] = { 1.0f, 1.0f };
 
+/* Which decks are running, as far as this process can tell.
+ *
+ * The audio here is the MASTER mix - one stereo stream, already mixed - so
+ * there is no per-deck level in it.  Scaling by the fader alone left the
+ * right meter moving whenever the left deck played, because both faders
+ * were up.  PLAY is a toggle and this process sees it, so a stopped deck's
+ * meter goes dark.
+ *
+ * It is modelled, not measured: start a deck from the touchscreen and this
+ * does not hear about it.  The player's own meters are on the panel link,
+ * which this port does not decode (docs/13-panel-link.md). */
+static int g_playing[2] = { 0, 0 };
+
+/* How the meter maps level to scale.  A DJ engine leaves headroom, so a
+ * track peaking at -20 dBFS is normal and a -48 dB floor makes that look
+ * half lit.  Tighten the floor, or add gain, from the map file. */
+static float g_meter_floor_db = 36.0f;
+static float g_meter_gain_db  = 0.0f;
+
 /* The master level knob, if it sends anything.  Not mapped by default -
  * `launch.py sniff` says whether yours does - and published for the
  * launcher's on-screen meter as well as used here. */
@@ -357,6 +396,13 @@ static int handle_cc14(int ch, int cc, int val)
             if (v10 > 1023) v10 = 1023;
             if (s->key == K_FADER && s->send_ch >= 1 && s->send_ch <= 2)
                 g_fader[s->send_ch - 1] = norm;
+            if (s->key == K_TEMPO_SLIDER && g_smart_on) {
+                /* SMART FADER is on: the player is setting the tempo, so the
+                 * fader must not fight it. */
+                if (opt_verbose)
+                    logmsg("  tempo held: SMART FADER is on\n");
+                return 1;
+            }
             if (v10 != s->last10) {
                 s->last10 = v10;
                 send_ctrl(s->key, s->op, s->send_ch, v10, norm, pos);
@@ -437,6 +483,8 @@ static void reload_jog_conf(int announce)
         else if (!strcmp(line, "bend") && value >= 0.0) jog_bend_scale = (float)value;
         else if (!strcmp(line, "reverse"))              jog_reverse = value != 0.0;
         else if (!strcmp(line, "emit_ms") && value >= 1) jog_emit_ms = (int)value;
+        else if (!strcmp(line, "spindown") && value >= 0)
+            jog_spindown_ms = (int)value;
     }
     fclose(f);
     if (announce)
@@ -467,6 +515,7 @@ struct jog {
     long long last_ms;
     long long last_emit_ms;
     long long touch_ms;    /* when the touch arrived, for the stuck guard */
+    float last_speed;      /* what it was doing, so it can spin down       */
 };
 static struct jog jogs[2];
 
@@ -546,8 +595,14 @@ static void jog_emit(struct jog *s, long long t)
     while (s->vpos < 0.0f)     s->vpos += jog_ppr;
 
     speed = revs / dt * jog_scale;
-    if (s->mode == JOG_BEND)
+    /* What makes a turn a scratch is the plate being HELD, not which CC
+     * carried it.  Deciding on the CC alone meant that touching the top and
+     * turning still counted as the rim - a quarter-speed nudge - whenever the
+     * FLX4 sent the rim's CC, which is what "captive touch feels like the
+     * side" was. */
+    if (s->mode == JOG_BEND && !s->touched)
         speed *= jog_bend_scale;     /* the rim nudges, it does not scratch */
+    s->last_speed = speed;
     if (speed > 8.0f) speed = 8.0f;
     if (speed < -8.0f) speed = -8.0f;
 
@@ -592,7 +647,24 @@ static void jog_tick(void)
         }
         if (t - s->last_emit_ms < jog_idle_ms)
             continue;
+
+        /* A real platter does not stop the instant you let go.  Let the last
+         * speed run down instead of cutting it to zero, so a backspin carries
+         * on turning and the wheel feels heavier than it is. */
+        if (jog_spindown_ms > 0 && !s->touched &&
+            (s->last_speed > 0.15f || s->last_speed < -0.15f)) {
+            float per = (float)jog_emit_ms / (float)jog_spindown_ms;
+            s->last_speed -= s->last_speed * per;
+            s->vpos += s->last_speed * jog_ppr * (float)jog_emit_ms / 1000.0f;
+            while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
+            while (s->vpos < 0.0f)     s->vpos += jog_ppr;
+            s->last_emit_ms = t;
+            send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, s->last_speed,
+                      (int)s->vpos);
+            continue;
+        }
         s->moving = 0;
+        s->last_speed = 0.0f;
         send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, 0.0f, (int)s->vpos);
     }
 }
@@ -976,12 +1048,12 @@ static void meter_tick(void)
             int level = 0;
             /* the master mix is one stream: scale each column by its own
              * channel's fader so the two meters move apart */
-            peak = (int32_t)((float)peak * g_fader[column] * g_master);
+            peak = (int32_t)((float)peak * g_fader[column] * g_master
+                             * (g_playing[column] ? 1.0f : 0.0f));
             if (peak > 0 && full > 0) {
-                /* dBFS over 48 dB, so the top of the scale behaves like a
-                 * meter rather than like a volume control */
-                double db = 20.0 * log10((double)peak / (double)full);
-                double share = (db + 48.0) / 48.0;
+                double db = 20.0 * log10((double)peak / (double)full)
+                            + g_meter_gain_db;
+                double share = (db + g_meter_floor_db) / g_meter_floor_db;
                 if (share < 0.0) share = 0.0;
                 if (share > 1.0) share = 1.0;
                 level = (int)(share * 127.0 + 0.5);
@@ -1068,6 +1140,28 @@ static void load_map_file(const char *path)
                      !strcmp(ops, "value") ? OP_VALUE : OP_ROTATE,
                      schan, got >= 7 ? signed_norm : 0, "(map file)");
             n++;
+        } else if (!strcmp(kind, "smartfader")) {
+            char how[16];
+            int number = 0;
+            int got = sscanf(line, "%15s %15s %15s %i", kind, chs, how, &number);
+            if (got < 4) { logmsg("flx4: bad map line: %s", line); continue; }
+            g_smart_ch = parse_ch(chs) - 1;
+            if (g_smart_ch < 0) g_smart_ch = 0;
+            g_smart_note = number;
+            logmsg("flx4: SMART FADER on ch%d %s %#x - it will hold both "
+                   "pitch faders\n", g_smart_ch + 1, how, number);
+            n++;
+        } else if (!strcmp(kind, "meterscale")) {
+            float floor_db = 0.0f, gain_db = 0.0f;
+            int got = sscanf(line, "%15s %f %f", kind, &floor_db, &gain_db);
+            if (got < 2) { logmsg("flx4: bad map line: %s", line); continue; }
+            if (floor_db > 6.0f && floor_db < 96.0f)
+                g_meter_floor_db = floor_db;
+            if (got >= 3)
+                g_meter_gain_db = gain_db;
+            logmsg("flx4: meter floor -%.0f dB, gain %+.1f dB\n",
+                   (double)g_meter_floor_db, (double)g_meter_gain_db);
+            n++;
         } else if (!strcmp(kind, "masterlevel")) {
             char how[16];
             int number = 0;
@@ -1108,13 +1202,23 @@ static void load_map_file(const char *path)
     logmsg("flx4: loaded %d entries from %s\n", n, path);
 }
 
-/* BEAT FX channel-select switch: ch5 note 0x10 = CH1, ch6 note 0x11 = CH2 */
+/* BEAT FX channel-select switch: ch5 note 0x10 = CH1, ch6 note 0x11 = CH2.
+ *
+ * The value is an index into the engine's own enum, and it starts at zero:
+ *
+ *   EnBeatEffectSelectChannel:
+ *     0 = PLAYER_0   1 = PLAYER_1   2 = MIC_0
+ *     3 = ASSIGN_A   4 = ASSIGN_B   5 = MASTER   6 = AUX
+ *
+ * This sent 1 for channel 1 and 2 for channel 2, which is PLAYER_1 and
+ * MIC_0 - so selecting channel 1 showed channel 2, and channel 2 showed the
+ * microphone.  Off by one, all the way along. */
 static int handle_fxch(int ch, int note)
 {
     int v = 0;
-    if (ch == MC_FX1 && note == 0x10)      v = 1;
-    else if (ch == MC_FX2 && note == 0x11) v = 2;
-    else if (ch == MC_FX1 && note == 0x14) v = 5;   /* master, if sent */
+    if (ch == MC_FX1 && note == 0x10)      v = 0;   /* CH1 -> PLAYER_0 */
+    else if (ch == MC_FX2 && note == 0x11) v = 1;   /* CH2 -> PLAYER_1 */
+    else if (ch == MC_FX1 && note == 0x14) v = 5;   /* MASTER, if sent */
     else return 0;
     if (opt_verbose)
         logmsg("  beat fx channel select -> %d\n", v);
@@ -1229,6 +1333,10 @@ static void handle_note(int ch, int note, int on)
         sch = notemap[i].send_ch;
         if (sch == 0)
             sch = (ch == MC_DECK1) ? 1 : 2;
+        /* PLAY is a toggle, and knowing which decks are running is what
+         * keeps a stopped deck's level meter dark (see g_playing). */
+        if (on && notemap[i].key == K_PLAY && sch >= 1 && sch <= 2)
+            g_playing[sch - 1] = !g_playing[sch - 1];
         send_ctrl(notemap[i].key, on ? OP_PRESS : OP_RELEASE, sch, 0, 0.0f, 0);
         led_for_press(ch, note, notemap[i].key, sch, on);
         note_latency(notemap[i].name);
@@ -1245,6 +1353,14 @@ static void handle_cc(int ch, int cc, int val)
 {
     if (opt_sniff) {
         logmsg("MIDI ch%-2d CC  %3d (0x%02x) val=%3d\n", ch + 1, cc, cc, val);
+        return;
+    }
+
+    if (g_smart_ch >= 0 && ch == g_smart_ch && cc == g_smart_note) {
+        g_smart_on = val >= 64;
+        logmsg("flx4: SMART FADER %s - the pitch faders are %s\n",
+               g_smart_on ? "on" : "off",
+               g_smart_on ? "held" : "live again");
         return;
     }
 

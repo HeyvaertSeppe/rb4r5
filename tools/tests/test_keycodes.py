@@ -5,8 +5,9 @@ Every one of these was checked against a live-verified port of the same
 engine (the SC Live 4 / knobshim2 work).  Thirty-nine agreed; the ones that
 did not are recorded here so they cannot drift back:
 
-  * the tempo (pitch) fader is 0x4107, not 0x4109 - it had been sending the
-    fader to whatever 0x4109 is
+  * the tempo fader is 0x4109 HERE.  The reference port has onKey_TempoSlider
+    at 0x4107; changing to it broke the fader on the RX3's build, so this one
+    is pinned the other way and stays that way
   * BEAT FX SELECT takes op 5 VALUE carrying a SWITCH POSITION 0..13, not a
     rotate with a delta, not a rotate with a 10-bit position, and not a
     button press.  All three of those were tried on hardware and the player
@@ -40,8 +41,7 @@ VERIFIED = {
     "source": 0x0201, "browse": 0x0202, "taglist": 0x0203, "menu": 0x0206,
     "link": 0x0207, "rekordbox": 0x0208, "usb1": 0x0209, "info": 0x020B,
     "selector": 0x420C, "back": 0x420D, "load": 0x4311,
-    "play": 0x4101, "cue": 0x4102, "vinyl": 0x4104, "tempo": 0x4107,
-    "keylock": 0x4108, "loopin": 0x410C, "loopout": 0x410D, "reloop": 0x410E,
+    "play": 0x4101, "cue": 0x4102, "vinyl": 0x4104,     "keylock": 0x4108, "loopin": 0x410C, "loopout": 0x410D, "reloop": 0x410E,
     "rev": 0x410F, "slip": 0x4110, "master": 0x4111, "sync": 0x4112,
     "hotcue": 0x4113, "aloop": 0x4114, "sliploop": 0x4115, "beatjump": 0x4116,
     "pad1": 0x4117, "searchfwd": 0x411F, "searchrev": 0x4120,
@@ -68,8 +68,11 @@ for name, code in sorted(VERIFIED.items(), key=lambda kv: kv[1]):
 check("every verified keycode matches", wrong, [])
 
 print("\n== the ones that were wrong, pinned")
-check("the tempo fader is 0x4107", keys.KEYS["tempo"][0], 0x4107)
-check("and 0x4109 is not the fader", keys.KEYS["temporange"][0], 0x4109)
+# The reference port has onKey_TempoSlider at 0x4107, but swapping to it
+# broke the fader on the RX3's own build, which works on 0x4109.  Hardware
+# beats inference from another product - pinned so it is not "corrected"
+# back again.
+check("the tempo fader is 0x4109 on this build", keys.KEYS["tempo"][0], 0x4109)
 check("0x4102 is CUE", keys.KEYS["cue"][0], 0x4102)
 check("0x4104 is VINYL", keys.KEYS["vinyl"][0], 0x4104)
 for gone in ("play1", "play2", "cue1", "cue2"):

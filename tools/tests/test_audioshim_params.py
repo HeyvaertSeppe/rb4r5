@@ -55,6 +55,9 @@ static int npcm = 0;
 static struct fake_pcm slave_pcm;
 static int slave_prepared = 0, slave_configured = 0;
 void *fake_slave(void) { return &slave_pcm; }
+/* is this pointer one WE handed out - i.e. a real PCM, not a sentinel? */
+int fake_is_pcm(void *p)
+{ return p >= (void *)&pcms[0] && p < (void *)&pcms[8]; }
 int fake_slave_prepared(void) { return slave_prepared; }
 int fake_slave_configured(void) { return slave_configured; }
 
@@ -351,6 +354,23 @@ with tempfile.TemporaryDirectory() as tmp:
           lib.snd_pcm_hw_params_set_access(master2, ctypes.byref(params), 0), 0)
     check("and its hw_params still succeeds",
           lib.snd_pcm_hw_params(master2, ctypes.byref(params)), 0)
+
+    # --- the streams that are not hardware are still real PCMs ----------
+    #
+    # They used to be the addresses of five static ints.  That holds only
+    # while every ALSA function the engine calls on them is one this shim
+    # exports - and it exports 23.  snd_pcm_state(), avail_update(),
+    # delay(), drain(), start(), hw_free() and the rest go straight to
+    # alsa-lib, which dereferences the pointer as a snd_pcm_t.  A pointer to
+    # an int is not one, and that is a SIGSEGV in the player.
+    check("the headphone stream is a real PCM, not a sentinel pointer",
+          bool(asound.fake_is_pcm(hp2)), True)
+    check("so is the booth stream", bool(asound.fake_is_pcm(booth2)), True)
+    check("and the capture stream", bool(asound.fake_is_pcm(handle)), True)
+    check("they are backed by alsa-lib's null device, which needs no "
+          "hardware", opens().count("null") >= 3, True)
+    check("and each is a stream of its own",
+          len({hp2.value, booth2.value, handle.value}), 3)
 
     # --- alsa-lib calls these symbols on its OWN handles -----------------
     #

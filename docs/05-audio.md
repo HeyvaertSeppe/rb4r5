@@ -446,3 +446,30 @@ and `..._max()`, which always answer 2 for the stereo stream the engine
 believes in. If alsa-lib is ever seen making its own channel decisions
 through those public accessors rather than its internal ones, that is the
 place to look.
+
+## The streams that are not hardware are still real PCMs
+
+The engine opens five playback/capture streams; only one is the controller.
+The other four — headphones, booth, a spare output, and capture — used to be
+the addresses of five `static int`s, recognised by pointer comparison.
+
+That holds only while **every** ALSA function the engine calls on them is one
+this shim exports. It exports 23. `snd_pcm_state()`, `snd_pcm_avail_update()`,
+`snd_pcm_delay()`, `snd_pcm_drain()`, `snd_pcm_start()`, `snd_pcm_hw_free()`,
+`snd_pcm_poll_descriptors()` and a dozen more go straight to alsa-lib, which
+dereferences the pointer as a `snd_pcm_t`. A pointer to an `int` is not one,
+and the player dies with `SIGSEGV`.
+
+It only started firing once the interception bug above was fixed: until then
+the engine gave up early, and never reached the point of doing real playback
+work on the streams it was not going to hear anything from.
+
+Each virtual stream is now backed by alsa-lib's own **`null`** PCM — a real,
+complete PCM that needs no hardware and is defined by `alsa.conf` itself.
+Every ALSA function works on it, exported here or not. Parameter and prepare
+calls are passed through to it so it behaves like the working device the
+engine expects; only `writei` is intercepted, which is the part that actually
+needs doing something about (the cue mix, the meters, the pacing).
+
+If the runtime has no `null` PCM the shim falls back to the old sentinels and
+says so in the log — the player runs, with the old hazard.

@@ -150,12 +150,29 @@ typedef long snd_pcm_sframes_t;
 #define SND_PCM_ACCESS_RW_INTERLEAVED 3
 #define SND_PCM_FORMAT_S24_LE   6
 
-/* Virtual handles for the streams that are not the real device */
-static int g_h_master = 0;   /* only when no hardware could be opened */
-static int g_h_hp     = 1;
-static int g_h_booth  = 2;
-static int g_h_dummy  = 3;
-static int g_h_cap    = 4;
+/* The streams that are not the real device.
+ *
+ * These used to be the addresses of five static ints.  That works only for
+ * as long as every ALSA function the engine calls on them is one this shim
+ * exports - and it exports 23 of them.  snd_pcm_state(), avail_update(),
+ * delay(), drain(), start(), hw_free(), poll_descriptors() and the rest go
+ * straight to alsa-lib, which dereferences the pointer as a snd_pcm_t.  A
+ * pointer to an int is not one.
+ *
+ * So each is backed by alsa-lib's own "null" PCM: a real, complete PCM that
+ * needs no hardware and is defined by alsa.conf itself.  Every function
+ * works on it, exported here or not.  This shim still intercepts the writes,
+ * which is the only part it actually needs to do something about.
+ */
+enum { V_MASTER, V_HP, V_BOOTH, V_DUMMY, V_CAP, V_COUNT };
+
+static snd_pcm_t *g_virtual[V_COUNT];
+/* last resort if the runtime has no "null" PCM: distinct addresses, and the
+ * old hazard along with them, but the player still runs */
+static int g_virtual_fallback[V_COUNT] = { 0, 1, 2, 3, 4 };
+static int g_virtual_warned;
+
+static snd_pcm_t *virtual_stream(int which);
 
 static snd_pcm_t *g_real_playback = NULL;
 static int g_real_refs            = 0;
@@ -352,6 +369,30 @@ static void init_real_alsa(void)
     alog("audioshim: real ALSA initialized\n");
 }
 
+static snd_pcm_t *virtual_stream(int which)
+{
+    if (g_virtual[which])
+        return g_virtual[which];
+    if (real_snd_pcm_open) {
+        snd_pcm_t *handle = NULL;
+        int stream = (which == V_CAP) ? SND_PCM_STREAM_CAPTURE
+                                      : SND_PCM_STREAM_PLAYBACK;
+        if (real_snd_pcm_open(&handle, "null", stream, 0) == 0 && handle)
+            g_virtual[which] = handle;
+    }
+    if (!g_virtual[which]) {
+        g_virtual[which] = (snd_pcm_t *)&g_virtual_fallback[which];
+        if (!g_virtual_warned) {
+            g_virtual_warned = 1;
+            alog("audioshim: the runtime has no \"null\" PCM, so the streams "
+                 "that are not the real device have nothing real behind "
+                 "them; any ALSA call this shim does not export will crash "
+                 "on one\n");
+        }
+    }
+    return g_virtual[which];
+}
+
 /* Mix buffers.  The engine hands us S24_LE samples in int32 containers, which
  * is what we write out too (alsa-lib's plug layer converts if the device wants
  * S24_3LE or S32_LE). */
@@ -442,6 +483,11 @@ static inline int is_real(snd_pcm_t *pcm)
 #define H_VIRTUAL 2     /* one of our fake streams */
 #define H_NONE    3     /* no handle at all - do nothing, touch nothing */
 
+/* Anything backed by a real PCM - alsa-lib's own, or one of the "null" PCMs
+ * behind the virtual streams - takes its parameters for real.  Only the
+ * master is ours to decide for, and only a null handle is nobody's. */
+static int passthrough(snd_pcm_t *pcm);
+
 static int whose(snd_pcm_t *pcm)
 {
     /* The engine really does call snd_pcm_close(NULL), among others.  That
@@ -451,13 +497,18 @@ static int whose(snd_pcm_t *pcm)
      * to it. */
     if (!pcm)
         return H_NONE;
-    if (pcm == (snd_pcm_t *)&g_h_master || pcm == (snd_pcm_t *)&g_h_hp ||
-        pcm == (snd_pcm_t *)&g_h_booth  || pcm == (snd_pcm_t *)&g_h_dummy ||
-        pcm == (snd_pcm_t *)&g_h_cap)
-        return H_VIRTUAL;
+    for (int index = 0; index < V_COUNT; index++)
+        if (pcm == g_virtual[index])
+            return H_VIRTUAL;
     if (pcm == g_real_playback)
         return H_MASTER;
     return H_ALSA;
+}
+
+static int passthrough(snd_pcm_t *pcm)
+{
+    int kind = whose(pcm);
+    return kind == H_ALSA || kind == H_VIRTUAL;
 }
 
 /* A real PCM to fill hw_params from, for the streams that have no hardware.
@@ -651,24 +702,24 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
     if (stream != SND_PCM_STREAM_PLAYBACK) {
         /* Capture / mic -> virtual handle, so nothing fights for the hardware */
         alog("audioshim: mapped virtual Capture device\n");
-        *pcm = (snd_pcm_t *)&g_h_cap;
+        *pcm = virtual_stream(V_CAP);
         return 0;
     }
 
     which = rx3_output(name);
     if (which == 1) {
         alog("audioshim: mapped virtual Headphone/cue device\n");
-        *pcm = (snd_pcm_t *)&g_h_hp;
+        *pcm = virtual_stream(V_HP);
         return 0;
     }
     if (which == 2) {
         alog("audioshim: mapped virtual Booth device\n");
-        *pcm = (snd_pcm_t *)&g_h_booth;
+        *pcm = virtual_stream(V_BOOTH);
         return 0;
     }
     if (which != 0) {
         alog("audioshim: mapped dummy output device\n");
-        *pcm = (snd_pcm_t *)&g_h_dummy;
+        *pcm = virtual_stream(V_DUMMY);
         return 0;
     }
 
@@ -689,7 +740,7 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
 
     alog("audioshim: no hardware for Master - running it virtually, paced in "
          "software, with no sound\n");
-    *pcm = (snd_pcm_t *)&g_h_master;
+    *pcm = virtual_stream(V_MASTER);
     return 0;
 }
 
@@ -920,14 +971,15 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
         return real_snd_pcm_hw_params_any ?
                real_snd_pcm_hw_params_any(pcm, params) : 0;
 
-    /* A virtual stream still has to leave `params` filled in.  Returning 0
-     * and touching nothing leaves the caller's zeroed struct behind, and the
-     * next thing that reads it aborts the player inside alsa-lib. */
+    /* A virtual stream is a real "null" PCM, so this fills `params` properly.
+     * It has to be filled: the caller allocates it zeroed, every mask in it
+     * is empty, and alsa-lib asserts rather than returns when something
+     * later reads an empty mask - which aborts the player. */
+    if (real_snd_pcm_hw_params_any)
+        return real_snd_pcm_hw_params_any(pcm, params);
     donor = params_donor();
     if (donor && real_snd_pcm_hw_params_any)
         return real_snd_pcm_hw_params_any(donor, params);
-    alog("audioshim: hw_params_any on a virtual stream with no donor - "
-         "returning EINVAL rather than an unreadable params struct\n");
     return -EINVAL;
 }
 
@@ -943,7 +995,7 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int access)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params_set_access ?
                real_snd_pcm_hw_params_set_access(pcm, params, access) : 0;
     return 0;
@@ -952,7 +1004,7 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
 int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, int format)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params_set_format ?
                real_snd_pcm_hw_params_set_format(pcm, params, format) : 0;
     return 0;
@@ -961,7 +1013,7 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
 int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params_set_channels ?
                real_snd_pcm_hw_params_set_channels(pcm, params, val) : 0;
     return 0;
@@ -970,7 +1022,7 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, 
 int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params_set_rate_near ?
                real_snd_pcm_hw_params_set_rate_near(pcm, params, val, dir) : 0;
     /* the engine reads this back and clocks itself from it */
@@ -981,7 +1033,7 @@ int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params,
 int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val, int *dir)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params_set_period_size_near ?
                real_snd_pcm_hw_params_set_period_size_near(pcm, params, val, dir) : 0;
     return 0;
@@ -990,7 +1042,7 @@ int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *
 int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params_set_periods_near ?
                real_snd_pcm_hw_params_set_periods_near(pcm, params, val, dir) : 0;
     return 0;
@@ -1016,7 +1068,7 @@ int snd_pcm_hw_params_test_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, uns
 {
     cfg_init();
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_test_rate ? real_test_rate(pcm, params, rate) : 0;
     return ((int)rate == g_rate) ? 0 : -EINVAL;
 }
@@ -1024,7 +1076,7 @@ int snd_pcm_hw_params_test_rate(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, uns
 int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_hw_params ? real_snd_pcm_hw_params(pcm, params) : 0;
     if (whose(pcm) == H_MASTER) {
         /* Already configured at open.  If something left it unusable, this
@@ -1042,7 +1094,7 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 int snd_pcm_sw_params_current(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_sw_params_current ?
                real_snd_pcm_sw_params_current(pcm, params) : 0;
     return 0;
@@ -1067,7 +1119,7 @@ int snd_pcm_sw_params_get_boundary(const snd_pcm_sw_params_t *params, snd_pcm_uf
 int snd_pcm_sw_params_set_silence_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_silence_threshold)
+    if (passthrough(pcm) && real_snd_pcm_sw_params_set_silence_threshold)
         return real_snd_pcm_sw_params_set_silence_threshold(pcm, params, val);
     return 0;
 }
@@ -1075,7 +1127,7 @@ int snd_pcm_sw_params_set_silence_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t 
 int snd_pcm_sw_params_set_silence_size(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_silence_size)
+    if (passthrough(pcm) && real_snd_pcm_sw_params_set_silence_size)
         return real_snd_pcm_sw_params_set_silence_size(pcm, params, val);
     return 0;
 }
@@ -1083,7 +1135,7 @@ int snd_pcm_sw_params_set_silence_size(snd_pcm_t *pcm, snd_pcm_sw_params_t *para
 int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_start_threshold)
+    if (passthrough(pcm) && real_snd_pcm_sw_params_set_start_threshold)
         return real_snd_pcm_sw_params_set_start_threshold(pcm, params, val);
     return 0;
 }
@@ -1091,7 +1143,7 @@ int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *p
 int snd_pcm_sw_params_set_stop_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *params, snd_pcm_uframes_t val)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA && real_snd_pcm_sw_params_set_stop_threshold)
+    if (passthrough(pcm) && real_snd_pcm_sw_params_set_stop_threshold)
         return real_snd_pcm_sw_params_set_stop_threshold(pcm, params, val);
     return 0;
 }
@@ -1099,7 +1151,7 @@ int snd_pcm_sw_params_set_stop_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *pa
 int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
 {
     init_real_alsa();
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_sw_params ? real_snd_pcm_sw_params(pcm, params) : 0;
     return 0;
 }
@@ -1109,7 +1161,7 @@ int snd_pcm_prepare(snd_pcm_t *pcm)
     init_real_alsa();
     /* alsa-lib prepares a plug PCM by calling THIS on its slave.  Passing it
      * through is the whole reason the device can reach PREPARED at all. */
-    if (whose(pcm) == H_ALSA)
+    if (passthrough(pcm))
         return real_snd_pcm_prepare ? real_snd_pcm_prepare(pcm) : 0;
     if (whose(pcm) == H_MASTER && real_snd_pcm_prepare)
         return real_snd_pcm_prepare(g_real_playback);
@@ -1185,7 +1237,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
      * channel clipping on its own is not a master meter. */
     static int32_t s_peak_l = 0, s_peak_r = 0;
 
-    if (pcm == (snd_pcm_t *)&g_h_hp) {
+    if (pcm == g_virtual[V_HP]) {
         /* Headphone/cue stream: park it in channels 2/3 of the mix and return.
          * The master stream is what actually drives the write to the device -
          * but this one still has to keep to real time, or the engine clocks
@@ -1207,7 +1259,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         return size;
     }
 
-    if (pcm == (snd_pcm_t *)&g_h_booth || pcm == (snd_pcm_t *)&g_h_dummy) {
+    if (pcm == g_virtual[V_BOOTH] || pcm == g_virtual[V_DUMMY]) {
         static struct pace pace_booth = { 0, 0, 0, "the booth stream", 0, 0 };
         pace_stream(&pace_booth, size, g_rate);  /* the FLX4 has no booth output, but
                                           * the engine still counts on it

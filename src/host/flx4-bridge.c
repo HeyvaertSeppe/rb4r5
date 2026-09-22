@@ -100,7 +100,8 @@
 /* Not an RX3 keycode: a note mapped to this opens the launcher's effect
  * picker instead of going to the player.  The FLX4 has one FX knob and no
  * way to see the list, so the picker is the missing half of that control. */
-#define K_OVERLAY_FX  0xf001
+#define K_OVERLAY_FX  0xf001      /* FX SELECT: one effect down the list */
+#define K_OVERLAY_FXUP 0xf002     /* SHIFT+FX SELECT: one effect up */
 
 #define K_BFXTYPE     0x448b
 #define K_BFXCH       0x448c
@@ -590,52 +591,32 @@ static void led_set(int ch, int note, int on)
 
 /* ---- the BEAT FX SELECT lamp ----
  *
- * The picker is a mode you are in, not an action you took, so its button
- * blinks for as long as it is open - which is what the RX3 does with a
- * control that has taken over the screen.
- *
- * It never lit at all before: the K_OVERLAY_FX branch of handle_note()
- * returns as soon as it has told the launcher to open the picker, and
- * led_for_press() is below that return.
- *
- * The picker can also be closed by touching the screen, which this process
- * never hears about, so the lamp checks the launcher's own modal flag file
- * rather than trusting its idea of the state.
+ * There is no box to be in any more: the effect list is always on screen, so
+ * the button lights for a moment each time it moves the selection, the way a
+ * momentary button does on the RX3.  It never lit at all before, because the
+ * branch that handles it returns before led_for_press() is reached.
  */
 #define FX_SELECT_NOTE  0x63
-#define FX_BLINK_MS     350
-static const char *opt_modal = "/tmp/rb-overlay.modal";
+#define FX_FLASH_MS     120
 
-static int       g_fx_open   = 0;
 static int       g_fx_lit    = 0;
 static long long g_fx_at     = 0;
 
-static void fx_lamp(int open)
+static void fx_lamp_flash(void)
 {
-    g_fx_open = open;
-    g_fx_lit  = open;
-    g_fx_at   = now_ms();
-    led_set(MC_FX1, FX_SELECT_NOTE, open);
+    g_fx_lit = 1;
+    g_fx_at  = now_ms();
+    led_set(MC_FX1, FX_SELECT_NOTE, 1);
 }
 
 static void fx_lamp_tick(void)
 {
-    long long t;
-
-    if (!g_fx_open)
+    if (!g_fx_lit)
         return;
-    t = now_ms();
-    if (t - g_fx_at < FX_BLINK_MS)
+    if (now_ms() - g_fx_at < FX_FLASH_MS)
         return;
-    g_fx_at = t;
-
-    if (access(opt_modal, F_OK) != 0) {
-        /* the picker went away without us - a tap on the screen */
-        fx_lamp(0);
-        return;
-    }
-    g_fx_lit = !g_fx_lit;
-    led_set(MC_FX1, FX_SELECT_NOTE, g_fx_lit);
+    g_fx_lit = 0;
+    led_set(MC_FX1, FX_SELECT_NOTE, 0);
 }
 
 /* ---- what a button's light should DO ----
@@ -867,8 +848,8 @@ static struct notemap notemap[NMAP_MAX] = {
      * is FOR: the FLX4 has no screen, so cycling the effect blind is the
      * thing the picker exists to replace.  SHIFT+FX SELECT still cycles it
      * the old way for anyone who wants that. */
-    { MC_FX1, 0x63, K_OVERLAY_FX, CH_GLOBAL, "BEAT FX select (picker)" },
-    { MC_FX1, 0x64, K_BFXTYPE,  CH_GLOBAL, "SHIFT+BEAT FX select (cycle)" },
+    { MC_FX1, 0x63, K_OVERLAY_FX,   CH_GLOBAL, "BEAT FX select (next effect)" },
+    { MC_FX1, 0x64, K_OVERLAY_FXUP, CH_GLOBAL, "SHIFT+BEAT FX select (previous)" },
     { MC_FX1, 0x4A, K_BEATPREV, CH_GLOBAL, "BEAT <" },
     { MC_FX1, 0x4B, K_BEATNEXT, CH_GLOBAL, "BEAT >" },
     { MC_FX1, 0x47, K_BFX,      CH_GLOBAL, "BEAT FX on/off" },
@@ -1074,14 +1055,19 @@ static void handle_note(int ch, int note, int on)
                 return;
             }
         }
-        if (notemap[i].key == K_OVERLAY_FX) {
+        if (notemap[i].key == K_OVERLAY_FX ||
+            notemap[i].key == K_OVERLAY_FXUP) {
+            int up = (notemap[i].key == K_OVERLAY_FXUP);
             if (on) {
-                overlay_command("fx");
-                fx_lamp(!g_fx_open);
+                /* The launcher owns the effect list - it is the only thing
+                 * that knows which one is lit - so this says which way to
+                 * move and lets it do the stepping. */
+                overlay_command(up ? "fx-" : "fx+");
+                fx_lamp_flash();
             }
             if (opt_verbose)
-                logmsg("  %s -> effect picker %s\n", notemap[i].name,
-                       on ? "toggle" : "(release)");
+                logmsg("  %s -> effect %s\n", notemap[i].name,
+                       up ? "up" : "down");
             return;
         }
         sch = notemap[i].send_ch;

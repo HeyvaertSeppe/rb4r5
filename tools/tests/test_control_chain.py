@@ -58,15 +58,18 @@ MIDI = {
     "pad 8":                [0x97, 0x07, 0x7F],
     "pad mode BEAT LOOP":   [0x90, 0x6D, 0x7F],
     "pad mode BEAT JUMP":   [0x90, 0x20, 0x7F],
-    # FX SELECT itself opens the launcher's effect picker; the engine's own
-    # blind cycling moved to SHIFT+FX SELECT (note 0x64).
-    "BEAT FX select":       [0x94, 0x64, 0x7F],
     "BEAT FX on/off":       [0x94, 0x47, 0x7F],
     "BEAT FX depth":        [0xB4, 0x02, 0x40],
     "BEAT < / >":           [0x94, 0x4B, 0x7F],
 }
 
 OPS = {0: "press", 2: "release", 4: "rotate", 5: "value"}
+
+# Controls that reach the engine THROUGH the launcher rather than straight
+# from the bridge.  There is no launcher here - this test drives the bridge
+# on its own - so they are checked separately, below, by watching what the
+# bridge asks the launcher to do.
+VIA_LAUNCHER = {"BEAT FX select"}
 failures = []
 
 
@@ -141,6 +144,10 @@ with tempfile.TemporaryDirectory() as tmp:
     missing_midi = []
     seen = 0
     for name, instruction, needles in verify.CONTROLS:
+        if name in VIA_LAUNCHER:
+            print(f"--   {name:<22} -> the launcher (checked below)")
+            seen += 1
+            continue
         if name not in MIDI:
             missing_midi.append(name)
             continue
@@ -155,8 +162,9 @@ with tempfile.TemporaryDirectory() as tmp:
             failures.append(name)
             print(f"FAIL {name:<22} -> nothing matching {needles} ({why})")
 
-    # FX SELECT is the one button that does NOT go to the engine: it opens the
-    # launcher's picker instead, which the FLX4 has no other way to reach.
+    # FX SELECT is the one button that does NOT go to the engine.  It moves
+    # the launcher's own effect list - down on its own, up with SHIFT - and
+    # the launcher sends the engine the steps that takes.
     picker = []
     def read_picker():
         try:
@@ -176,27 +184,33 @@ with tempfile.TemporaryDirectory() as tmp:
     watcher.start()
     time.sleep(0.2)
     os.write(midi, bytes([0x94, 0x63, 0x7F]))     # FX SELECT press
-    time.sleep(0.5)
+    time.sleep(0.3)
     os.write(midi, bytes([0x94, 0x63, 0x00]))     # and release
+    os.write(midi, bytes([0x94, 0x64, 0x7F]))     # SHIFT + FX SELECT
+    time.sleep(0.3)
+    os.write(midi, bytes([0x94, 0x64, 0x00]))
     watcher.join(timeout=3)
-    check("FX SELECT asks the launcher to open the effect picker",
-          b"fx" in b"".join(picker))
+    told = b"".join(picker)
+    check("FX SELECT moves the launcher's effect list down", b"fx+" in told)
+    check("and SHIFT + FX SELECT moves it up", b"fx-" in told)
     # and it lights its own lamp: the branch that opens the picker used to
     # return before anything touched an LED, so the button never lit
     bridge_src_fx = (REPO / "src/host/flx4-bridge.c").read_text()
-    fx_branch = bridge_src_fx[bridge_src_fx.index("if (notemap[i].key == K_OVERLAY_FX)"):]
+    fx_branch = bridge_src_fx[bridge_src_fx.index(
+        "if (notemap[i].key == K_OVERLAY_FX ||"):]
     fx_branch = fx_branch[:fx_branch.index("return;")]
-    check("and lights the FX button while the picker is open",
-          "fx_lamp(" in fx_branch)
-    check("and does not send the engine a blind FX-type step",
-          engine_log.read_text().count("key=0000448b") == 1)
+    check("and lights the FX button as it does it",
+          "fx_lamp_flash(" in fx_branch)
+    check("and neither sends the engine a blind FX-type step",
+          engine_log.read_text().count("key=0000448b"), 0)
 
     os.close(midi)
     stop.set()
     proc.terminate()
 
     print()
-    check("every control in the walk has MIDI to test with", missing_midi, [])
+    check("every control in the walk has MIDI to test with",
+          [n for n in missing_midi if n not in VIA_LAUNCHER], [])
     check("every control reached the engine", seen, len(verify.CONTROLS))
 
     # what the engine received, for the record

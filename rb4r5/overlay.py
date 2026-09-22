@@ -9,8 +9,10 @@ sends.
 
 It also owns two things that take the whole screen for a moment:
 
-  * the effect picker - the FLX4 has one FX knob and no way to see the list,
-    so pressing its FX SELECT opens a grid of every Beat FX and a tap chooses
+  * the effect list - the FLX4 has one FX knob and no way to show what it is
+    set to, so every Beat FX is listed down the left border with the selected
+    one lit.  FX SELECT moves down it, SHIFT+FX SELECT moves up, and a tap
+    chooses
     one;
   * the boot splash - the player takes a while to come up and a black screen
     for that long looks broken, so a progress screen covers it while the UI
@@ -54,11 +56,15 @@ METER_OK    = (60, 210, 120)
 METER_WARM  = (230, 190, 50)
 METER_HOT   = (235, 60, 50)
 METER_OFF   = (28, 30, 36)
+# the effect list down the left border: the selected one in the RX3's amber
+FX_ON_BG    = LIT_BG
+FX_ON       = LIT_LABEL
+FX_OFF      = (128, 134, 148)
 
-# Beat FX, in the order the player steps through them.  The picker moves the
-# selection by sending that many steps on the FX-type encoder, so the ORDER is
-# what matters, not the spelling: if the player lands on the wrong one, fix
-# the order in /etc/rb4r5/fx-list.json and it will agree again.
+# Beat FX, in the order the player steps through them.  Choosing one sends
+# that many steps of the player's own FX-select control, so the ORDER is what
+# matters, not the spelling: if the player lands on the wrong effect, fix the
+# order in /etc/rb4r5/fx-list.json and the two agree again.
 DEFAULT_FX = [
     "DELAY", "ECHO", "PING PONG", "SPIRAL", "REVERB", "TRANS", "ENIGMA JET",
     "FLANGER", "PHASER", "FILTER", "SLIP ROLL", "ROLL", "MOBIUS SAW",
@@ -119,12 +125,6 @@ class Layout:
     def bar_rect(self) -> tuple[int, int, int, int]:
         return 0, 0, self.fw, self.bar_h
 
-    def picker_rect(self) -> tuple[int, int, int, int]:
-        """70% of the panel, centred - what the request asked for."""
-        w = int(self.fw * 0.7)
-        h = int(self.fh * 0.7)
-        return (self.fw - w) // 2, (self.fh - h) // 2, w, h
-
 
 class Button:
     __slots__ = ("label", "key", "action", "channel", "x", "w", "lit", "until")
@@ -149,7 +149,7 @@ class Overlay:
         self.fx = [str(name).upper() for name in
                    load_json(cfg.get("overlay.fx_file"), DEFAULT_FX)]
         self.fx_index = 0                  # what we believe is selected
-        self.mode = "none"                 # none | picker | splash
+        self.mode = "none"                 # none | splash
         self.splash_progress = 0.0
         self.splash_message = ""
         self.layout_buttons()
@@ -193,93 +193,6 @@ class Overlay:
         if target is not False:
             bar.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return bar
-
-    # -- the effect picker -------------------------------------------------
-    def draw_picker(self, target: str | None = None) -> canvas.Canvas:
-        x, y, w, h = self.layout.picker_rect()
-        box = canvas.Canvas(self.layout.info, x, y, w, h)
-        box.fill(PICK_BG)
-        box.frame(0, 0, w, h, PICK_EDGE, max(2, h // 220))
-
-        title = "BEAT FX"
-        tscale = box.fit_scale(title, w // 3, h // 12)
-        box.text_centred(w // 2, h // 22, title, ACCENT, tscale)
-
-        cells = self.fx_cells(w, h)
-        for index, (name, cx, cy, cw, ch) in enumerate(cells):
-            chosen = index == self.fx_index
-            box.rect(cx, cy, cw, ch, LIT_BG if chosen else BUTTON_BG)
-            box.frame(cx, cy, cw, ch,
-                      ACCENT if chosen else BUTTON_EDGE, max(1, ch // 24))
-            scale = box.fit_scale(name, cw - cw // 8, ch - ch // 3)
-            box.text_centred(cx + cw // 2, cy + (ch - font.text_height(scale)) // 2,
-                             name, LIT_LABEL if chosen else LABEL, scale)
-
-        hint = "TAP TO SELECT - HOLD TO SAY IT IS ALREADY ON THAT ONE"
-        hscale = box.fit_scale(hint, w - w // 10, h // 22)
-        box.text_centred(w // 2, h - h // 14, hint, (120, 128, 142), hscale)
-        if target is not False:
-            box.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
-        return box
-
-    def fx_cells(self, w: int, h: int) -> list[tuple]:
-        """Grid geometry for the effect names, inside the picker box."""
-        count = max(1, len(self.fx))
-        columns = 3 if count <= 12 else 4
-        rows = (count + columns - 1) // columns
-        margin = w // 20
-        top = h // 8
-        bottom = h - h // 9
-        gap = max(4, w // 90)
-        cw = (w - 2 * margin - gap * (columns - 1)) // columns
-        ch = (bottom - top - gap * (rows - 1)) // max(1, rows)
-        cells = []
-        for index, name in enumerate(self.fx):
-            col, row = index % columns, index // columns
-            cells.append((name,
-                          margin + col * (cw + gap),
-                          top + row * (ch + gap), cw, ch))
-        return cells
-
-    def picker_hit(self, x: int, y: int) -> int | None:
-        px, py, w, h = self.layout.picker_rect()
-        if not (px <= x < px + w and py <= y < py + h):
-            return None
-        for index, (_name, cx, cy, cw, ch) in enumerate(self.fx_cells(w, h)):
-            if cx <= x - px < cx + cw and cy <= y - py < cy + ch:
-                return index
-        return None
-
-    def choose_fx(self, index: int, resync: bool = False) -> str:
-        """Step the player's FX selector to the effect that was tapped.
-
-        There is no way to ask the player which effect is selected, so the
-        index is tracked here and moved by the difference.  A long press says
-        "it is already on this one" and re-syncs without sending anything,
-        which is the repair when the two drift apart.
-        """
-        count = len(self.fx)
-        index = max(0, min(index, count - 1))
-        if resync:
-            self.fx_index = index
-            return f"marked {self.fx[index]} as the selected effect"
-
-        # Send exactly what the controller's own BEAT FX SELECT button sends:
-        # a press and a release of the FX-type key, which is how the engine
-        # is built to be told to move on.  A rotate carries a delta and the
-        # engine does nothing with it - which is why tapping an effect
-        # changed the highlight here and nothing in the player.
-        #
-        # A button only goes one way, so the shorter route is forwards
-        # through the end of the list and round.
-        steps = (index - self.fx_index) % count
-        for _ in range(steps):
-            keys.tap_ctrl("bfxtype", 1)
-            time.sleep(0.02)
-        self.fx_index = index
-        if not steps:
-            return f"{self.fx[index]} was already selected"
-        return f"selected {self.fx[index]} ({steps} step(s) on)"
 
     # -- the splash --------------------------------------------------------
     def draw_splash(self, progress: float = 0.0, message: str = "",
@@ -334,6 +247,93 @@ class Overlay:
             return 0, 0, 0, 0
         pad = max(2, spare // 10)
         return right + pad, fy + pad, spare - 2 * pad, fh - 2 * pad
+
+    # -- the effect list ---------------------------------------------------
+    def fx_rect(self) -> tuple[int, int, int, int]:
+        """The left-hand black bar, which is otherwise wasted.
+
+        The aspect fit leaves a strip of black down each side of the picture.
+        The master meter uses the right one; the effect list uses the left,
+        where it is always visible - the FLX4 has one FX knob and no way to
+        show what it is set to, and a list you can see beats a box that has
+        to be opened.
+        """
+        fx, fy, _fw, fh = self.layout.frame
+        if fx < 24:
+            return 0, 0, 0, 0
+        pad = max(2, fx // 10)
+        return pad, fy + pad, fx - 2 * pad, fh - 2 * pad
+
+    def fx_rows(self, w: int, h: int) -> list[tuple[str, int, int]]:
+        """(name, y, height) for each effect, top to bottom."""
+        count = max(1, len(self.fx))
+        row_h = max(10, h // count)
+        return [(name, index * row_h, row_h)
+                for index, name in enumerate(self.fx)]
+
+    def fx_hit(self, x: int, y: int) -> int | None:
+        """Which effect a touch landed on, or None."""
+        rx, ry, rw, rh = self.fx_rect()
+        if rw <= 0 or not (rx <= x < rx + rw and ry <= y < ry + rh):
+            return None
+        for index, (_name, top, height) in enumerate(self.fx_rows(rw, rh)):
+            if top <= y - ry < top + height:
+                return index
+        return None
+
+    def draw_fx_strip(self, target: str | None = None) -> canvas.Canvas | None:
+        """The effect list, with the selected one lit."""
+        x, y, w, h = self.fx_rect()
+        if w <= 0 or h <= 0:
+            return None
+        strip = canvas.Canvas(self.layout.info, x, y, w, h)
+        strip.fill(BG)
+        for index, (name, top, height) in enumerate(self.fx_rows(w, h)):
+            live = index == self.fx_index
+            if live:
+                strip.rect(0, top, w, height - 1, FX_ON_BG)
+            scale = strip.fit_scale(name, w - 4, height - 4)
+            text_h = font.text_height(scale)
+            strip.text(2, top + max(0, (height - text_h) // 2), name,
+                       FX_ON if live else FX_OFF, scale)
+        if target is not False:
+            strip.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
+        return strip
+
+    def choose_fx(self, index: int, resync: bool = False) -> str:
+        """Step the player's effect selector to the one that was chosen.
+
+        There is no way to ask the player which effect is selected, so the
+        index is tracked here.  A long press on a row says "it is already on
+        this one" and re-syncs without sending anything, which is the repair
+        when the two drift apart.
+        """
+        count = len(self.fx)
+        index = max(0, min(index, count - 1))
+        if resync:
+            self.fx_index = index
+            return f"marked {self.fx[index]} as the selected effect"
+
+        # Send exactly what the controller's own BEAT FX SELECT button sends:
+        # a press and a release of the FX-type key, which is how the engine
+        # is built to be told to move on.  A rotate carries a delta and the
+        # engine does nothing with it.
+        #
+        # A button only goes one way, so the route is forwards through the
+        # end of the list and round.
+        steps = (index - self.fx_index) % count
+        for _ in range(steps):
+            keys.tap_ctrl("bfxtype", 1)
+            time.sleep(0.02)
+        self.fx_index = index
+        if not steps:
+            return f"{self.fx[index]} was already selected"
+        return f"selected {self.fx[index]} ({steps} step(s) on)"
+
+    def step_fx(self, direction: int) -> str:
+        """Move the selection one effect down (+1) or up (-1)."""
+        count = len(self.fx)
+        return self.choose_fx((self.fx_index + direction) % count)
 
     def read_levels(self) -> tuple[float, float, int]:
         """(left, right, sequence) as 0..1 of full scale."""
@@ -397,8 +397,8 @@ class Overlay:
         """Tell the display driver to stop publishing (or start again).
 
         Without this the player's next frame paints straight over whatever
-        was drawn - a picker that appears and vanishes inside 30ms, which
-        reads as "the button only flashes the layout".
+        was drawn - something that appears and vanishes inside 30ms, which
+        reads as a flicker rather than as a change.
         """
         try:
             if mine:
@@ -423,7 +423,7 @@ class Overlay:
             "mode": self.mode,
             "bar_h": self.layout.bar_h,
             "frame": list(self.layout.frame),
-            "modal": self.mode in ("picker", "splash"),
+            "modal": self.mode == "splash",
         }
         try:
             tmp = STATE_FILE + ".tmp"
@@ -446,7 +446,7 @@ def modal_up() -> bool:
 
 
 class OverlayDaemon:
-    """Owns the top bar, the picker and the splash, and the touches on them.
+    """Owns the top bar, the effect list, the splash and the touches on them.
 
     It opens the touch panel itself rather than being fed by rbtouchd: evdev
     hands every reader its own copy of the events, and the two daemons split
@@ -507,7 +507,7 @@ class OverlayDaemon:
             self.fifo = os.open(CMD_FIFO, os.O_RDWR | os.O_NONBLOCK)
         except OSError as exc:
             util.warn(f"overlay: cannot open {CMD_FIFO} ({exc}); "
-                      "the FX picker cannot be opened from the controller")
+                      "the controller cannot change the effect")
             self.fifo = None
 
     # -- coordinates -------------------------------------------------------
@@ -527,8 +527,11 @@ class OverlayDaemon:
     # -- touch -------------------------------------------------------------
     def press(self, x: int, y: int) -> None:
         over = self.overlay
-        if over.mode == "picker":
-            index = over.picker_hit(x, y)
+        if over.mode == "splash":
+            self.hit = None
+            return
+        index = over.fx_hit(x, y)
+        if index is not None:
             self.hit = ("fx", index)
             return
         button = over.button_at(x, y)
@@ -553,51 +556,21 @@ class OverlayDaemon:
             if target.key:
                 keys.send_key(target.key, target.channel, False)
             if target.action == "fx":
-                self.toggle_picker()
+                util.info(f"overlay: {over.step_fx(1)}")
+                over.draw_fx_strip()
             target.lit = False
             target.until = time.monotonic() + 0.12   # a short afterglow
             self.dirty = True
             return
 
         if kind == "fx":
-            if target is None:                      # tap outside the grid
-                self.close_picker()
+            if target is None:
                 return
             note = over.choose_fx(target, resync=held_ms >= self.HOLD_MS)
             util.info(f"overlay: {note}")
-            over.draw_picker()
-            time.sleep(0.18)                        # let the choice be seen
-            self.close_picker()
+            over.draw_fx_strip()
 
     # -- modes -------------------------------------------------------------
-    def toggle_picker(self) -> None:
-        if self.overlay.mode == "picker":
-            self.close_picker()
-        else:
-            self.open_picker()
-
-    def open_picker(self) -> None:
-        self.overlay.mode = "picker"
-        self.overlay.hold_screen(True)
-        self.overlay.write_state()
-        self.overlay.draw_picker()
-        for button in self.overlay.buttons:
-            if button.action == "fx":
-                button.lit = True
-        self.dirty = True
-
-    def close_picker(self) -> None:
-        self.overlay.mode = "none"
-        self.overlay.hold_screen(False)
-        self.overlay.write_state()
-        for button in self.overlay.buttons:
-            if button.action == "fx":
-                button.lit = False
-        self.dirty = True
-        # the player redraws continuously, so the box disappears on its own;
-        # nudging it makes that immediate rather than on the next UI change
-        keys.tap_key("info") if self.cfg.get("overlay.nudge_after_picker") else None
-
     def splash(self, progress: float, message: str = "") -> None:
         if self.overlay.mode != "splash":
             self.splash_started = time.monotonic()
@@ -651,11 +624,7 @@ class OverlayDaemon:
         point doing even that 50 times a second when the level has not moved
         a segment.
         """
-        if not self.meter_on or self.overlay.mode in ("splash", "picker"):
-            # The picker is a box in the middle of the screen and the meter
-            # is a strip at the side, but they overlap on a narrow panel -
-            # and the meter redraws twenty times a second, straight over it.
-            # That is the picker "glitching".
+        if not self.meter_on or self.overlay.mode == "splash":
             return
         now = time.monotonic()
         if now - self.meter_at < 0.05:
@@ -699,11 +668,26 @@ class OverlayDaemon:
                       f"{waited:.0f}s")
             self.end_splash()
 
+    def redraw_borders(self) -> None:
+        """Put the bar, the effect list and the meter back.
+
+        Anything that covers the whole panel - the splash - takes them with
+        it, and the player does not know they are there to restore them.
+        """
+        if self.overlay.mode == "splash":
+            return
+        self.overlay.draw_bar()
+        self.overlay.draw_fx_strip()
+        if self.meter_on:
+            left, right, _seq = self.overlay.read_levels()
+            self.overlay.draw_meter(left, right)
+
     def end_splash(self) -> None:
         if self.overlay.mode == "splash":
             self.overlay.mode = "none"
             self.overlay.hold_screen(False)
             self.overlay.write_state()
+            self.redraw_borders()
             self.dirty = True
 
     # -- commands ----------------------------------------------------------
@@ -712,10 +696,13 @@ class OverlayDaemon:
         if not parts:
             return
         word = parts[0].lower()
-        if word in ("fx", "picker"):
-            self.toggle_picker()
+        if word in ("fx", "fx+", "fxdown", "picker"):
+            util.info(f"overlay: {self.overlay.step_fx(1)}")
+            self.overlay.draw_fx_strip()
+        elif word in ("fx-", "fxup"):
+            util.info(f"overlay: {self.overlay.step_fx(-1)}")
+            self.overlay.draw_fx_strip()
         elif word == "close":
-            self.close_picker()
             self.end_splash()
         elif word == "splash":
             try:
@@ -785,6 +772,13 @@ class OverlayDaemon:
                   f"{over.layout.frame[0]},{over.layout.frame[1]}")
         self.open_fifo()
         over.draw_bar()
+        if over.fx_rect()[2] > 0:
+            over.draw_fx_strip()
+            util.info(f"overlay: the effect list is in the left bar "
+                      f"({over.fx_rect()[2]}px wide, {len(over.fx)} effects)")
+        else:
+            util.info("overlay: no left border to put the effect list in "
+                      "(the picture fills the panel)")
         if self.meter_on and over.meter_rect()[2] > 0:
             over.draw_meter(0.0, 0.0)
             util.info(f"overlay: master meter in the right bar "
@@ -827,6 +821,7 @@ class OverlayDaemon:
                                 button.until = 0.0
                         if over.mode != "splash":
                             over.draw_bar()
+                            over.draw_fx_strip()
                         self.dirty = False
             except OSError as exc:
                 util.warn(f"overlay: touch lost ({exc}); rescanning")

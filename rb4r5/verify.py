@@ -276,6 +276,11 @@ CONTROLS = [
      ["key=00004114"]),
     ("pad mode BEAT JUMP", "press the BEAT JUMP pad mode button",
      ["key=00004116"]),
+    # BEAT FX SELECT reaches the engine the long way round: the bridge tells
+    # the launcher to move down its effect list, and the launcher sends the
+    # engine one step of the FX-type key.  Same key to watch for, one more
+    # process in between - so this only passes with the launcher running,
+    # which is the point of an end-to-end walk.
     ("BEAT FX select", "press BEAT FX SELECT", ["key=0000448b"]),
     ("BEAT FX on/off", "press BEAT FX ON/OFF", ["key=0000448d"]),
     ("BEAT FX depth", "turn the BEAT FX LEVEL/DEPTH knob", ["key=0000448f"]),

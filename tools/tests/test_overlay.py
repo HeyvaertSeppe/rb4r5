@@ -102,20 +102,52 @@ lit = over.draw_bar(target=False)
 check(bytes(lit.buf) != bytes(bar.buf), "lighting a button changes the bar")
 over.buttons[0].lit = False
 
-print("\n== the effect picker")
-x, y, w, h = over.layout.picker_rect()
-check(abs(w - int(over.layout.fw * 0.7)) <= 1 and
-      abs(h - int(over.layout.fh * 0.7)) <= 1, "70% of the panel")
-check(x + w <= over.layout.fw and y + h <= over.layout.fh and x > 0 and y > 0,
-      "centred inside the panel")
-cells = over.fx_cells(w, h)
-check(len(cells) == len(over.fx), f"a cell per effect ({len(cells)})")
-for index, (name, cx, cy, cw, ch) in enumerate(cells):
-    hit = over.picker_hit(x + cx + cw // 2, y + cy + ch // 2)
-    check(hit == index, f"the middle of cell {index} ({name}) hits {index}")
-    check(cx >= 0 and cy >= 0 and cx + cw <= w and cy + ch <= h,
-          f"cell {index} is inside the box")
-check(over.picker_hit(5, 5) is None, "a touch outside the box is not a cell")
+print("\n== the effect list down the left border")
+#
+# The FLX4 has one FX knob and no way to show what it is set to, so every
+# Beat FX is listed down the left black bar with the selected one lit.  It is
+# always there - no box to open, nothing to draw over the picture.
+x, y, w, h = over.fx_rect()
+mx, _my, mw, _mh = over.meter_rect()
+fx0, _fy, fw0, _fh = over.layout.frame
+check(w > 0, f"there is a left bar to use ({w}px)")
+check(x + w <= fx0, "it stays clear of the player's picture")
+check(mx >= fx0 + fw0, "and the meter is still on the other side")
+
+rows = over.fx_rows(w, h)
+check(len(rows) == len(over.fx), f"a row per effect ({len(rows)})")
+check(all(top >= 0 and top + height <= h for _n, top, height in rows),
+      "every row is inside the bar")
+for index, (name, top, height) in enumerate(rows):
+    hit = over.fx_hit(x + w // 2, y + top + height // 2)
+    check(hit == index, f"the middle of row {index} ({name}) hits {index}")
+check(over.fx_hit(x + w // 2, y - 5) is None, "above the list is not a row")
+check(over.fx_hit(over.layout.fw // 2, y + 5) is None,
+      "and neither is the middle of the screen")
+
+over.fx_index = 3
+strip = over.draw_fx_strip(target=False)
+check(strip is not None and strip.w == w and strip.h == h,
+      "the list covers the bar")
+srgb = fb.to_rgb(bytes(strip.buf), dict(strip.info, width=strip.w,
+                                        height=strip.h,
+                                        line_length=strip.stride))
+lit_row = rows[3]
+dark_row = rows[0]
+
+def row_colour(row):
+    _n, top, height = row
+    px = ((top + height // 2) * strip.w + strip.w // 2) * 3
+    return tuple(srgb[px:px + 3])
+
+check(row_colour(lit_row) != row_colour(dark_row),
+      "the selected effect looks different from the rest")
+
+over.fx_index = 0
+check(over.step_fx(1) and over.fx_index == 1, "FX select moves one down")
+over.fx_index = 0
+over.step_fx(-1)
+check(over.fx_index == len(over.fx) - 1, "and up from the top wraps to the end")
 
 print("\n== choosing an effect steps the player's selector to it")
 #
@@ -178,12 +210,14 @@ full = over.draw_splash(1.0, "x", target=False)
 check(bytes(half.buf) != bytes(full.buf), "progress changes what is drawn")
 
 print("\n== the state file tells the touch daemon to keep off")
-over.mode = "picker"
+# The splash is the only thing that covers the picture now - the effect list
+# lives in the border, so it never has to hold the player off.
+over.mode = "splash"
 over.write_state()
-check(overlay.modal_up() is True, "a picker is modal")
+check(overlay.modal_up() is True, "the splash is modal")
 over.mode = "none"
 over.write_state()
-check(overlay.modal_up() is False, "nothing else is")
+check(overlay.modal_up() is False, "the effect list is not")
 state = overlay.read_state()
 check(state.get("bar_h") == 130 and tuple(state.get("frame", ())) == over.layout.frame,
       "the state carries the geometry touchd needs")

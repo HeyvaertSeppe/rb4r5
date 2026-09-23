@@ -120,6 +120,100 @@ def build_host_tools(cfg, repo: Path, install: bool = True) -> list[str]:
     return notes
 
 
+# --------------------------------------------------------------------------
+# is what is installed what is in the tree?
+# --------------------------------------------------------------------------
+def sources_digest(*dirs: Path) -> str:
+    """One hash over every source file that goes into a build."""
+    h = hashlib.sha256()
+    for directory in dirs:
+        for path in sorted(directory.rglob("*")):
+            if path.is_file() and (path.suffix in (".c", ".h") or
+                                   path.name == "Makefile"):
+                h.update(str(path.relative_to(directory)).encode())
+                h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def _stamp_matches(stamp: Path, digest: str) -> bool:
+    try:
+        return stamp.read_text().strip() == digest
+    except OSError:
+        return False
+
+
+def install_shims(cfg) -> list[str]:
+    """Put the freshly built shims where the player loads them from."""
+    notes = []
+    for name in SHIMS:
+        src = cfg.work / "shims" / name
+        dst = chroot.inside(cfg.chroot, f"usr/lib/{name}")
+        if src.exists():
+            util.ensure_dir(dst.parent)
+            shutil.copy2(src, dst)
+            notes.append(f"installed usr/lib/{name}")
+    return notes
+
+
+def refresh_stale(cfg, repo: Path) -> list[str]:
+    """Rebuild whatever was installed from older sources than the tree's.
+
+    The launcher is Python and runs from the tree, so a `git pull` changes it
+    at once - but the bridge and the shims are compiled, and they stayed
+    whatever was last built.  Half the port updated and half not looks like
+    every fix "changing nothing".  Each install is stamped with a hash of the
+    sources it came from; a run rebuilds what does not match.
+    """
+    notes = []
+    host_digest = sources_digest(repo / "src/host", repo / "src/shims")
+    host_stamp = cfg.bindir / ".rb4r5-host-sources"
+    host_ok = all((cfg.bindir / n).exists() for n in HOST_TOOLS)
+    if not (host_ok and _stamp_matches(host_stamp, host_digest)):
+        util.step("the controller bridge's sources changed - rebuilding it")
+        try:
+            notes += build_host_tools(cfg, repo)
+            host_stamp.write_text(host_digest + "\n")
+        except (util.Fail, OSError) as exc:
+            util.warn(f"could not rebuild the host tools: {exc}\n"
+                      f"    the previous build keeps running; fix it with "
+                      f"`sudo python3 launch.py build`")
+
+    shim_digest = sources_digest(repo / "src/shims")
+    shim_stamp = cfg.work / "shims" / ".rb4r5-shim-sources"
+    installed = all(chroot.inside(cfg.chroot, f"usr/lib/{n}").exists()
+                    for n in SHIMS)
+    if installed and not _stamp_matches(shim_stamp, shim_digest):
+        if not util.have(CROSS + "gcc"):
+            util.warn("the shims' sources changed but the soft-float cross "
+                      "compiler is missing, so the player keeps the old ones:"
+                      "\n    sudo apt-get install gcc-arm-linux-gnueabi "
+                      "libc6-dev-armel-cross && sudo python3 launch.py build")
+            return notes
+        util.step("the player's shims changed - rebuilding them")
+        try:
+            notes += build_shims(cfg, repo)
+            notes += install_shims(cfg)
+            util.ensure_dir(shim_stamp.parent)
+            shim_stamp.write_text(shim_digest + "\n")
+        except (util.Fail, OSError) as exc:
+            util.warn(f"could not rebuild the shims: {exc}\n"
+                      f"    the player keeps the previous ones; fix it with "
+                      f"`sudo python3 launch.py build`")
+    return notes
+
+
+def stamp_current(cfg, repo: Path) -> None:
+    """After a full build: what is installed is what is in the tree."""
+    try:
+        (cfg.bindir / ".rb4r5-host-sources").write_text(
+            sources_digest(repo / "src/host", repo / "src/shims") + "\n")
+        util.ensure_dir(cfg.work / "shims")
+        (cfg.work / "shims" / ".rb4r5-shim-sources").write_text(
+            sources_digest(repo / "src/shims") + "\n")
+    except OSError:
+        pass
+
+
 def build_shims(cfg, repo: Path) -> list[str]:
     """Cross-compile the LD_PRELOAD shims against the RX3 userland.
 
@@ -357,6 +451,7 @@ def all_steps(cfg, repo: Path, with_directfb: bool = True,
     util.step("installing into the chroot")
     notes += chroot.install_runtime_bits(cfg, repo)
     notes.append(chroot.write_directfbrc(cfg))
+    stamp_current(cfg, repo)
 
     # The build continues past a failed component so the rest still gets
     # built, but it must not end quietly: a missing display driver leaves the

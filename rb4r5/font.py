@@ -73,6 +73,26 @@ GLYPH_W, GLYPH_H = 5, 7
 UNKNOWN = GLYPHS["?"]
 
 
+# The RX3's own typeface (rb4r5/typeface.py), when one was found.  Layout
+# does not change with it: a "scale" still means capitals GLYPH_H * scale
+# pixels tall, so everything sized for the pixel font still fits.
+_typeface = None
+
+
+def use_typeface(face) -> None:
+    global _typeface
+    _typeface = face
+
+
+def typeface():
+    return _typeface
+
+
+def pixel_size(scale: int) -> int:
+    """The typeface's pixel size for capitals as tall as the bitmap's."""
+    return _typeface.px_for_cap(GLYPH_H * scale) if _typeface else 0
+
+
 def glyph(char: str) -> tuple[int, ...]:
     return GLYPHS.get(char.upper(), UNKNOWN)
 
@@ -81,6 +101,8 @@ def text_width(text: str, scale: int = 1, tracking: int = 1) -> int:
     """Pixels a string occupies at this scale (tracking is in font pixels)."""
     if not text:
         return 0
+    if _typeface is not None:
+        return _typeface.width(text, pixel_size(scale))
     return (len(text) * (GLYPH_W + tracking) - tracking) * scale
 
 

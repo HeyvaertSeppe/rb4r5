@@ -249,10 +249,14 @@ def read_tuning() -> dict:
 
 
 def seed_tuning(cfg) -> None:
-    """Start the live file from the configured values, so tuning is relative."""
+    """Start the live file from the configured values, so tuning is relative.
+
+    Rewritten on every start.  The bridge re-reads this file twice a second
+    and it wins over the command line, so a copy left in /tmp from an earlier
+    run - an old tpr=1800, say - kept the wheel three times too slow however
+    the config was changed.  Tuning that should last goes in the config
+    (`jogtest` prints the command). """
     try:
-        if Path(JOG_CONF).exists():
-            return
         Path(JOG_CONF).write_text(
             f"tpr={cfg.get('controller.jog_ticks_per_rev', 600)}\n"
             f"scale={cfg.get('controller.jog_scale', 1.0)}\n"

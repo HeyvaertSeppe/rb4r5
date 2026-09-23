@@ -33,12 +33,18 @@ import struct
 import time
 from pathlib import Path
 
-from . import canvas, config, fb, font, inputs, keys, util, zones
+from . import (canvas, config, fb, font, inputs, keys, typeface, util,
+               zones)
 
 CMD_FIFO = "/tmp/rb-overlay.fifo"
 STATE_FILE = "/tmp/rb-overlay.state"
 LEVELS_FILE = "/tmp/rb-levels.dat"      # written by audioshim, 5 x int32
 MASTER_FILE = "/tmp/rb-master.dat"      # the controller's MASTER knob, 0..1
+# What the player itself says it is doing, published from inside it by
+# keyshim.so (src/shims/rb_state.h).  Only the Beat FX position is read here.
+STATE_FILE = "/tmp/rb-state.dat"
+STATE_MAGIC, STATE_VERSION, STATE_SIZE = 0x54534252, 1, 120
+STATE_BFX_POS = 115                      # offset of bfx_pos in the record
 MODAL_FILE = "/tmp/rb-overlay.modal"    # while this exists the player holds off
 FRAMES_FILE = "/tmp/rb-frames.dat"      # the driver's frame counter
 
@@ -161,6 +167,7 @@ class Overlay:
         self.fx = [str(name).upper() for name in
                    load_json(cfg.get("overlay.fx_file"), DEFAULT_FX)]
         self.fx_index = 0                  # what we believe is selected
+        self.fx_chosen_at = 0.0            # when we last moved it ourselves
         self._logo = None                  # None = not looked yet, () = none
         self.mode = "none"                 # none | splash
         self.splash_progress = 0.0
@@ -391,10 +398,12 @@ class Overlay:
             if live:
                 strip.frame(0, top, w, body_h, LIT_EDGE, 1)
             lines = self.fx_lines(name)
-            block = line_h * len(lines) + 2 * (len(lines) - 1)
+            # a third of a capital between lines, whichever font draws them
+            lead = max(2, line_h // 3)
+            block = line_h * len(lines) + lead * (len(lines) - 1)
             start = top + max(0, (body_h - block) // 2)
             for row, text in enumerate(lines):
-                strip.text_centred(w // 2, start + row * (line_h + 2), text,
+                strip.text_centred(w // 2, start + row * (line_h + lead), text,
                                    FX_ON if live else FX_OFF, scale)
         if target is not False:
             strip.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
@@ -449,11 +458,43 @@ class Overlay:
             landed = keys.value("bfxtype", 1, index, index / max(1, count - 1))
 
         self.fx_index = index
+        self.fx_chosen_at = time.monotonic()
         if not landed:
             util.warn(f"overlay: nothing is reading {config.FIFO_CTRL} - the "
                       "effect was not sent to the player")
             return f"{self.fx[index]} (NOT SENT - no reader on the control fifo)"
         return f"selected {self.fx[index]} (switch position {index})"
+
+    def player_fx(self) -> int | None:
+        """The Beat FX position the PLAYER is on, if it says; else None."""
+        try:
+            blob = Path(STATE_FILE).read_bytes()
+        except OSError:
+            return None
+        if len(blob) != STATE_SIZE:
+            return None
+        magic, version, seq = struct.unpack_from("<III", blob, 0)
+        (seq_end,) = struct.unpack_from("<I", blob, STATE_SIZE - 4)
+        if magic != STATE_MAGIC or version != STATE_VERSION or seq != seq_end:
+            return None
+        position = blob[STATE_BFX_POS]
+        return position if position < len(self.fx) else None
+
+    def follow_player_fx(self) -> bool:
+        """Show the effect the player is really on.
+
+        The strip used to show what it had last SENT, so an effect changed on
+        the touchscreen, or a player that came up on the effect it was left
+        on, put the highlight on the wrong line.  Not in the second after a
+        choice of our own, while the player is still catching up with it.
+        Returns True when the highlight moved."""
+        if time.monotonic() - getattr(self, "fx_chosen_at", 0.0) < 1.0:
+            return False
+        position = self.player_fx()
+        if position is None or position == self.fx_index:
+            return False
+        self.fx_index = position
+        return True
 
     def step_fx(self, direction: int) -> str:
         """Move the selection one effect down (+1) or up (-1)."""
@@ -624,6 +665,7 @@ class OverlayDaemon:
         self.splash_max = float(cfg.get("overlay.splash_max_seconds", 75.0))
         self.meter_on = bool(cfg.get("overlay.meter", True))
         self.meter_at = 0.0
+        self.player_at = 0.0
         self.meter_seq = -1
         self.meter_last = (-1.0, -1.0)
 
@@ -784,6 +826,15 @@ class OverlayDaemon:
         self.meter_seq = seq
         self.meter_last = (left, right)
         self.overlay.draw_meter(left, right)
+
+    def poll_player(self) -> None:
+        """Four times a second: is the player on the effect we show?"""
+        now = time.monotonic()
+        if now - self.player_at < 0.25:
+            return
+        self.player_at = now
+        if self.overlay.mode != "splash" and self.overlay.follow_player_fx():
+            self.dirty = True
 
     def poll_splash(self) -> None:
         if self.overlay.mode != "splash":
@@ -962,6 +1013,7 @@ class OverlayDaemon:
                         self.handle_events(events)
                     self.poll_splash()
                     self.poll_meter()
+                    self.poll_player()
                     if self.dirty or any(b.until and b.until < time.monotonic()
                                          for b in over.buttons):
                         for button in over.buttons:
@@ -982,6 +1034,8 @@ class OverlayDaemon:
 
 
 def run(cfg) -> int:
+    # the player's own letters for the labels, when its firmware has them
+    font.use_typeface(typeface.load(cfg))
     daemon = OverlayDaemon(cfg)
     try:
         return daemon.run()

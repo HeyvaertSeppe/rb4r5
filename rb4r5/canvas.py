@@ -27,6 +27,7 @@ class Canvas:
         self.bpp = max(2, info.get("bpp", 16) // 8)
         self.stride = self.w * self.bpp
         self.buf = bytearray(self.stride * self.h)
+        self._unpacked: dict[bytes, tuple[int, int, int]] = {}
 
     # -- painting ----------------------------------------------------------
     def pack(self, colour: tuple[int, int, int]) -> bytes:
@@ -90,10 +91,70 @@ class Canvas:
         self.rect(x, y, thickness, h, colour)
         self.rect(x + w - thickness, y, thickness, h, colour)
 
+    def pixel(self, x: int, y: int) -> tuple[int, int, int]:
+        """What is already drawn at (x, y), as RGB."""
+        at = y * self.stride + x * self.bpp
+        raw = bytes(self.buf[at:at + self.bpp])
+        rgb = self._unpacked.get(raw)
+        if rgb is None:
+            one = dict(self.info, width=1, height=1, line_length=self.bpp)
+            rgb = tuple(fb.to_rgb(raw, one)[:3])
+            self._unpacked[raw] = rgb
+        return rgb
+
+    def _text_face(self, x: int, y: int, message: str,
+                   colour: tuple[int, int, int], scale: int) -> int:
+        """Draw with the RX3's typeface, anti-aliased onto what is there.
+
+        y is the top of the capitals, as with the pixel font, so a label
+        lands where the layout put it whichever font draws it."""
+        face = font.typeface()
+        size = font.pixel_size(scale)
+        cap = font.text_height(scale)
+        baseline = y + cap
+        pen = x
+        blends: dict[tuple[bytes, int], bytes] = {}
+        solid = self.pack(colour)
+        for char in str(message):
+            g = face.glyph(char, size)
+            if g.width and g.rows:
+                gx, gy = pen + g.left, baseline - g.top
+                for row in range(g.rows):
+                    line = gy + row
+                    if line < 0 or line >= self.h:
+                        continue
+                    base = row * g.width
+                    for col in range(g.width):
+                        a = g.alpha[base + col]
+                        if a < 24:
+                            continue
+                        column = gx + col
+                        if column < 0 or column >= self.w:
+                            continue
+                        at = line * self.stride + column * self.bpp
+                        if a >= 232:
+                            self.buf[at:at + self.bpp] = solid
+                            continue
+                        under = bytes(self.buf[at:at + self.bpp])
+                        key = (under, a >> 3)
+                        px = blends.get(key)
+                        if px is None:
+                            bg = self.pixel(column, line)
+                            mix = (a >> 3) / 31.0
+                            px = self.pack(tuple(
+                                int(bg[i] + (colour[i] - bg[i]) * mix + 0.5)
+                                for i in range(3)))
+                            blends[key] = px
+                        self.buf[at:at + self.bpp] = px
+            pen += g.advance
+        return pen - x
+
     def text(self, x: int, y: int, message: str,
              colour: tuple[int, int, int], scale: int = 2,
              tracking: int = 1) -> int:
         """Draw a string; returns the width it took."""
+        if font.typeface() is not None:
+            return self._text_face(x, y, message, colour, scale)
         px = self.pack(colour)
         step = (font.GLYPH_W + tracking) * scale
         for index, char in enumerate(str(message)):

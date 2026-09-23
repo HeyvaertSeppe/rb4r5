@@ -26,6 +26,8 @@ PACKAGES_RUNTIME = ["alsa-utils", "coreutils", "util-linux", "psmisc",
                     "exfatprogs", "dosfstools",
                     # firmware unpacking: AES for the .UPD, bsdtar for the ISO
                     "python3-cryptography", "libarchive-tools", "git",
+                    # the overlay sets its labels in the RX3's own typeface
+                    "libfreetype6",
                     # screenshots of the player (launch.py verify / fbdump)
                     "python3-pil"]
 PACKAGES_BUILD = ["build-essential", "gcc-arm-linux-gnueabi",

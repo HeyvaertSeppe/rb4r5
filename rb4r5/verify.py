@@ -269,13 +269,16 @@ CONTROLS = [
     ("LOOP IN", "press LOOP IN / 4 BEAT", ["key=0000410c"]),
     ("LOOP OUT", "press LOOP OUT", ["key=0000410d"]),
     ("RELOOP", "press RELOOP/EXIT", ["key=0000410e"]),
+    # The deck starts in HOT CUE, and a bank key is only sent when the deck
+    # is not already in that bank (a second press flips it to the bank's
+    # other function) - so HOT CUE is walked last, coming back from another.
+    ("pad mode BEAT JUMP", "press the BEAT JUMP pad mode button",
+     ["key=00004116"]),
+    ("pad mode BEAT LOOP", "press the BEAT LOOP pad mode button (SHIFT + "
+     "BEAT JUMP)", ["key=00004114"]),
     ("pad mode HOT CUE", "press the HOT CUE pad mode button", ["key=00004113"]),
     ("pad 1", "press performance pad 1", ["key=00004117"]),
     ("pad 8", "press performance pad 8", ["key=0000411e"]),
-    ("pad mode BEAT LOOP", "press the BEAT LOOP pad mode button",
-     ["key=00004114"]),
-    ("pad mode BEAT JUMP", "press the BEAT JUMP pad mode button",
-     ["key=00004116"]),
     # BEAT FX SELECT reaches the engine the long way round: the bridge tells
     # the launcher to move down its effect list, and the launcher sends the
     # engine one step of the FX-type key.  Same key to watch for, one more

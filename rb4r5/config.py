@@ -78,6 +78,9 @@ DEFAULTS: dict = {
         # master level meter in the black bar beside the picture, fed by
         # audioshim (which is the only thing that sees the audio)
         "meter": True,
+        # The labels are set in the RX3's own typeface, found in its firmware
+        # (the chroot's /root/gui).  A path here picks a font file instead.
+        "font": None,
     },
     # ---- audio -------------------------------------------------------------
     "audio": {
@@ -129,6 +132,10 @@ DEFAULTS: dict = {
         "jog_bend_scale": 0.25,
         "jog_emit_ms": 10,               # one speed per this many ms
         "leds": True,                    # light the controller's buttons
+        # Light them from the PLAYER's own state (PLAY, CUE, SYNC, loops, hot
+        # cues, BEAT FX, per-channel meters, headphone CUE), read inside the
+        # player by keyshim.so.  Off: they follow the buttons instead.
+        "engine_state": True,
         "jog_touch_timeout_ms": 4000,    # let a stuck plate-touch go
         "midi_device": None,             # /dev/snd/midiC*D*, null = auto
         "filter_init": True,             # select FILTER as the colour FX type
@@ -209,6 +216,10 @@ DEFAULTS: dict = {
         "primebox": "/opt/rb4r5/PrimeBox",
         "neon": True,
         "jobs": 0,                       # 0 = nproc
+        # Rebuild the bridge and the shims before a run when their sources
+        # have changed since they were installed.  Without it a `git pull`
+        # changes nothing until someone remembers `launch.py build`.
+        "auto_rebuild": True,
     },
 }
 

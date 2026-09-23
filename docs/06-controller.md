@@ -310,23 +310,84 @@ Ticks are now accumulated and turned into one speed at a fixed rate
 ## The LEDs
 
 Pioneer controllers light a button by being sent the note that button sends,
-with velocity `0x7f` for on and `0x00` for off. So the bridge opens the MIDI
-node **read-write** now — it was read-only, which is why nothing on the
-controller ever lit — echoes every button it handles, and runs a lamp test at
-startup so you can see at a glance whether the output path works.
+with velocity `0x7f` for on and `0x00` for off. The bridge opens the MIDI node
+read-write, runs a lamp test when the controller appears, and from then on
+**redraws every lamp from state**, writing only the ones that changed.
 
-Pads take their own path through the bridge — the note is computed from the
-pad mode and the pad number rather than looked up in the table — which is how
-they came to be the one thing that never lit. They light now too.
+The state is the **player's own**. `keyshim.so` reads, from inside rbp, the
+same things the RX3's panel is lit from and publishes them forty times a
+second to `/tmp/rb-state.dat` ([`src/shims/rb_state.h`](../src/shims/rb_state.h)):
 
-That is not the same as mirroring the player. The player's own LED state goes
-down the panel link, which is not decoded yet
-([13-panel-link](13-panel-link.md)) — so what lights is what *you* pressed,
-not what the RX3 thinks. `controller.leds=false` turns it off.
+| What | Where in rbp | FLX4 lamp |
+|---|---|---|
+| playing / loaded / sync / looping | `PlayEngine::isPlaying()` etc. (`0x011497d0`) | PLAY, CUE, SYNC, LOOP IN/OUT, RELOOP |
+| PLAY (2 = paused, blink), SYNC (2 = nudged off beat) | `uif::LedStat` ids 49 / 4 | PLAY `0x0B`, SYNC `0x58` |
+| the eight pads, in whatever bank | `uif::LedStat` ids 18–25 | pads, plain and SHIFT channel |
+| BEAT FX ON/OFF (blinks while on) | `uif::LedStat` id 48 | `ch5/6 0x47` |
+| headphone CUE per channel | `MixerEngine::getMixerChHeadphoneCue` | `0x54` |
+| channel meters, 0–11 segments, pre-fader | hook on `MonoLvMeter::getLedValue` | `CC 0x02` per deck |
+| pad bank and its second function | `ui::PlayerInnards` +0x74 / +0x7a | pad-mode buttons |
+| the Beat FX the player is on | `getBeatEffectType()` | the overlay's effect list |
+
+Every address is the SC Live 4 port's (rblive4 `knobshim2.c`), live-verified
+against this same XDJ-RX3 v1.20 rbp. So a track loaded from the touchscreen,
+a loop that ends by itself or a hot cue stored last week all show — none of
+which echoing button presses could do.
+
+The lamps then behave like the RX3's:
+
+* **PLAY** lit while playing, blinking while paused on a track, dark empty.
+* **CUE** lit on the cue point, blinking when paused elsewhere, lit while held.
+* **LOOP IN / OUT** flash while a loop plays (IN alone once its point is set),
+  **RELOOP/EXIT** lit while there is a loop to exit — and all three go out
+  when the loop does.
+* **pads** show what the player holds (stored hot cues, the running beat
+  loop), on both the plain and the SHIFT channel.
+* **pad-mode buttons** are lit on the *deck* channel (`0x90/0x91`), where
+  their buttons are; they used to be sent to the pad channel and never lit.
+
+If the state is missing (an old shim, the player still starting,
+`controller.engine_state=false`) the same lamps are drawn from a model of the
+deck kept from the buttons, and the bridge log says which it is using.
+`RB_ENGINE_STATE=0` in the player's environment turns the reader off, and
+`RB_METER_HOOK=0` just the meter hook.
 
 The bridge only ever writes to a real MIDI character device. A FIFO or a file
 would send the bytes straight back as input, where they would parse as button
 presses nobody made.
+
+### Headphone CUE
+
+The RX3 has no keycode for a channel's CUE button — its PFL buttons go
+straight to the mixer — so the bridge asks keyshim to toggle the channel's cue
+in the player's `MixerEngine` (control record key `0x7e54`, channel 1/2).
+Without the player's state it falls back to MASTER CUE, as before.
+
+### Pad banks: PAD FX1 is RELEASE FX, SAMPLER is SLIP LOOP
+
+The RX3 has four banks (`0x4113`–`0x4116`), and pressing a bank key again
+flips the bank to its **second function** rather than selecting it. RELEASE
+FX and SLIP LOOP share `0x4115`. So the bridge sends a bank key only when the
+deck is not already there, reads which function the bank opened on from the
+player, and flips it once if needed: PAD FX1 lands on RELEASE FX, SAMPLER on
+SLIP LOOP, and pressing either again changes nothing.
+
+### CUE/LOOP CALL < >
+
+With a beat loop running in the BEAT LOOP bank, `<` halves it and `>` doubles
+it by pressing the neighbouring beat-loop pad (rbp's sizes run 4, 2, 1 … 1/32
+beats from pad 1 to 8). They used to send BEAT < / >, which is the Beat FX's
+beat, not the loop's. The RX3's own CUE/LOOP CALL keycodes are not verified,
+so a manual (IN/OUT) loop cannot be resized from here. `loopcall reverse` in
+the map file flips the direction. SHIFT + `<` / `>` are SEARCH.
+
+### Where the faders are
+
+At startup the bridge sends Pioneer's "report every control" sysex
+(`F0 00 40 05 00 00 02 06 00 03 01 F7`, from the DDJ-400 / FLX4 Mixxx
+scripts) and repeats it for half a minute once the player is up, so a fader
+that was already up plays at its real level instead of reading "down" until
+it is moved.
 
 ## "It responds slowly"
 
@@ -475,24 +536,6 @@ the deck is the channel — `0x4102` is CUE, not deck 2's play, and `0x4104` is
 VINYL, not deck 2's cue. Use `play 1` / `play 2`.
 
 `tools/tests/test_keycodes.py` pins all of this so it cannot drift back.
-
-## What the LEDs would take
-
-rbp computes its real LED state into **`uif::LedStat`** and encodes it for the
-panel's micons, sent to `/dev/subucom_spi1.0` — which this port stubs as a
-FIFO and does not decode. So the lights here are *modelled* from what we
-send, which is right until the player changes something by itself.
-
-Matching the player exactly needs one of two things, and neither is a guess
-that can be made from here:
-
-* **decode the panel link** — `launch.py subucom --learn` captures it while a
-  named control changes, which is the data that would make the decode
-  possible; or
-* **read `LedStat` in-process** — the pointer chain is
-  `IUiObjManager::getLedManager()` → `LedManager+0x30`, with `Led` entries of
-  `0x2c` bytes holding id, channel and state. The addresses are specific to
-  each rbp build, so the RX3's have to be found in the RX3's binary.
 
 ## The jog: what makes a turn a scratch
 

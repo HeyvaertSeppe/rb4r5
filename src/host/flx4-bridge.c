@@ -41,6 +41,7 @@
  *     -m  load key overrides / additions from a map file
  *     -J  jog pulses per revolution (default 1800)
  *     -F  select FILTER as the Sound Color FX type on both channels at startup
+ *     -N  light the lamps from the buttons only, not from the player's state
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -56,6 +57,8 @@
 #include <time.h>
 #include <dirent.h>
 #include <stdint.h>
+
+#include "../shims/rb_state.h"
 
 /* ------------------------------------------------------------------ */
 /* rbp / XDJ-RX3 keys                                                  */
@@ -123,6 +126,8 @@
 #define K_BEATPREV    0x4490
 #define K_BEATNEXT    0x4491
 #define K_TAP         0x4492
+#define K_SRFWD       0x411f   /* SEARCH >, per deck */
+#define K_SRREV       0x4120   /* SEARCH <, per deck */
 
 #define CH_GLOBAL     1
 
@@ -305,19 +310,6 @@ static int cc14_n = 0;
  * is an approximation, and an honest one: it shows what you are sending,
  * not what the deck is playing. */
 static float g_fader[2] = { 1.0f, 1.0f };
-
-/* Which decks are running, as far as this process can tell.
- *
- * The audio here is the MASTER mix - one stereo stream, already mixed - so
- * there is no per-deck level in it.  Scaling by the fader alone left the
- * right meter moving whenever the left deck played, because both faders
- * were up.  PLAY is a toggle and this process sees it, so a stopped deck's
- * meter goes dark.
- *
- * It is modelled, not measured: start a deck from the touchscreen and this
- * does not hear about it.  The player's own meters are on the panel link,
- * which this port does not decode (docs/13-panel-link.md). */
-static int g_playing[2] = { 0, 0 };
 
 /* How the meter maps level to scale.  A DJ engine leaves headroom, so a
  * track peaking at -20 dBFS is normal and a -48 dB floor makes that look
@@ -698,8 +690,28 @@ static void midi_send3(int status, int d1, int d2)
 }
 
 
+/* What every lamp was last told, so a lamp is only written when it changes.
+ * The lamps are redrawn from state every pass of the loop; without this that
+ * would be thousands of messages a second down a USB MIDI link. */
+static signed char lamp_last[16][128];
+static int lamp_cache_ready = 0;
+
+static void lamps_forget(void)
+{
+    memset(lamp_last, -1, sizeof(lamp_last));
+    lamp_cache_ready = 1;
+}
+
 static void led_set(int ch, int note, int on)
 {
+    signed char *last;
+    on = on ? 1 : 0;
+    if (!lamp_cache_ready)
+        lamps_forget();
+    last = &lamp_last[ch & 0x0f][note & 0x7f];
+    if (*last == on)
+        return;
+    *last = (signed char)on;
     midi_send3(0x90 | (ch & 0x0f), note, on ? 0x7f : 0x00);
 }
 
@@ -733,278 +745,639 @@ static void fx_lamp_tick(void)
     led_set(MC_FX1, FX_SELECT_NOTE, 0);
 }
 
-/* ---- what a button's light should DO ----
- * Echoing the press is right for a button that means "do this now" and wrong
- * for one that means "you are now in this state".  PLAY stays lit while the
- * deck plays; a pad mode stays lit while that mode is chosen and the other
- * three go dark; CUE lights while held.  The player's own LED state is down
- * the panel link and not decoded yet (docs/13-panel-link.md), so this is
- * modelled from what we send - which is right until something else changes
- * the deck. */
-#define LED_MOMENTARY 0        /* lit while held                        */
-#define LED_TOGGLE    1        /* flips on each press                   */
-#define LED_RADIO     2        /* one of a group, the rest go dark      */
-
-struct led_rule {
-    int key;                   /* the engine key this button sends      */
-    int kind;
-    int group;                 /* for LED_RADIO: which set it belongs to */
-};
-
-static const struct led_rule led_rules[] = {
-    { K_PLAY,     LED_TOGGLE, 0 },
-    { K_SYNC,     LED_TOGGLE, 0 },
-    { K_MASTER,   LED_TOGGLE, 0 },
-    { K_BFX,      LED_TOGGLE, 0 },
-    { K_RELOOP,   LED_TOGGLE, 0 },
-    { K_MASTERCUE, LED_TOGGLE, 0 },   /* headphone CUE stays lit while on */
-    { K_LOOPIN,   LED_TOGGLE, 0 },
-    { K_LOOPOUT,  LED_TOGGLE, 0 },
-    /* The four pad modes were LED_RADIO here.  They no longer pass through
-     * this table at all - they light in pad_mode_light(), which is also the
-     * only place that knows the deck is in that bank - so the rules were
-     * dead.  LED_RADIO itself stays: it is what the kind field is for. */
-};
-
-/* the state we are showing, per (channel, note) */
-#define LED_MAX 128
-static struct { int ch, note, key, on, sch; } led_state[LED_MAX];
-static int led_n = 0;
-
-/* Drop what we think a lamp is showing, so the next press starts from off.
- * A toggle lamp whose control was cancelled some other way (RELOOP takes the
- * loop away) would otherwise need two presses to come back on. */
-static void led_forget(int ch, int note)
-{
-    for (int i = 0; i < led_n; i++)
-        if (led_state[i].ch == ch && led_state[i].note == note)
-            led_state[i].on = 0;
-}
-
-static int led_kind_of(int key, int *group)
-{
-    for (size_t i = 0; i < sizeof(led_rules) / sizeof(led_rules[0]); i++)
-        if (led_rules[i].key == key) {
-            if (group) *group = led_rules[i].group;
-            return led_rules[i].kind;
-        }
-    return LED_MOMENTARY;
-}
-
-static void led_remember(int ch, int note, int key, int sch, int on)
-{
-    for (int i = 0; i < led_n; i++)
-        if (led_state[i].ch == ch && led_state[i].note == note) {
-            led_state[i].on = on;
-            led_state[i].key = key;
-            led_state[i].sch = sch;
-            return;
-        }
-    if (led_n < LED_MAX) {
-        led_state[led_n].ch = ch;
-        led_state[led_n].note = note;
-        led_state[led_n].key = key;
-        led_state[led_n].sch = sch;
-        led_state[led_n].on = on;
-        led_n++;
-    }
-}
-
-static int led_is_on(int ch, int note)
-{
-    for (int i = 0; i < led_n; i++)
-        if (led_state[i].ch == ch && led_state[i].note == note)
-            return led_state[i].on;
-    return 0;
-}
-
-/* Light a button the way its kind says, and darken the rest of its group. */
-static void led_for_press(int ch, int note, int key, int sch, int on)
-{
-    int group = 0;
-    int kind = led_kind_of(key, &group);
-
-    if (kind == LED_MOMENTARY) {
-        led_set(ch, note, on);
-        led_remember(ch, note, key, sch, on);
-        return;
-    }
-    if (!on)
-        return;                        /* state buttons act on the press */
-
-    if (kind == LED_TOGGLE) {
-        int next = !led_is_on(ch, note);
-        led_set(ch, note, next);
-        led_remember(ch, note, key, sch, next);
-        return;
-    }
-
-    /* LED_RADIO: this one on, the others in the group on the same deck off */
-    for (int i = 0; i < led_n; i++) {
-        int other_group = 0;
-        if (led_state[i].ch == ch && led_state[i].note == note)
-            continue;
-        if (led_kind_of(led_state[i].key, &other_group) != LED_RADIO ||
-            other_group != group || led_state[i].sch != sch)
-            continue;
-        if (led_state[i].on) {
-            led_set(led_state[i].ch, led_state[i].note, 0);
-            led_state[i].on = 0;
-        }
-    }
-    led_set(ch, note, 1);
-    led_remember(ch, note, key, sch, 1);
-}
-
-/* ---------------- performance pads ----------------
- * On the FLX4 the pad note is (mode base + pad index), with a different base
- * per pad mode, and the four pad MIDI channels separate deck and SHIFT:
+/* ====================================================================
+ * The lamps
+ * ====================================================================
  *
- *   base 0x00 HOT CUE      -> RX3 HOT CUE bank
- *   base 0x20 BEAT JUMP    -> RX3 BEAT JUMP bank
- *   base 0x30 SAMPLER      -> RX3 SLIP LOOP bank (no sampler in this engine)
- *   base 0x60 BEAT LOOP    -> RX3 AUTO LOOP bank
- *   base 0x40 KEYBOARD, 0x70 KEY SHIFT, PAD FX  -> no RX3 equivalent
+ * The RX3 decides every lamp on its panel itself - PLAY blinking while
+ * paused, SYNC, the hot cue pads that hold a cue, BEAT FX - and keyshim.so
+ * now reads that decision from inside the player and publishes it
+ * (src/shims/rb_state.h).  So the lamps below follow the PLAYER, not the
+ * buttons: a track loaded from the touchscreen, a loop that ends by itself or
+ * a hot cue stored last week all show, which no amount of echoing presses
+ * could do.
+ *
+ * When the player's state is not there (an old keyshim, RB_ENGINE_STATE=0, or
+ * the player still starting) the same lamps are worked out from a model of
+ * the deck kept from the buttons - the fallback, not the plan.
  */
-static int pad_bank_key(int base)
+static int opt_engine_state = 1;       /* -N turns it off                   */
+static const char *state_path = RB_STATE_PATH;   /* -P, for the tests      */
+
+static struct rb_state g_rs;
+static int       g_rs_ok = 0;          /* fresh within the last 750 ms      */
+static uint32_t  g_rs_seq = 0;
+static long long g_rs_fresh_at = 0;
+static long long g_rs_read_at = 0;
+
+static void player_state_up(void);
+
+static void state_tick(long long t)
 {
-    switch (base) {
-    case 0x0: return K_HOTCUE;
-    case 0x2: return K_BEATJUMP;
-    case 0x3: return K_SLIPLOOP;
-    case 0x6: return K_ALOOP;
-    default:  return 0;
+    struct rb_state st;
+    int ok, fd;
+
+    if (!opt_engine_state || t - g_rs_read_at < 25)
+        return;
+    g_rs_read_at = t;
+    fd = open(state_path, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, &st, sizeof(st));
+        close(fd);
+        if (n == (ssize_t)sizeof(st) && st.magic == RB_STATE_MAGIC &&
+            st.version == RB_STATE_VERSION && st.seq == st.seq_end) {
+            if (st.seq != g_rs_seq) {
+                g_rs_seq = st.seq;
+                g_rs_fresh_at = t;
+            }
+            g_rs = st;
+        }
+    }
+    ok = g_rs_fresh_at && t - g_rs_fresh_at < 750;
+    if (ok != g_rs_ok) {
+        g_rs_ok = ok;
+        logmsg("flx4: %s\n", ok
+               ? "the lamps now follow the player's own state"
+               : "the player's state went quiet - lamps follow the buttons");
+        if (ok) {
+            logmsg("flx4: player reports%s%s%s%s\n",
+                   (g_rs.flags & RBS_ENGINE)  ? " transport" : "",
+                   (g_rs.flags & RBS_LEDSTAT) ? " lamps" : "",
+                   (g_rs.flags & RBS_METERS)  ? " meters" : "",
+                   (g_rs.flags & RBS_MIXER)   ? " headphone-cue" : "");
+            player_state_up();
+        }
     }
 }
 
-/* The pad-mode buttons.
- *
- * These used to go through the note table, which sends the key on every
- * press - and pressing the RX3's bank key again moves it on to that bank's
- * SECOND function.  So a second press of PAD FX1 slid release FX over to
- * slip loop, and there was no way back.  Pressing a mode you are already in
- * does nothing now.
- *
- * One deck is in exactly one bank, and BOTH ways in have to agree on which:
- * the mode button, and pressing a pad that belongs to another bank.  They
- * used to keep separate state, so after choosing a mode the first pad press
- * sent the bank key a second time - the same slide, by the other door.  That
- * is what pad_mode_key is for, and both paths go through pad_mode_enter().
- */
-static int pad_mode_key[2] = { 0, 0 };
+static int rs_has(uint32_t what)
+{
+    return g_rs_ok && (g_rs.flags & what) == what;
+}
 
-static const struct { int note; int key; const char *name; } pad_modes[] = {
-    { 0x1B, K_HOTCUE,   "HOT CUE" },
-    { 0x6D, K_ALOOP,    "BEAT LOOP" },
-    { 0x20, K_BEATJUMP, "BEAT JUMP" },
-    { 0x1E, K_SLIPLOOP, "PAD FX1 (release FX)" },
+static int blink_on(void)
+{
+    return (int)((now_ms() / 400) & 1);    /* the RX3's ~1.25 Hz blink */
+}
+
+/* rbp's lamp state -> on/off right now */
+static int lamp_level(uint8_t st, int fallback)
+{
+    if (st == RBL_UNKNOWN)
+        return fallback;
+    if (st == RBL_BLINK)
+        return blink_on();
+    return st != RBL_OFF;
+}
+
+/* ---- the fallback: a deck as the buttons describe it ---- */
+struct deck_model {
+    int loaded, playing;
+    int cue_held, cue_preview, at_cue;
+    long long cue_released_at;
+    int looping, armed, has_loop, loop_pad, prev_looping;
+    int sync, pfl;
+};
+static struct deck_model g_deck[2] = {
+    { .loop_pad = -1 }, { .loop_pad = -1 },
+};
+static int g_bfx_on = 0;
+static int g_hotcue[2][8];             /* model only: which slots hold a cue */
+static int g_pad_held[2][8];
+
+static int deck_loaded(int d)
+{
+    return rs_has(RBS_ENGINE) ? g_rs.deck[d].loaded : g_deck[d].loaded;
+}
+
+static int deck_playing(int d)
+{
+    if (rs_has(RBS_ENGINE))
+        return g_rs.deck[d].playing;
+    return g_deck[d].playing || g_deck[d].cue_preview;
+}
+
+static int deck_looping(int d)
+{
+    return rs_has(RBS_ENGINE) ? g_rs.deck[d].looping : g_deck[d].looping;
+}
+
+/* What a button did to the deck, CDJ rules:
+ *   PLAY toggles; PLAY while CUE is held keeps it playing when CUE lets go.
+ *   CUE while playing goes back to the cue point and stops.  CUE while paused
+ *   on the cue point plays for as long as it is held; paused anywhere else
+ *   it sets the cue point there. */
+static void model_key(int d, int key, int on)
+{
+    struct deck_model *m = &g_deck[d];
+
+    switch (key) {
+    case K_PLAY:
+        if (!on)
+            break;
+        m->loaded = 1;
+        if (m->cue_held) {
+            m->cue_preview = 0;
+            m->playing = 1;
+        } else {
+            m->playing = !deck_playing(d);
+            if (!m->playing)
+                m->at_cue = 0;
+        }
+        break;
+    case K_CUE:
+        if (on) {
+            m->loaded = 1;
+            m->cue_held = 1;
+            if (deck_playing(d)) {
+                m->playing = 0;
+                m->at_cue = 1;
+            } else if (m->at_cue) {
+                m->cue_preview = 1;
+            } else {
+                m->at_cue = 1;
+            }
+        } else {
+            m->cue_held = 0;
+            m->cue_released_at = now_ms();
+            if (m->cue_preview) {
+                m->cue_preview = 0;
+                if (!m->playing)
+                    m->at_cue = 1;
+            }
+        }
+        break;
+    case K_LOAD:
+        if (!on)
+            break;
+        m->loaded = 1;
+        m->playing = m->cue_preview = 0;
+        m->at_cue = 1;
+        m->looping = m->armed = m->has_loop = 0;
+        m->loop_pad = -1;
+        memset(g_hotcue[d], 0, sizeof(g_hotcue[d]));
+        break;
+    case K_LOOPIN:
+        if (on && !deck_looping(d))
+            m->armed = 1;
+        break;
+    case K_LOOPOUT:
+        if (on && (m->armed || deck_looping(d))) {
+            m->looping = m->has_loop = 1;
+            m->armed = 0;
+            m->loop_pad = -1;
+        }
+        break;
+    case K_RELOOP:
+        if (!on)
+            break;
+        m->armed = 0;
+        if (deck_looping(d))
+            m->looping = 0;
+        else if (m->has_loop)
+            m->looping = 1;
+        break;
+    case K_SYNC:
+        if (on)
+            m->sync = !m->sync;
+        break;
+    }
+}
+
+/* Keep the model in step with the player whenever the player can say, so
+ * that the fallback starts from the truth if the state goes away. */
+static void model_follow_player(int d)
+{
+    struct deck_model *m = &g_deck[d];
+    const struct rb_state_deck *k = &g_rs.deck[d];
+    int looping;
+
+    if (!rs_has(RBS_ENGINE))
+        return;
+    m->loaded = k->loaded;
+    if (!m->cue_held)
+        m->playing = k->playing;
+    m->sync = k->sync_on;
+    looping = k->looping;
+    if (looping || (m->prev_looping && !looping))
+        m->armed = 0;                  /* a loop started, or one ended */
+    if (looping)
+        m->has_loop = 1;
+    m->looping = looping;
+    m->prev_looping = looping;
+    /* playing moves the deck off its cue point - but not in the moment
+     * after CUE lets go, while the player is still on its way back to it */
+    if (k->playing && !m->cue_held && now_ms() - m->cue_released_at > 250)
+        m->at_cue = 0;
+}
+
+/* ---- pad modes ----
+ *
+ * The FLX4's pad-mode buttons, and the RX3 bank each one puts the deck in.
+ * The RX3 has four banks (keys 0x4113..0x4116) and a second press of a bank
+ * key flips it to that bank's SECOND function - which is how RELEASE FX and
+ * SLIP LOOP share 0x4115.  So PAD FX1 and SAMPLER are the same RX3 bank, told
+ * apart by that second function:
+ *
+ *   HOT CUE  (0x1B, pads 0x00..) -> HOT CUE
+ *   BEAT LOOP(0x6D, pads 0x60..) -> BEAT LOOP  (SHIFT + BEAT JUMP)
+ *   BEAT JUMP(0x20, pads 0x20..) -> BEAT JUMP
+ *   PAD FX1  (0x1E, pads 0x10..) -> RELEASE FX (0x4115, second function)
+ *   SAMPLER  (0x22, pads 0x30..) -> SLIP LOOP  (0x4115, first function)
+ *
+ * The bank key is only ever sent when the deck is not already where it
+ * should be: pressing it again is not "select", it is "flip".  Where the
+ * player publishes its bank (rb_state pad_mode / pad_sub) that is what is
+ * compared; otherwise the bank we last sent is.
+ *
+ * KEYBOARD, PAD FX2 and KEY SHIFT have no RX3 bank; their pads do nothing.
+ */
+enum { PM_HOTCUE, PM_BEATLOOP, PM_BEATJUMP, PM_RELEASEFX, PM_SLIPLOOP,
+       PM_COUNT };
+
+static const struct pad_mode {
+    int note;          /* the mode button, on the deck channel      */
+    int base;          /* high nibble of the pads' notes in this mode */
+    int key;           /* the RX3 bank key                          */
+    int sub;           /* 0 = the bank's first function, 1 = second */
+    const char *name;
+} pad_modes[PM_COUNT] = {
+    { 0x1B, 0x0, K_HOTCUE,   0, "HOT CUE" },
+    { 0x6D, 0x6, K_ALOOP,    0, "BEAT LOOP" },
+    { 0x20, 0x2, K_BEATJUMP, 0, "BEAT JUMP" },
+    { 0x1E, 0x1, K_SLIPLOOP, 1, "PAD FX1 = RELEASE FX" },
+    { 0x22, 0x3, K_SLIPLOOP, 0, "SAMPLER = SLIP LOOP" },
 };
 
-/* The mode you are in is lit and the other three are dark, which is what the
- * RX3 does.  Both the plain and the SHIFT channel are told, or the lamps go
- * dark the moment a finger lands on SHIFT. */
-static void pad_mode_light(int deck, int key)
-{
-    int plain = deck == 0 ? MC_PAD1 : MC_PAD2;
-    int shift = deck == 0 ? MC_PAD1_SH : MC_PAD2_SH;
-    size_t i;
+/* The FLX4 wakes up in HOT CUE, and so does the player. */
+static int g_padmode[2] = { PM_HOTCUE, PM_HOTCUE };
+static int g_bank[2]    = { K_HOTCUE, K_HOTCUE };   /* the bank we last sent */
+static int g_sub[2]     = { 0, 0 };                 /* ... and its function  */
+static int g_sub_want[2] = { -1, -1 };  /* a function to check once settled */
+static long long g_bank_settle[2];      /* rbp's report is stale until then */
 
-    for (i = 0; i < sizeof(pad_modes) / sizeof(pad_modes[0]); i++) {
-        int lit = pad_modes[i].key == key;
-        led_set(plain, pad_modes[i].note, lit);
-        led_set(shift, pad_modes[i].note, lit);
-    }
+static int pad_mode_by_base(int base)
+{
+    for (int m = 0; m < PM_COUNT; m++)
+        if (pad_modes[m].base == base)
+            return m;
+    return -1;
 }
 
-/* Enter a bank.  Sends the RX3's bank key only if we are not already there,
- * because a second press of it moves on to the bank's second function. */
-static void pad_mode_enter(int deck, int key)
+/* Banks that have a second function this bridge cares about.  Only these
+ * are ever pressed twice: flipping HOT CUE or BEAT JUMP to something unknown
+ * would be worse than leaving them. */
+static int bank_has_sub(int key)
 {
-    const char *name = "that bank";
-    size_t i;
+    return key == K_SLIPLOOP || key == K_ALOOP;
+}
 
-    if (!key)
-        return;
-    for (i = 0; i < sizeof(pad_modes) / sizeof(pad_modes[0]); i++)
-        if (pad_modes[i].key == key)
-            name = pad_modes[i].name;
-    pad_mode_light(deck, key);
-    if (pad_mode_key[deck] == key) {
-        if (opt_verbose)
-            logmsg("  pad mode deck%d already %s; not sending it again "
-                   "(that would move it on to the next bank)\n",
-                   deck + 1, name);
+static int rbp_bank(int d)
+{
+    if (now_ms() >= g_bank_settle[d] && rs_has(RBS_ENGINE) &&
+        g_rs.deck[d].pad_mode <= 3)
+        return K_HOTCUE + g_rs.deck[d].pad_mode;
+    return g_bank[d];
+}
+
+static int live_sub(int d)
+{
+    return g_rs_ok && g_rs.deck[d].pad_sub <= 1;
+}
+
+static int rbp_sub(int d)
+{
+    if (now_ms() >= g_bank_settle[d] && live_sub(d))
+        return g_rs.deck[d].pad_sub;
+    return g_sub[d];
+}
+
+static void pad_mode_enter(int d, int m)
+{
+    const struct pad_mode *pm = &pad_modes[m];
+    long long t = now_ms();
+
+    g_padmode[d] = m;
+    if (rbp_bank(d) != pm->key) {
+        send_tap(pm->key, d + 1);
+        g_bank[d] = pm->key;
+        g_sub[d] = 0;                  /* a bank opens on its first function */
+        g_bank_settle[d] = t + 300;
+        if (bank_has_sub(pm->key)) {
+            if (live_sub(d)) {
+                g_sub_want[d] = pm->sub;       /* checked in pad_mode_tick */
+            } else if (pm->sub) {
+                send_tap(pm->key, d + 1);
+                g_sub[d] = 1;
+            }
+        }
+        logmsg("flx4: deck%d pads -> %s\n", d + 1, pm->name);
         return;
     }
-    pad_mode_key[deck] = key;
-    send_tap(key, deck + 1);
+    if (bank_has_sub(pm->key) && rbp_sub(d) != pm->sub) {
+        send_tap(pm->key, d + 1);
+        g_sub[d] = pm->sub;
+        g_bank_settle[d] = t + 300;
+        g_sub_want[d] = -1;
+        logmsg("flx4: deck%d pads -> %s (second press)\n", d + 1, pm->name);
+        return;
+    }
     if (opt_verbose)
-        logmsg("  pad mode deck%d -> %s\n", deck + 1, name);
+        logmsg("  deck%d already in %s; not pressing the bank key again\n",
+               d + 1, pm->name);
+}
+
+/* After entering a bank, check which function it opened on - the player
+ * says - and flip it once if that is not the one asked for. */
+static void pad_mode_tick(long long t)
+{
+    for (int d = 0; d < 2; d++) {
+        int want = g_sub_want[d];
+        if (want < 0 || t < g_bank_settle[d])
+            continue;
+        g_sub_want[d] = -1;
+        if (!live_sub(d))
+            continue;
+        if (g_rs.deck[d].pad_sub != want) {
+            send_tap(g_bank[d], d + 1);
+            g_bank_settle[d] = t + 300;
+            logmsg("flx4: deck%d bank opened on its other function; "
+                   "pressed it once more\n", d + 1);
+        }
+        g_sub[d] = want;
+    }
 }
 
 static int handle_padmode(int ch, int deck, int note, int on)
 {
-    size_t i;
-
     (void)ch;
-    for (i = 0; i < sizeof(pad_modes) / sizeof(pad_modes[0]); i++)
-        if (pad_modes[i].note == note) {
+    for (int m = 0; m < PM_COUNT; m++)
+        if (pad_modes[m].note == note) {
             if (on)                     /* a mode is chosen on the press */
-                pad_mode_enter(deck, pad_modes[i].key);
+                pad_mode_enter(deck, m);
             return 1;
         }
     return 0;
 }
 
-/* Hot cues do not follow the finger.
- *
- * On the RX3 a hot cue pad is lit when that slot holds a cue and dark when
- * it does not, and on the FLX4 the pad was going dark again the instant it
- * was released - "the hot cues don't light".  There is no cue-point feedback
- * coming back from the player (that lives in uif::LedStat, which this port
- * stubs), so the lamps follow what was just done on the pads instead: a
- * plain press sets the cue, so the pad stays lit; SHIFT+pad deletes it, so
- * it goes dark.  Loading a different track does not reach us, so the lamps
- * can be a track behind until the pads are touched again.
- */
-static int hotcue_set[2][8];
+/* ---- the pads ---- */
+static int pad_lamp(int d, int m, int p)
+{
+    int held = g_pad_held[d][p];
+    const struct rb_state_deck *k = &g_rs.deck[d];
+
+    /* rbp's own pad lamps, while it has the deck in the bank these pads
+     * belong to (its lamps show ITS bank, which the touchscreen can change) */
+    if (rs_has(RBS_LEDSTAT) && rbp_bank(d) == pad_modes[m].key &&
+        k->pad_led[p] != RBL_UNKNOWN)
+        return lamp_level(k->pad_led[p], 0) || held;
+
+    switch (m) {
+    case PM_HOTCUE:
+        return g_hotcue[d][p] || held;
+    case PM_BEATLOOP:
+        return (deck_looping(d) && g_deck[d].loop_pad == p) || held;
+    default:
+        return held;
+    }
+}
+
+static void pads_refresh(int d)
+{
+    int plain = d == 0 ? MC_PAD1 : MC_PAD2;
+    int shift = d == 0 ? MC_PAD1_SH : MC_PAD2_SH;
+
+    /* Every mode's pad notes, so leaving a mode darkens what it lit.  The
+     * SHIFT channel gets the same, or the pads go dark under SHIFT. */
+    for (int m = 0; m < PM_COUNT; m++)
+        for (int p = 0; p < 8; p++) {
+            int note = (pad_modes[m].base << 4) | p;
+            int v = (m == g_padmode[d]) ? pad_lamp(d, m, p) : 0;
+            led_set(plain, note, v);
+            led_set(shift, note, v);
+        }
+}
 
 static void handle_pad(int ch, int deck, int note, int on)
 {
     int base = (note >> 4) & 0x0F;
     int idx  = note & 0x0F;
     int shifted = (ch == MC_PAD1_SH || ch == MC_PAD2_SH);
-    int plain = deck == 0 ? MC_PAD1 : MC_PAD2;
-    int shift = deck == 0 ? MC_PAD1_SH : MC_PAD2_SH;
-    int lit;
+    int m = pad_mode_by_base(base);
 
     if (opt_verbose)
         logmsg("  pad deck%d note 0x%02x (base 0x%x pad %d) %s%s\n",
                deck + 1, note, base, idx + 1, on ? "press" : "release",
-               pad_bank_key(base) ? "" : "  [no RX3 bank: ignored]");
-    if (idx > 7 || !pad_bank_key(base))
+               m >= 0 ? "" : "  [no RX3 bank: ignored]");
+    if (idx > 7 || m < 0)
         return;
 
-    /* Pads take their own path rather than the note table - the note is
-     * computed from the mode and the pad number - so they were missed by the
-     * lighting, which is why every button lit except these.
-     *
-     * The light has to be sent on the SHIFT channel too.  The FLX4 keeps a
-     * separate lamp state per channel, so a pad lit on ch 0x97 goes dark the
-     * moment SHIFT is held unless ch 0x98 was told as well - which is why
-     * hot cues and loops "stop working" whenever a finger is on SHIFT. */
-    if (base == 0x0) {
-        if (on)
-            hotcue_set[deck][idx] = !shifted;
-        lit = hotcue_set[deck][idx];
-    } else {
-        lit = on;
-    }
-    led_set(plain, note, lit);
-    led_set(shift, note, lit);
+    /* The FLX4 changes its pads' notes by itself when a mode button is
+     * pressed, so a pad says which mode the controller is really in. */
+    if (on)
+        pad_mode_enter(deck, m);
+    g_pad_held[deck][idx] = on;
 
-    pad_mode_enter(deck, pad_bank_key(base));
+    /* The RX3 has no SHIFT key for the pads, so SHIFT + a hot cue pad
+     * would CALL the cue the DJ meant to delete.  Better that it does
+     * nothing. */
+    if (shifted && m == PM_HOTCUE) {
+        if (on)
+            logmsg("flx4: SHIFT + hot cue pad has no RX3 equivalent "
+                   "(delete hot cues on the touchscreen)\n");
+        return;
+    }
+
+    if (on && m == PM_HOTCUE)
+        g_hotcue[deck][idx] = 1;           /* an empty pad stores one */
+    if (on && m == PM_BEATLOOP) {
+        struct deck_model *dm = &g_deck[deck];
+        if (deck_looping(deck) && dm->loop_pad == idx) {
+            dm->looping = 0;               /* the lit pad again: exit */
+        } else {
+            dm->looping = dm->has_loop = 1;
+            dm->armed = 0;
+            dm->loop_pad = idx;
+        }
+    }
     send_ctrl(K_PAD1 + idx, on ? OP_PRESS : OP_RELEASE, deck + 1, 0, 0.0f, 0);
+    pads_refresh(deck);                    /* no waiting for the next tick */
+}
+
+/* ---- CUE/LOOP CALL < and >: a running loop, halved or doubled ----
+ *
+ * The RX3's own CUE/LOOP CALL keycodes are not among the verified ones, and
+ * BEAT < / > (which these used to send) are the Beat FX's beat, not the
+ * loop's.  What is verified is the beat-loop pads, and rbp's beat-loop size
+ * table runs 4, 2, 1, 1/2 .. 1/32 beats from pad 1 to pad 8 (rblive4,
+ * PlayerInnards::execAutoBeatLoop).  So with a beat loop running in the BEAT
+ * LOOP bank, "longer" is the pad to the left of the lit one and "shorter" the
+ * pad to its right.  `loopcall reverse` in the map file flips that.
+ */
+static int g_loopcall_reverse = 0;
+
+static void loop_call(int d, int longer)
+{
+    int cur = -1, next;
+
+    if (!deck_looping(d)) {
+        logmsg("flx4: deck%d LOOP CALL: no loop running\n", d + 1);
+        return;
+    }
+    if (rbp_bank(d) != K_ALOOP) {
+        logmsg("flx4: deck%d LOOP CALL: only a beat loop (BEAT LOOP pads) "
+               "can be halved or doubled\n", d + 1);
+        return;
+    }
+    if (rs_has(RBS_LEDSTAT))
+        for (int p = 0; p < 8 && cur < 0; p++)
+            if (g_rs.deck[d].pad_led[p] == RBL_ON ||
+                g_rs.deck[d].pad_led[p] == RBL_BLINK)
+                cur = p;
+    if (cur < 0)
+        cur = g_deck[d].loop_pad;
+    if (cur < 0) {
+        logmsg("flx4: deck%d LOOP CALL: cannot tell which beat loop is "
+               "running\n", d + 1);
+        return;
+    }
+    next = cur + ((longer != g_loopcall_reverse) ? -1 : 1);
+    if (next < 0 || next > 7)
+        return;                           /* already the longest/shortest */
+    send_tap(K_PAD1 + next, d + 1);
+    g_deck[d].loop_pad = next;
+    if (opt_verbose)
+        logmsg("  deck%d loop %s: pad %d -> pad %d\n", d + 1,
+               longer ? "doubled" : "halved", cur + 1, next + 1);
+}
+
+/* ---- every lamp that shows state, from the player or the model ---- */
+static void lamps_refresh(void)
+{
+    int blink = blink_on();
+
+    if (midi_fd < 0 || !opt_leds)
+        return;
+    for (int d = 0; d < 2; d++) {
+        int ch = d == 0 ? MC_DECK1 : MC_DECK2;
+        struct deck_model *m = &g_deck[d];
+        const struct rb_state_deck *k = &g_rs.deck[d];
+        int ledstat = rs_has(RBS_LEDSTAT);
+        int loaded, playing, looping, v;
+
+        model_follow_player(d);
+        loaded  = deck_loaded(d);
+        playing = deck_playing(d);
+        looping = deck_looping(d);
+
+        /* PLAY: lit while playing, blinking while paused on a track */
+        v = playing ? 1 : (loaded ? blink : 0);
+        if (ledstat)
+            v = lamp_level(k->play_led, v);
+        led_set(ch, 0x0B, v);
+        led_set(ch, 0x47, v);                /* the SHIFT layer's PLAY */
+
+        /* CUE: lit on the cue point, blinking when paused anywhere else
+         * (press it to set the cue there), lit while held */
+        v = m->cue_held ? 1
+          : (loaded && !playing) ? (m->at_cue ? 1 : blink) : 0;
+        led_set(ch, 0x0C, v);
+        led_set(ch, 0x48, v);
+
+        /* SYNC: rbp's own lamp keeps its third state - blinking when synced
+         * but nudged off the beat */
+        v = rs_has(RBS_ENGINE) ? k->sync_on : m->sync;
+        if (ledstat)
+            v = lamp_level(k->sync_led, v);
+        led_set(ch, 0x58, v);
+
+        /* LOOP IN and OUT flash while a loop plays; IN alone flashes once its
+         * point is set and OUT is awaited; RELOOP/EXIT is lit while there is
+         * a loop to exit.  Nothing stays lit once the loop is gone. */
+        led_set(ch, 0x10, (looping || (m->armed && !looping)) ? blink : 0);
+        led_set(ch, 0x11, looping ? blink : 0);
+        led_set(ch, 0x4D, looping);
+
+        /* headphone CUE */
+        v = (rs_has(RBS_MIXER) && k->pfl <= 1) ? k->pfl : m->pfl;
+        led_set(ch, 0x54, v);
+
+        /* the pad-mode buttons live on the DECK channel (0x90/0x91) */
+        for (int pm = 0; pm < PM_COUNT; pm++)
+            led_set(ch, pad_modes[pm].note, pm == g_padmode[d]);
+
+        pads_refresh(d);
+    }
+
+    /* BEAT FX ON/OFF: rbp blinks it while an effect is on */
+    {
+        int v = g_bfx_on;
+        if (rs_has(RBS_LEDSTAT))
+            v = lamp_level(g_rs.bfx_led, v);
+        led_set(MC_FX1, 0x47, v);
+        led_set(MC_FX2, 0x47, v);
+    }
+}
+
+/* Keys whose lamp shows STATE, and is drawn by lamps_refresh() - never
+ * echoed from the press, which is what made them wrong. */
+static int lamp_owned(int key)
+{
+    switch (key) {
+    case K_PLAY: case K_CUE: case K_SYNC: case K_LOOPIN: case K_LOOPOUT:
+    case K_RELOOP: case K_BFX: case K_MASTERCUE:
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- the controls' real positions ----
+ *
+ * A fader that is up when the player starts reads as down until it is
+ * moved, because nothing has said where it is.  Pioneer's controllers
+ * answer this sysex with the position of every fader and knob (it is what
+ * the DDJ-400/FLX4 Mixxx scripts send at startup; a controller that does not
+ * know it ignores it).  It is sent when the controller appears and again,
+ * every few seconds for half a minute, once the player is up - a position
+ * sent before the player's mixer exists is dropped.
+ */
+static const unsigned char query_positions[] = {
+    0xF0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x02, 0x06, 0x00, 0x03, 0x01, 0xF7
+};
+static long long g_query_until = 0, g_query_next = 0;
+
+static void positions_window(long long ms)
+{
+    long long t = now_ms();
+    if (t + ms > g_query_until)
+        g_query_until = t + ms;
+    g_query_next = t;
+}
+
+static void positions_tick(long long t)
+{
+    if (midi_fd < 0 || t >= g_query_until || t < g_query_next)
+        return;
+    g_query_next = t + 3000;
+    /* forget what was sent, or the answer - the same positions - would be
+     * dropped as "no change" */
+    for (int i = 0; i < cc14_n; i++) {
+        cc14[i].last10 = -1;
+        cc14[i].have_msb = 0;
+    }
+    if (write(midi_fd, query_positions, sizeof(query_positions)) < 0 &&
+        opt_verbose)
+        logmsg("  (position query failed: %s)\n", strerror(errno));
+    else if (opt_verbose)
+        logmsg("  asked the controller where its faders are\n");
+}
+
+static void player_state_up(void)
+{
+    positions_window(30000);
+    /* the player may have been restarted under us: start from its banks */
+    for (int d = 0; d < 2; d++)
+        g_bank_settle[d] = 0;
 }
 
 /* ---------------- note mapping table ---------------- */
@@ -1042,15 +1415,19 @@ static struct notemap notemap[NMAP_MAX] = {
      * so far, so this goes to MASTER CUE: the headphones follow, which is
      * most of what the button is for.  Bind it properly from the map file
      * once the right keycode is known. */
-    /* CUE/LOOP CALL arrows: halve and double the loop, which is what the
-     * RX3's BEAT arrows do to an active loop. */
-    { MC_DECK1, 0x51, K_BEATPREV, 0, "LOOP CALL < (halve the loop)" },
-    { MC_DECK2, 0x51, K_BEATPREV, 0, "LOOP CALL < (halve the loop)" },
-    { MC_DECK1, 0x53, K_BEATNEXT, 0, "LOOP CALL > (double the loop)" },
-    { MC_DECK2, 0x53, K_BEATNEXT, 0, "LOOP CALL > (double the loop)" },
+    /* CUE/LOOP CALL < and > halve and double a running beat loop - see
+     * loop_call(); they are handled before this table.  With SHIFT they are
+     * the RX3's SEARCH < / >, which scan while held. */
+    { MC_DECK1, 0x3E, K_SRREV, 0, "SHIFT+LOOP CALL < (search back)" },
+    { MC_DECK2, 0x3E, K_SRREV, 0, "SHIFT+LOOP CALL < (search back)" },
+    { MC_DECK1, 0x3D, K_SRFWD, 0, "SHIFT+LOOP CALL > (search forward)" },
+    { MC_DECK2, 0x3D, K_SRFWD, 0, "SHIFT+LOOP CALL > (search forward)" },
     /* SHIFT + RELOOP/EXIT toggles quantize */
     { MC_DECK1, 0x50, K_EFFECTQUANT, CH_GLOBAL, "SHIFT+RELOOP (quantize)" },
     { MC_DECK2, 0x50, K_EFFECTQUANT, CH_GLOBAL, "SHIFT+RELOOP (quantize)" },
+    /* headphone CUE, per channel: toggled in the player's mixer directly
+     * (handle_pfl), because the RX3 has no keycode for it.  MASTER CUE is
+     * only the fallback for a player that cannot take the direct toggle. */
     { MC_DECK1, 0x54, K_MASTERCUE, CH_GLOBAL, "headphone CUE (deck 1)" },
     { MC_DECK2, 0x54, K_MASTERCUE, CH_GLOBAL, "headphone CUE (deck 2)" },
     { MC_DECK1, 0x58, K_SYNC, 0, "BEAT SYNC" },
@@ -1074,12 +1451,7 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_DECK1, 0x67, K_JOG_TOUCH, 0, "SHIFT+jog plate touch" },
     { MC_DECK2, 0x67, K_JOG_TOUCH, 0, "SHIFT+jog plate touch" },
 
-    /* ---- pad mode buttons (the pads themselves carry their mode) ---- */
-    /* The RX3's fourth bank is release FX / slip loop, and it belongs on PAD
-     * FX1 (note 0x1E) where the RX3 puts it - not behind two presses of
-     * SAMPLER (0x22), which is where it was.  The FLX4's own pad-mode notes:
-     *   0x1B HOT CUE   0x1E PAD FX1   0x20 BEAT JUMP   0x22 SAMPLER
-     *   0x69 KEYBOARD  0x6B PAD FX2   0x6D BEAT LOOP   0x6F KEY SHIFT */
+    /* ---- pad mode buttons: see pad_modes[], they are handled first ---- */
 
     /* ---- BEAT FX (ch 5, and ch 6 when the FX is assigned to CH2) ---- */
     /* Pressing FX SELECT opens the picker, because that is what pressing it
@@ -1095,7 +1467,16 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_FX1, 0x43, K_BFX,      CH_GLOBAL, "SHIFT+BEAT FX (all off)" },
     { MC_FX2, 0x43, K_BFX,      CH_GLOBAL, "SHIFT+BEAT FX (all off, CH2)" },
 };
-static int nmap_n = 44;   /* keep in sync with the initialiser above */
+/* Counted at startup: a hand-kept count went stale every time the table
+ * changed, and an entry past it was silently never matched. */
+static int nmap_n = 0;
+
+static void notemap_count(void)
+{
+    nmap_n = 0;
+    while (nmap_n < NMAP_MAX && notemap[nmap_n].name)
+        nmap_n++;
+}
 
 static const char *note_name(int ch, int note)
 {
@@ -1160,10 +1541,26 @@ static void meter_tick(void)
     if (g_meter[0].ch < 0 && g_meter[1].ch < 0)
         return;
     t = now_ms();
-    if (t - g_meter_at < 50)              /* twenty times a second is plenty */
+    if (t - g_meter_at < 40)              /* twenty-five times a second */
         return;
     g_meter_at = t;
 
+    /* The player's own channel meters, when it publishes them: each column
+     * is its own deck's level, measured before the fader - exactly what the
+     * RX3's channel meters show.  rbp lights 0..11 segments. */
+    if (rs_has(RBS_METERS)) {
+        for (int column = 0; column < 2; column++) {
+            int seg = g_rs.deck[column].meter;
+            if (seg > RB_METER_SEGMENTS)
+                seg = RB_METER_SEGMENTS;
+            meter_send(column, (seg * 127 + RB_METER_SEGMENTS / 2) /
+                               RB_METER_SEGMENTS);
+        }
+        return;
+    }
+
+    /* Otherwise the master mix, which is one stream: each column is scaled
+     * by its own fader and darkened while its deck is stopped. */
     fd = open(LEVELS_PATH, O_RDONLY);
     if (fd < 0)
         return;
@@ -1180,7 +1577,7 @@ static void meter_tick(void)
             /* the master mix is one stream: scale each column by its own
              * channel's fader so the two meters move apart */
             peak = (int32_t)((float)peak * g_fader[column] * g_master
-                             * (g_playing[column] ? 1.0f : 0.0f));
+                             * (deck_playing(column) ? 1.0f : 0.0f));
             if (peak > 0 && full > 0) {
                 double db = 20.0 * log10((double)peak / (double)full)
                             + g_meter_gain_db;
@@ -1304,6 +1701,15 @@ static void load_map_file(const char *path)
             logmsg("flx4: master level knob on ch%d CC %#x\n",
                    g_master_ch + 1, number);
             n++;
+        } else if (!strcmp(kind, "loopcall")) {
+            char how[16] = "";
+            if (sscanf(line, "%15s %15s", kind, how) == 2 &&
+                !strcmp(how, "reverse"))
+                g_loopcall_reverse = 1;
+            logmsg("flx4: LOOP CALL arrows %s\n", g_loopcall_reverse
+                   ? "reversed (> is the pad to the left)"
+                   : "normal (< halves, > doubles)");
+            n++;
         } else if (!strcmp(kind, "meter")) {
             char which[16], how[16];
             int number = 0;
@@ -1358,9 +1764,6 @@ static int handle_fxch(int ch, int note)
 }
 
 /* ---------------- MIDI dispatch ---------------- */
-/* One line into the overlay daemon's command fifo.  Never blocks and never
- * matters if nothing is listening: the picker is a convenience, and the
- * controller must not stall because a daemon is not running. */
 /* A short sweep at startup: every note we know how to light, on and then off.
  * It says "a host is here" to the controller, and it tells the operator at a
  * glance whether the output path works at all. */
@@ -1369,6 +1772,12 @@ static void led_hello(void)
     int shown = 0;
     if (midi_fd < 0 || !opt_leds)
         return;
+    lamps_forget();                     /* a new device knows nothing */
+    for (int d = 0; d < 2; d++)
+        for (int m = 0; m < PM_COUNT; m++) {
+            led_set(d == 0 ? MC_DECK1 : MC_DECK2, pad_modes[m].note, 1);
+            shown++;
+        }
     for (int i = 0; i < nmap_n; i++) {
         if (!notemap[i].key || notemap[i].key == K_OVERLAY_FX)
             continue;
@@ -1381,11 +1790,17 @@ static void led_hello(void)
             continue;
         led_set(notemap[i].ch, notemap[i].note, 0);
     }
-    led_n = 0;                          /* everything is dark again */
+    for (int d = 0; d < 2; d++)
+        for (int m = 0; m < PM_COUNT; m++)
+            led_set(d == 0 ? MC_DECK1 : MC_DECK2, pad_modes[m].note, 0);
+    /* from here lamps_refresh() draws everything from state */
     logmsg("flx4-bridge: lamp test over %d button(s)%s\n", shown,
            midi_fd < 0 ? " (no output device)" : "");
 }
 
+/* One line into the overlay daemon's command fifo.  Never blocks and never
+ * matters if nothing is listening: the controller must not stall because a
+ * daemon is not running. */
 static void overlay_command(const char *word)
 {
     static int complained = 0;
@@ -1434,6 +1849,44 @@ static void handle_note(int ch, int note, int on)
     if ((ch == MC_DECK1 || ch == MC_DECK2) && note == 0x3F)
         return;
 
+    if (ch == MC_DECK1 || ch == MC_DECK2) {
+        int d = ch == MC_DECK1 ? 0 : 1;
+
+        /* CUE/LOOP CALL < / >: halve or double a running beat loop */
+        if (note == 0x51 || note == 0x53) {
+            led_set(ch, note, on);
+            if (on)
+                loop_call(d, note == 0x53);
+            return;
+        }
+        /* headphone CUE: straight into the player's mixer, per channel */
+        if (note == 0x54) {
+            if (on) {
+                g_deck[d].pfl = !g_deck[d].pfl;
+                if (rs_has(RBS_MIXER))
+                    send_ctrl(RB_CMD_PFL_TOGGLE, OP_PRESS, d + 1, 0, 0.0f, 0);
+                else
+                    send_tap(K_MASTERCUE, CH_GLOBAL);
+                if (opt_verbose)
+                    logmsg("  headphone CUE deck%d%s\n", d + 1,
+                           rs_has(RBS_MIXER) ? "" : " (as MASTER CUE)");
+            }
+            return;
+        }
+    }
+
+    /* SHIFT + BEAT FX ON/OFF turns the effect OFF - not a second toggle,
+     * which would turn an effect that is already off back on. */
+    if ((ch == MC_FX1 || ch == MC_FX2) && note == 0x43) {
+        int is_on = rs_has(RBS_LEDSTAT) && g_rs.bfx_led != RBL_UNKNOWN
+                  ? g_rs.bfx_led != RBL_OFF : g_bfx_on;
+        if (on && is_on) {
+            send_tap(K_BFX, CH_GLOBAL);
+            g_bfx_on = 0;
+        }
+        return;
+    }
+
     for (int i = 0; i < nmap_n; i++) {
         int sch;
         if (notemap[i].ch != ch || notemap[i].note != note || !notemap[i].key)
@@ -1467,21 +1920,21 @@ static void handle_note(int ch, int note, int on)
         sch = notemap[i].send_ch;
         if (sch == 0)
             sch = (ch == MC_DECK1) ? 1 : 2;
-        /* PLAY is a toggle, and knowing which decks are running is what
-         * keeps a stopped deck's level meter dark (see g_playing). */
-        if (on && notemap[i].key == K_PLAY && sch >= 1 && sch <= 2)
-            g_playing[sch - 1] = !g_playing[sch - 1];
-        /* RELOOP/EXIT takes the loop away, so the LOOP IN and LOOP OUT lamps
-         * have to go out with it - they are toggles and would otherwise stay
-         * lit over a loop that is no longer there. */
-        if (on && notemap[i].key == K_RELOOP) {
-            led_set(ch, 0x10, 0);
-            led_set(ch, 0x11, 0);
-            led_forget(ch, 0x10);
-            led_forget(ch, 0x11);
-        }
+
+        /* the deck model only knows deck keys, so a global one on channel 1
+         * falls through it untouched */
+        if (sch >= 1 && sch <= 2)
+            model_key(sch - 1, notemap[i].key, on);
+        if (on && notemap[i].key == K_BFX)
+            g_bfx_on = !g_bfx_on;
+
         send_ctrl(notemap[i].key, on ? OP_PRESS : OP_RELEASE, sch, 0, 0.0f, 0);
-        led_for_press(ch, note, notemap[i].key, sch, on);
+        /* A lamp that shows state is drawn from that state; any other button
+         * lights while it is held. */
+        if (lamp_owned(notemap[i].key))
+            lamps_refresh();
+        else
+            led_set(ch, note, on);
         note_latency(notemap[i].name);
         if (opt_verbose)
             logmsg("  %s -> 0x%04x %s ch%d\n", notemap[i].name,
@@ -1671,7 +2124,7 @@ int main(int argc, char **argv)
 
     /* -l is handled after the whole option list, so `-l -m map.conf` and
      * `-m map.conf -l` behave the same. */
-    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:c:RLF")) != -1) {
+    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:c:P:RLFN")) != -1) {
         switch (opt) {
         case 'v': opt_verbose = 1; break;
         case 's': opt_sniff = 1; opt_verbose = 1; break;
@@ -1689,18 +2142,21 @@ int main(int argc, char **argv)
         case 'O': opt_overlay = optarg; break;
         case 'L': opt_leds = 0; break;
         case 'F': opt_filter_init = 1; break;
+        case 'N': opt_engine_state = 0; break;
+        case 'P': state_path = optarg; break;
         case 'l': opt_list = 1; break;
         default:
             fprintf(stderr, "usage: %s [-v] [-s] [-l] [-d dev] [-f fifo] "
                             "[-m mapfile] [-J engine_ppr] [-T flx4_ticks_per_rev] "
                             "[-S jog_scale] [-B bend_scale] [-E emit_ms] "
                             "[-R] [-L] [-H touch_timeout_ms] "
-                            "[-O overlayfifo] [-c jogconf] [-F]\n",
+                            "[-O overlayfifo] [-c jogconf] [-F] [-N]\n",
                             argv[0]);
             return 2;
         }
     }
 
+    notemap_count();
     build_cc14();
     if (map_file)
         load_map_file(map_file);
@@ -1771,6 +2227,7 @@ static void run_device(int fd)
         }
     }
     led_hello();
+    positions_window(10000);            /* where are the faders? */
 
     for (;;) {
         struct pollfd pfd;
@@ -1785,8 +2242,15 @@ static void run_device(int fd)
             logmsg("flx4: poll: %s\n", strerror(errno));
             break;
         }
+        {
+            long long t = now_ms();
+            state_tick(t);
+            pad_mode_tick(t);
+            positions_tick(t);
+        }
         fx_lamp_tick();
         meter_tick();
+        lamps_refresh();
         if (pr == 0) {
             jog_tick();
             continue;

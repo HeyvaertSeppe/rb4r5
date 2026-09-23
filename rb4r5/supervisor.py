@@ -25,8 +25,8 @@ import threading
 import time
 from pathlib import Path
 
-from . import (audio, chroot, config, display, jogcal, overlay, platform5,
-               util)
+from . import (audio, build, chroot, config, display, jogcal, overlay,
+               platform5, util)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -127,6 +127,9 @@ class Supervisor:
 
     # -- setup -------------------------------------------------------------
     def preflight(self, strict: bool = True) -> None:
+        if self.cfg.get("build.auto_rebuild", True):
+            for note in build.refresh_stale(self.cfg, self.repo):
+                util.info(note)
         problems = [p for p in platform5.check(strict=False)
                     if not p.startswith("note:")]
         if problems and strict:
@@ -237,6 +240,10 @@ class Supervisor:
         logs = util.ensure_dir(cfg.logs)
         root = str(cfg.chroot)
         player_env = chroot.player_env(cfg, audio.env(cfg, self.audio_choice))
+        # keyshim reads the player's own lamp/meter state for the controller
+        # (src/shims/rb_state.h); this is the off switch if it ever misbehaves
+        if not cfg.get("controller.engine_state", True):
+            player_env["RB_ENGINE_STATE"] = "0"
         python = sys.executable or "python3"
         launcher = str(self.repo / "launch.py")
 
@@ -283,6 +290,8 @@ class Supervisor:
                         "-O", overlay.CMD_FIFO]
                 if not cfg.get("controller.leds", True):
                     argv.append("-L")
+                if not cfg.get("controller.engine_state", True):
+                    argv.append("-N")
                 if cfg.get("controller.jog_reverse"):
                     argv.append("-R")
                 if cfg.get("controller.filter_init", True):

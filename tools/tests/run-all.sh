@@ -24,6 +24,15 @@ for src in src/shims/memshim.c src/shims/audioshim.c src/shims/keyshim.c; do
        -DSYS_mmap2=192 -DSYS_poll=168 "$src" && echo "  $src ok"
 done
 
+if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
+    # keyshim reads the player's memory at fixed ARM addresses and patches
+    # one of its functions, so it is worth compiling as the ARM it will be
+    arm-linux-gnueabi-gcc -O2 -march=armv5t -mfloat-abi=soft \
+        -fno-stack-protector -fPIC -Wall -Wextra -Wno-unused-parameter \
+        -Werror -shared -o "$TMP/keyshim.so" src/shims/keyshim.c -lpthread \
+        && echo "  keyshim.c ok as soft-float ARM"
+fi
+
 echo "== C: framebuffer publish path (src/directfb/rb4r5_scale.h)"
 cc -O2 -Wall -Wextra -o "$TMP/fbscale" tools/tests/test_fbscale.c
 "$TMP/fbscale" | tail -1

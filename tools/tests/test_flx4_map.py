@@ -14,6 +14,8 @@ fault:
     presses of SAMPLER (0x22).
   * a pad's lamp has to be sent on the SHIFT channel too, or it goes dark
     the moment SHIFT is held.
+  * the pad-mode lamps are on the deck channel (0x90/0x91), where their
+    buttons are - they were being sent to the pad channel and never lit.
 
 Run:  python3 tools/tests/test_flx4_map.py
 """
@@ -57,75 +59,63 @@ for note, key, what in (
     (0x11, "K_LOOPOUT", "LOOP OUT"),
     (0x4D, "K_RELOOP", "RELOOP/EXIT"),
     (0x58, "K_SYNC", "BEAT SYNC"),
-    (0x51, "K_BEATPREV", "LOOP CALL left (halve the loop)"),
-    (0x53, "K_BEATNEXT", "LOOP CALL right (double the loop)"),
     (0x50, "K_EFFECTQUANT", "SHIFT+RELOOP (quantize)"),
+    (0x3E, "K_SRREV", "SHIFT+LOOP CALL < (search back)"),
+    (0x3D, "K_SRFWD", "SHIFT+LOOP CALL > (search forward)"),
 ):
     check(f"note 0x{note:02X} is {what}", bound(note, key))
 
+note_fn = SRC[SRC.index("static void handle_note("):]
+note_fn = note_fn[:note_fn.index("\n}\n")]
+check("LOOP CALL < / > resize a running loop (loop_call), not the Beat FX "
+      "beat", "note == 0x51 || note == 0x53" in note_fn
+      and "loop_call(d, note == 0x53)" in note_fn
+      and not bound(0x51, "K_BEATPREV") and not bound(0x53, "K_BEATNEXT"))
+check("headphone CUE toggles the player's own channel cue",
+      "RB_CMD_PFL_TOGGLE" in note_fn)
+
 print("\n== the pad-mode buttons")
-# These are NOT in the note table on purpose: it sends the key on every
-# press, and a second press of an RX3 bank key moves on to that bank's second
-# function - which is how release FX slid over to slip loop.  They go through
-# pad_modes[] / pad_mode_enter() instead, which sends nothing when the deck is
-# already in that bank.
-modes = SRC[SRC.index("} pad_modes[] = {"):]
+# NOT in the note table: it sends the key on every press, and a second press
+# of an RX3 bank key flips it to that bank's second function.
+modes = SRC[SRC.index("} pad_modes[PM_COUNT] = {"):]
 modes = modes[:modes.index("};")]
-for note, key, what in (
-    (0x1B, "K_HOTCUE", "hot cue"),
-    (0x20, "K_BEATJUMP", "beat jump"),
-    (0x6D, "K_ALOOP", "beat loop"),
-    (0x1E, "K_SLIPLOOP", "pad FX1 -> release FX"),
+for note, base, key, sub, what in (
+    (0x1B, 0x0, "K_HOTCUE", 0, "hot cue"),
+    (0x6D, 0x6, "K_ALOOP", 0, "beat loop"),
+    (0x20, 0x2, "K_BEATJUMP", 0, "beat jump"),
+    (0x1E, 0x1, "K_SLIPLOOP", 1, "PAD FX1 -> release FX (second function)"),
+    (0x22, 0x3, "K_SLIPLOOP", 0, "SAMPLER -> slip loop (first function)"),
 ):
     check(f"note 0x{note:02X} selects {what}",
-          bool(re.search(rf"0x{note:02X},\s*{key}\b", modes, re.I)))
+          bool(re.search(rf"0x{note:02X},\s*0x{base:X},\s*{key},\s*{sub},",
+                         modes, re.I)))
     check(f"and note 0x{note:02X} is not in the note table too",
           bound(note, key), False)
 
-check("the release FX bank is NOT on SAMPLER any more",
-      bound(0x22, "K_SLIPLOOP"), False)
-
 enter = SRC[SRC.index("static void pad_mode_enter("):]
 enter = enter[:enter.index("\n}\n")]
-check("pressing the mode you are already in sends nothing",
-      "pad_mode_key[deck] == key" in enter and "return;" in enter)
-check("and a pad press enters its bank the same way",
-      "pad_mode_enter(deck, pad_bank_key(base))" in SRC)
+check("a bank key is only sent when the deck is not in that bank",
+      "if (rbp_bank(d) != pm->key)" in enter)
+check("and only banks with a second function are ever pressed twice",
+      "bank_has_sub(pm->key)" in enter)
+check("a pad press enters its bank the same way", "pad_mode_enter(deck, m)" in SRC)
 
 print("\n== the lamps")
-pad = SRC[SRC.index("static void handle_pad("):]
-pad = pad[:pad.index("\n}\n")]
-check("a pad lights", "led_set(plain, note, lit)" in pad)
-check("and lights on the SHIFT channel too, or it goes dark under SHIFT",
-      "led_set(shift, note, lit)" in pad)
-
-rules = SRC[SRC.index("static const struct led_rule led_rules[]"):]
-rules = rules[:rules.index("};")]
-for key, what in (("K_PLAY", "play"), ("K_SYNC", "sync"),
-                  ("K_RELOOP", "reloop"), ("K_MASTERCUE", "headphone cue"),
-                  ("K_LOOPIN", "loop in"), ("K_LOOPOUT", "loop out")):
-    check(f"{what} stays lit while it is on", key in rules)
-check("the pad modes light themselves, not through this table",
-      "K_HOTCUE" in rules, False)
-
-lamp = SRC[SRC.index("static void pad_mode_light("):]
-lamp = lamp[:lamp.index("\n}\n")]
-check("the mode you are in is lit and the other three are dark",
-      "pad_modes[i].key == key" in lamp)
-check("on the plain channel and the SHIFT one",
-      "MC_PAD1_SH" in lamp and "MC_PAD1" in lamp)
-
-print("\n== the lamps that have to stay put")
-check("a hot cue stays lit after the finger comes off",
-      "hotcue_set[deck][idx]" in pad)
-check("and SHIFT+pad, which deletes it, puts it out", "!shifted" in pad)
-
-reloop = SRC[SRC.index("if (on && notemap[i].key == K_RELOOP)"):]
-reloop = reloop[:reloop.index("}") + 1]
-check("RELOOP/EXIT puts the LOOP IN lamp out", "led_set(ch, 0x10, 0)" in reloop)
-check("and the LOOP OUT lamp", "led_set(ch, 0x11, 0)" in reloop)
-check("and forgets them, so one press relights them",
-      "led_forget(ch, 0x10)" in reloop)
+refresh = SRC[SRC.index("static void lamps_refresh("):]
+refresh = refresh[:refresh.index("\n}\n")]
+check("the lamps follow the player's LED table when it is there",
+      "rs_has(RBS_LEDSTAT)" in refresh and "k->play_led" in refresh)
+check("the pad-mode lamps are on the DECK channel, where their buttons are",
+      "led_set(ch, pad_modes[pm].note" in refresh)
+check("a loop's lamps go out with the loop",
+      "led_set(ch, 0x4D, looping)" in refresh)
+pads = SRC[SRC.index("static void pads_refresh("):]
+pads = pads[:pads.index("\n}\n")]
+check("a pad lamp is sent on the plain channel", "led_set(plain, note, v)" in pads)
+check("and on the SHIFT channel, or it goes dark under SHIFT",
+      "led_set(shift, note, v)" in pads)
+check("lamps are only written when they change",
+      "if (*last == on)" in SRC)
 
 print("\n== the Beat FX channel switch")
 fxch = SRC[SRC.index("static int handle_fxch("):]

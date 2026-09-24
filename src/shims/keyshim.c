@@ -52,7 +52,9 @@ static int real_close(int fd)
  * hundred records a second per deck.  That was thousands of syscalls a second
  * on the path between the wheel and the engine, and a log that grew without
  * end until /tmp filled.  Per-event lines now need KEYSHIM_VERBOSE=1. */
+#ifndef KLOG_PATH
 #define KLOG_PATH "/tmp/keyshim.log"
+#endif
 #define KLOG_CAP  (1024 * 1024)
 
 static int klog_verbose = -1;
@@ -559,12 +561,16 @@ static int me_get_master_cue(void)
 /* Commands that are not panel keys.  The RX3 has no keycode for a channel's
  * headphone CUE - its PFL buttons go straight to the mixer - so the bridge
  * asks for one here.  Returns 1 if the record was one of these. */
+/* set by the state thread once reading the mixer has worked, and never while
+ * that probe is switched off - the toggle calls into the same object */
+static volatile int g_mixer_usable = 0;
+
 static int engine_command(const struct ctrl_ev *ev)
 {
     if (ev->key != RB_CMD_PFL_TOGGLE)
         return 0;
     if (ev->op == OP_PRESS && ev->ch >= 1 && ev->ch <= 2 &&
-        engine_state_enabled()) {
+        engine_state_enabled() && g_mixer_usable) {
         int cur = me_get_cue(ev->ch - 1);
         if (cur >= 0)
             me_set_cue(ev->ch - 1, !cur);
@@ -574,6 +580,7 @@ static int engine_command(const struct ctrl_ev *ev)
 }
 
 /* ---- the LED table ---- */
+__attribute__((noinline))
 static unsigned char *ledstat_table(unsigned int *count)
 {
     void *holder = *(void **)LEDMGR_HOLDER_GLOBAL;
@@ -683,7 +690,7 @@ static int install_meter_hook(void)
     *(uint32_t *)(p + 0) = 0xE51FF004u;
     mprotect((void *)page, pgsz, PROT_READ | PROT_EXEC);
     flush_icache(p, p + 8);
-    klog_str("keyshim: meter hook installed\n");
+    klog_str("keyshim: meter hook installed (RB_METER_HOOK=0 turns it off)\n");
     return 1;
 #else
     return 0;
@@ -797,56 +804,168 @@ static void publish_state(const struct rb_state *st)
                   AT_FDCWD, RB_STATE_PATH);
 }
 
+/* ---- a fault in a probe turns the probe off, not the player ----
+ *
+ * Every probe below reads rbp's memory or calls into rbp at an address that
+ * is only right for the build it was found in.  If one is wrong, that must
+ * cost a lamp, not the player: each tick runs with a SIGSEGV/SIGBUS handler
+ * that, for a fault in THIS thread, jumps back to the top of the tick and
+ * switches the probe that faulted off for good.  A fault in any other thread
+ * goes to whatever handler rbp had, exactly as before. */
+#include <setjmp.h>
+#include <signal.h>
+
+enum {
+    P_ENGINE  = 1 << 0,     /* PlayEngine transport flags     */
+    P_LEDSTAT = 1 << 1,     /* uif::LedStat                   */
+    P_MIXER   = 1 << 2,     /* headphone cue                  */
+    P_PADBANK = 1 << 3,     /* ui::PlayerInnards memory scan  */
+    P_BFX     = 1 << 4,     /* getBeatEffectType()            */
+};
+static const char *probe_name(int probe)
+{
+    switch (probe) {
+    case P_ENGINE:  return "PlayEngine";
+    case P_LEDSTAT: return "LedStat";
+    case P_MIXER:   return "MixerEngine";
+    case P_PADBANK: return "PlayerInnards";
+    case P_BFX:     return "getBeatEffectType";
+    }
+    return "?";
+}
+
+static volatile int g_probe_off;        /* probes switched off */
+static volatile int g_probe_ok;         /* probes that have worked once */
+static volatile int g_probe_step;       /* the probe running now */
+static sigjmp_buf g_probe_jmp;
+static volatile int g_probe_armed;
+static pthread_t g_probe_thread;
+static struct sigaction g_prev_segv, g_prev_bus;
+
+static void probe_fault(int sig, siginfo_t *si, void *uc)
+{
+    if (g_probe_armed && pthread_equal(pthread_self(), g_probe_thread)) {
+        g_probe_armed = 0;
+        siglongjmp(g_probe_jmp, sig);
+    }
+    /* not ours: hand it back and let the instruction fault again there */
+    (void)si; (void)uc;
+    sigaction(sig, sig == SIGBUS ? &g_prev_bus : &g_prev_segv, NULL);
+}
+
+static void probe_guard_on(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = probe_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS, &sa, &g_prev_bus);
+    g_probe_armed = 1;
+}
+
+static void probe_guard_off(void)
+{
+    g_probe_armed = 0;
+    sigaction(SIGSEGV, &g_prev_segv, NULL);
+    sigaction(SIGBUS, &g_prev_bus, NULL);
+}
+
+/* run this probe? (and remember which one is running) */
+static int probe(int which)
+{
+    if (g_probe_off & which)
+        return 0;
+    g_probe_step = which;
+    /* and no read of the probe may be moved above that store: the compiler
+     * is free to hoist a plain load over a volatile one, and did - a fault
+     * was then blamed on no probe at all, and retried forever */
+    __asm__ __volatile__("" ::: "memory");
+    return 1;
+}
+
+static void probe_worked(int which)
+{
+    if (g_probe_ok & which)
+        return;
+    g_probe_ok |= which;
+    klog_str("keyshim: probe ok: ");
+    klog_str(probe_name(which));
+    klog_str("\n");
+}
+
+static int env_on(const char *name, int dflt)
+{
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return dflt;
+    return *v != '0';
+}
+
 /* Installed from the constructor, before rbp has started a single thread:
  * the patch is two words, and a thread running the function while they
  * change would execute half of each. */
 static int g_hooked = 0;
 
-static void *state_thread(void *arg)
+/* One pass over the probes: fills and publishes the record.  Everything it
+ * keeps between passes is here, at file scope, where the jump back from a
+ * faulting probe cannot clobber it. */
+static struct rb_state st, sent;
+static unsigned int last_calls = 0;
+static int quiet = 0, scans = 0, scan_wait = 60, idle = 0, said_meter = 0;
+
+static void state_tick(void)
 {
-    struct rb_state st, sent;
-    unsigned int last_calls = 0;
-    int hooked = g_hooked, quiet = 0, scans = 0, scan_wait = 60, idle = 0;
-    (void)arg;
+    /* volatile: their values are not relied on after a fault's jump back,
+     * but that way the compiler knows it too */
+    void *volatile pe = NULL;
+    unsigned int count = 0;
+    unsigned char *volatile leds = NULL;
+    volatile uint32_t flags = 0;
 
-    for (int i = 0; i < 300 && !get_key_manager(); i++)
-        usleep(100000);
-    if (!engine_state_enabled()) {
-        klog_str("keyshim: engine state publisher off\n");
-        return NULL;
+    probe_guard_on();
+    if (sigsetjmp(g_probe_jmp, 1)) {
+        probe_guard_off();
+        g_probe_off |= g_probe_step;
+        if (g_probe_step == P_MIXER)
+            g_mixer_usable = 0;
+        klog_str("keyshim: probe FAULTED and is now off: ");
+        klog_str(probe_name(g_probe_step));
+        klog_str("\n");
+        return;
     }
-    klog_str("keyshim: engine state publisher up\n");
-    memset(&sent, 0, sizeof(sent));
 
-    memset(&st, 0, sizeof(st));
-    st.magic = RB_STATE_MAGIC;
-    st.version = RB_STATE_VERSION;
+    if (probe(P_ENGINE))
+        pe = *(void **)PLAYENGINE_GLOBAL;
+    if (probe(P_LEDSTAT))
+        leds = ledstat_table(&count);
 
-    for (;;) {
-        void *pe = *(void **)PLAYENGINE_GLOBAL;
-        unsigned int count = 0;
-        unsigned char *leds = ledstat_table(&count);
-        uint32_t flags = 0;
-
-        for (int d = 0; d < 2; d++) {
-            struct rb_state_deck *k = &st.deck[d];
-            if (pe) {
-                k->loaded       = (uint8_t)pe_ask(pe, PE_ISLOADED, d);
-                k->playing      = (uint8_t)pe_ask(pe, PE_ISPLAYING, d);
-                k->sync_on      = (uint8_t)pe_ask(pe, PE_ISSYNCON, d);
-                k->looping      = (uint8_t)pe_ask(pe, PE_ISLOOPING, d);
-                k->can_reloop   = (uint8_t)pe_ask(pe, PE_ISCANRELOOP, d);
-                k->auto_loop    = (uint8_t)pe_ask(pe, PE_ISAUTOBEATLOOP, d);
-                k->slip         = (uint8_t)pe_ask(pe, PE_ISSLIPMODEON, d);
-                k->vinyl        = (uint8_t)pe_ask(pe, PE_ISVINYLMODE, d);
-                k->master_tempo = (uint8_t)pe_ask(pe, PE_ISMASTERTEMPO, d);
-            }
-            k->play_led = ledstat_state(leds, count, LEDSTAT_PLAY, (unsigned)d + 1);
-            k->sync_led = ledstat_state(leds, count, LEDSTAT_SYNC, (unsigned)d + 1);
+    for (int d = 0; d < 2; d++) {
+        struct rb_state_deck *k = &st.deck[d];
+        if (pe && probe(P_ENGINE)) {
+            k->loaded       = (uint8_t)pe_ask(pe, PE_ISLOADED, d);
+            k->playing      = (uint8_t)pe_ask(pe, PE_ISPLAYING, d);
+            k->sync_on      = (uint8_t)pe_ask(pe, PE_ISSYNCON, d);
+            k->looping      = (uint8_t)pe_ask(pe, PE_ISLOOPING, d);
+            k->can_reloop   = (uint8_t)pe_ask(pe, PE_ISCANRELOOP, d);
+            k->auto_loop    = (uint8_t)pe_ask(pe, PE_ISAUTOBEATLOOP, d);
+            k->slip         = (uint8_t)pe_ask(pe, PE_ISSLIPMODEON, d);
+            k->vinyl        = (uint8_t)pe_ask(pe, PE_ISVINYLMODE, d);
+            k->master_tempo = (uint8_t)pe_ask(pe, PE_ISMASTERTEMPO, d);
+            probe_worked(P_ENGINE);
+        }
+        k->play_led = k->sync_led = RBL_UNKNOWN;
+        memset(k->pad_led, RBL_UNKNOWN, sizeof(k->pad_led));
+        if (leds && probe(P_LEDSTAT)) {
+            k->play_led = ledstat_state(leds, count, LEDSTAT_PLAY,
+                                        (unsigned)d + 1);
+            k->sync_led = ledstat_state(leds, count, LEDSTAT_SYNC,
+                                        (unsigned)d + 1);
             for (int p = 0; p < 8; p++) {
-                unsigned char *e = leds ? ledstat_entry(leds, count,
-                                          LEDSTAT_PAD0 + (unsigned)p,
-                                          (unsigned)d + 1) : NULL;
+                unsigned char *e = ledstat_entry(leds, count,
+                                                 LEDSTAT_PAD0 + (unsigned)p,
+                                                 (unsigned)d + 1);
                 k->pad_led[p] = ledstat_state(leds, count,
                                               LEDSTAT_PAD0 + (unsigned)p,
                                               (unsigned)d + 1);
@@ -856,73 +975,127 @@ static void *state_thread(void *arg)
                     k->pad_rgb[p][2] = e[42];
                 }
             }
-            {
-                int cue = me_get_cue(d);
-                k->pfl = cue < 0 ? 0xff : (uint8_t)cue;
-                if (cue >= 0)
-                    flags |= RBS_MIXER;
+            probe_worked(P_LEDSTAT);
+        }
+        k->pfl = 0xff;
+        if (probe(P_MIXER)) {
+            int cue = me_get_cue(d);
+            if (cue >= 0) {
+                k->pfl = (uint8_t)cue;
+                flags |= RBS_MIXER;
+                probe_worked(P_MIXER);
+                g_mixer_usable = 1;
             }
-            k->meter = meter_segments(g_meter_bits[1 + d]);
+        }
+        k->meter = meter_segments(g_meter_bits[1 + d]);
+        k->pad_mode = k->pad_sub = 0xff;
+        if (probe(P_PADBANK)) {
             if (g_plinn[d] && !plinn_valid(g_plinn[d], d))
-                g_plinn[d] = NULL;               /* freed or moved: find it again */
+                g_plinn[d] = NULL;               /* freed or moved */
             if (g_plinn[d]) {
-                k->pad_mode = *(volatile unsigned char *)((char *)g_plinn[d] +
-                                                          PLINN_MODE_OFF);
-                k->pad_sub  = *(volatile unsigned char *)((char *)g_plinn[d] +
-                                                          PLINN_SUB_OFF);
-            } else {
-                k->pad_mode = k->pad_sub = 0xff;
+                k->pad_mode = *(volatile unsigned char *)
+                              ((char *)g_plinn[d] + PLINN_MODE_OFF);
+                k->pad_sub  = *(volatile unsigned char *)
+                              ((char *)g_plinn[d] + PLINN_SUB_OFF);
+                probe_worked(P_PADBANK);
             }
         }
-        /* The scan walks all of rbp's writable memory, so it is not done on
-         * every tick: every two seconds until both decks are found, and a
-         * dozen tries at most - after that the bridge models the bank. */
-        if ((!g_plinn[0] || !g_plinn[1]) && scans < 12 &&
-            ++scan_wait >= 80 && pe) {
-            scan_wait = 0;
-            scans++;
-            plinn_scan();
-        }
-        if (pe)
-            flags |= RBS_ENGINE;
-        if (leds)
-            flags |= RBS_LEDSTAT;
+    }
+    /* The scan walks rbp's writable memory, so it is not done on every
+     * tick: every two seconds until both decks are found, a dozen tries at
+     * most - after that the bridge models the bank. */
+    if (pe && (!g_plinn[0] || !g_plinn[1]) && scans < 12 &&
+        ++scan_wait >= 80 && probe(P_PADBANK)) {
+        scan_wait = 0;
+        scans++;
+        plinn_scan();
+    }
+    if (pe)
+        flags |= RBS_ENGINE;
+    st.bfx_led = RBL_UNKNOWN;
+    if (leds && probe(P_LEDSTAT)) {
+        flags |= RBS_LEDSTAT;
         st.bfx_led = ledstat_state(leds, count, LEDSTAT_BFX, 0);
-        {
-            int mc = me_get_master_cue();
-            st.master_cue = mc < 0 ? 0xff : (uint8_t)mc;
-        }
-        st.master_meter = meter_segments(g_meter_bits[0]);
-        st.bfx_pos = pe ? bfx_position() : 0xff;
+    }
+    st.master_cue = 0xff;
+    if (probe(P_MIXER)) {
+        int mc = me_get_master_cue();
+        st.master_cue = mc < 0 ? 0xff : (uint8_t)mc;
+    }
+    st.bfx_pos = 0xff;
+    if (pe && probe(P_BFX)) {
+        st.bfx_pos = bfx_position();
+        probe_worked(P_BFX);
+    }
+    probe_guard_off();
 
-        /* The meters are only real while rbp keeps calling getLedValue.  If
-         * it stops, say so rather than publish a frozen level. */
-        if (hooked) {
-            if (g_meter_calls != last_calls) {
-                last_calls = g_meter_calls;
-                quiet = 0;
-            } else if (++quiet > 20) {
-                st.deck[0].meter = st.deck[1].meter = 0;
-                st.master_meter = 0;
+    st.master_meter = meter_segments(g_meter_bits[0]);
+    /* The meters are only real while rbp keeps calling getLedValue.  If it
+     * stops, say so rather than publish a frozen level. */
+    if (g_hooked) {
+        if (g_meter_calls != last_calls) {
+            last_calls = g_meter_calls;
+            quiet = 0;
+            if (!said_meter) {
+                said_meter = 1;
+                klog_str("keyshim: meter hook: rbp is calling it\n");
             }
-            if (quiet <= 20)
-                flags |= RBS_METERS;
+        } else if (++quiet > 20) {
+            st.deck[0].meter = st.deck[1].meter = 0;
+            st.master_meter = 0;
         }
+        if (quiet <= 20)
+            flags |= RBS_METERS;
+    }
 
-        st.flags = flags;
-        /* Written when something changed, and five times a second anyway so
-         * the bridge can tell a quiet player from a dead one.  /tmp is on
-         * the SD card on most Pis; there is no point rewriting the same
-         * hundred bytes forty times a second. */
-        st.seq = sent.seq;
-        st.seq_end = sent.seq_end;
-        if (memcmp(&st, &sent, sizeof(st)) != 0 || ++idle >= 8) {
-            idle = 0;
-            st.seq++;
-            st.seq_end = st.seq;
-            publish_state(&st);
-            sent = st;
-        }
+    st.flags = flags;
+    /* Written when something changed, and five times a second anyway so the
+     * bridge can tell a quiet player from a dead one.  /tmp is on the SD card
+     * on most Pis; there is no point rewriting the same hundred bytes forty
+     * times a second. */
+    st.seq = sent.seq;
+    st.seq_end = sent.seq_end;
+    if (memcmp(&st, &sent, sizeof(st)) != 0 || ++idle >= 8) {
+        idle = 0;
+        st.seq++;
+        st.seq_end = st.seq;
+        publish_state(&st);
+        sent = st;
+    }
+}
+
+static void state_begin(void)
+{
+    /* The memory scan and the Beat FX getter are the least proven of the
+     * probes (the SC Live 4 port only ran them on demand): opt in. */
+    if (!env_on("RB_STATE_PADBANK", 0))
+        g_probe_off |= P_PADBANK;
+    if (!env_on("RB_STATE_BFX", 0))
+        g_probe_off |= P_BFX;
+    g_probe_thread = pthread_self();
+    memset(&sent, 0, sizeof(sent));
+    memset(&st, 0, sizeof(st));
+    st.magic = RB_STATE_MAGIC;
+    st.version = RB_STATE_VERSION;
+}
+
+static void *state_thread(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 300 && !get_key_manager(); i++)
+        usleep(100000);
+    if (!engine_state_enabled()) {
+        klog_str("keyshim: engine state publisher off\n");
+        return NULL;
+    }
+    /* let the player finish building its engine and UI before reading them */
+    for (int i = 0; i < 150 && !ui_pump_running(); i++)
+        usleep(100000);
+    sleep(3);
+    state_begin();
+    klog_str("keyshim: engine state publisher up\n");
+    for (;;) {
+        state_tick();
         usleep(25000);                          /* 40 Hz */
     }
     return NULL;
@@ -1011,13 +1184,16 @@ static void *ctrl_thread(void *arg)
     return NULL;
 }
 
+#ifndef KEYSHIM_NO_CONSTRUCTOR
 __attribute__((constructor))
+#endif
 static void keyshim_init(void)
 {
     pthread_t tid;
     if (!is_rbp_process())
         return;                 /* the loader and helpers get nothing */
     rbp_checked = 1;
+    klog_dec("keyshim: loaded into rbp, pid ", (int)getpid());
     if (engine_state_enabled())
         g_hooked = install_meter_hook();
     if (pthread_create(&tid, NULL, key_thread, NULL) == 0)

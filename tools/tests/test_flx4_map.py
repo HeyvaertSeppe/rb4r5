@@ -59,7 +59,7 @@ for note, key, what in (
     (0x11, "K_LOOPOUT", "LOOP OUT"),
     (0x4D, "K_RELOOP", "RELOOP/EXIT"),
     (0x58, "K_SYNC", "BEAT SYNC"),
-    (0x50, "K_EFFECTQUANT", "SHIFT+RELOOP (quantize)"),
+    (0x50, "K_MT", "SHIFT+RELOOP (key lock: tempo without pitch)"),
     (0x3E, "K_SRREV", "SHIFT+LOOP CALL < (search back)"),
     (0x3D, "K_SRFWD", "SHIFT+LOOP CALL > (search forward)"),
 ):

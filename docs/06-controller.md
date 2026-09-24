@@ -346,6 +346,21 @@ The lamps then behave like the RX3's:
 * **pad-mode buttons** are lit on the *deck* channel (`0x90/0x91`), where
   their buttons are; they used to be sent to the pad channel and never lit.
 
+Every probe runs under a fault guard: if an address is wrong for this build,
+the read faults, that one probe switches itself off (`keyshim: probe FAULTED
+and is now off: …` in `/tmp/keyshim.log`) and the player carries on. The pad
+bank scan and the Beat FX getter are the least proven and are off unless
+`RB_STATE_PADBANK=1` / `RB_STATE_BFX=1`. The meter hook runs in the player's
+own thread and cannot be guarded, so if the player dies of a memory fault the
+launcher restarts it without the hook, and after a second crash without the
+reader at all — for that run only, with keyshim's log printed so the cause
+is on screen.
+
+Two lamps do not follow rbp's table: **BEAT FX ON/OFF** blinks while the
+effect is on and is dark when it is off (rbp's id 48 reads "blink" with the
+effect off on this build), and **hot cue pads** light only for a stored cue
+— rbp keeps an empty slot "dim", which an on/off lamp would show as lit.
+
 If the state is missing (an old shim, the player still starting,
 `controller.engine_state=false`) the same lamps are drawn from a model of the
 deck kept from the buttons, and the bridge log says which it is using.
@@ -380,6 +395,20 @@ beats from pad 1 to 8). They used to send BEAT < / >, which is the Beat FX's
 beat, not the loop's. The RX3's own CUE/LOOP CALL keycodes are not verified,
 so a manual (IN/OUT) loop cannot be resized from here. `loopcall reverse` in
 the map file flips the direction. SHIFT + `<` / `>` are SEARCH.
+
+### SHIFT + RELOOP/EXIT is KEY LOCK
+
+Master tempo (`0x4108`) for that deck: the tempo changes and the pitch does
+not. Its lamp is on the SHIFT layer of RELOOP/EXIT (`0x50`).
+
+### Backspin
+
+Letting go of the plate while it is flung backwards (or spun hard forwards)
+keeps the engine "held" while the spin runs down — about 95% gone after
+`spindown` ms (`/tmp/rb-jog.conf`, default 900) — and hands the deck back to
+the motor only when it has stopped. It used to stop dead, because letting go
+of the plate is what hands it back. If the FLX4's own wheel is still turning
+its ticks drive the spin.
 
 ### Where the faders are
 

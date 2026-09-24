@@ -266,6 +266,8 @@ class Supervisor:
         # player_env goes INSIDE the chroot: handing it to the host `chroot`
         # process makes the host loader chase the shims on the host, where
         # they are not, and log a preload failure for every one of them.
+        self.player_env = player_env
+        self.player_cmd = (root, ["/lib/ld-linux.so.3", "/root/pdj/rbp"] + args)
         rbp_argv, rbp_around = chroot.chroot_cmd(
             root, ["/lib/ld-linux.so.3", "/root/pdj/rbp"] + args, player_env)
         self.children.append(Child(
@@ -467,6 +469,10 @@ class Supervisor:
         def feed():
             started = time.monotonic()
             for index, (progress, message) in enumerate(steps):
+                # the player may have got there while we slept: a step sent
+                # now would only be ignored, but there is no reason to send it
+                if index and not overlay.read_state().get("modal"):
+                    return
                 while not overlay.command(f"splash {progress:.2f} {message}"):
                     time.sleep(0.3)          # the daemon is not listening yet
                     if time.monotonic() - started > ceiling:
@@ -540,6 +546,8 @@ class Supervisor:
                                    f"giving up - see {child.log}")
                         return 1
                     self.report_exit(child, code)
+                    if child.name == "rbp":
+                        self.engine_fallback(child, code)
                     time.sleep(child.delay)
                     if child.name == "rbp":
                         chroot.make_stubs(self.cfg)
@@ -548,6 +556,55 @@ class Supervisor:
         finally:
             self.shutdown()
         return 0
+
+    # -- the controller's view into the player, if it is what crashes it ---
+    KEYSHIM_LOG = Path("/tmp/keyshim.log")
+
+    def engine_fallback(self, child, code) -> None:
+        """Restart the player without keyshim's engine reader if it crashed.
+
+        keyshim reads the player's lamps and meters from inside it, at
+        addresses verified on another port of the same build.  Its probes are
+        fault-guarded, but the meter hook runs in the player's own thread and
+        cannot be - so when the player dies of a memory fault, the next start
+        goes without the hook, and the one after without the reader at all.
+        The lamps then follow the buttons, as they did before.  This is for
+        this run only: the next `launch.py run` tries again, and the log says
+        what happened.
+        """
+        if code not in (-4, -7, -11):
+            return
+        env = getattr(self, "player_env", None)
+        if env is None:
+            return
+        try:
+            shim_log = self.KEYSHIM_LOG.read_text(errors="replace")[-20000:]
+        except OSError:
+            shim_log = ""
+        # only what the player that just died wrote
+        mark = shim_log.rfind("keyshim: loaded into rbp")
+        shim_log = shim_log[mark:] if mark >= 0 else ""
+        if shim_log:
+            util.warn("the last of /tmp/keyshim.log:")
+            for line in shim_log.splitlines()[-8:]:
+                print(f"    | {line}")
+        if env.get("RB_METER_HOOK") != "0" and \
+                "meter hook installed" in shim_log:
+            env["RB_METER_HOOK"] = "0"
+            util.warn("the player crashed with keyshim's meter hook in it - "
+                      "restarting it without the hook (the FLX4's meters "
+                      "follow the master output instead)")
+        elif env.get("RB_ENGINE_STATE") != "0" and \
+                "engine state publisher up" in shim_log:
+            env["RB_ENGINE_STATE"] = "0"
+            util.warn("the player crashed again with keyshim reading its "
+                      "state - restarting it without that (the FLX4's lamps "
+                      "follow the buttons).  Set controller.engine_state="
+                      "false to make that permanent.")
+        else:
+            return
+        root, cmd = self.player_cmd
+        child.argv, child.env = chroot.chroot_cmd(root, cmd, env)
 
     # -- saying why something died -----------------------------------------
     SIGNALS = {

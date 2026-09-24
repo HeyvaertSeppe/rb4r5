@@ -101,7 +101,8 @@ DEFAULT_BUTTONS = [
     {"label": "INFO",   "key": "info"},
     {"label": "MENU",   "key": "menu"},
     {"label": "BACK",   "key": "back"},
-    {"label": "FX",     "action": "fx"},
+    # no FX button: the effect list is always in the left border, and the
+    # FLX4's BEAT FX SELECT moves it
 ]
 
 
@@ -527,44 +528,76 @@ class Overlay:
         except (OSError, ValueError):
             return 1.0
 
+    METER_FLOOR_DB = 48.0
+
+    def meter_columns(self, w: int, h: int):
+        """The meter's rows, lit and unlit, worked out once per size.
+
+        Fine lines - two pixels with a two-pixel gap on a 1620-line panel -
+        each its own colour along the scale, so the column reads as one
+        smooth gradient rather than a stack of blocks.  Every row of the
+        drawn meter is one of three prebuilt byte strings: a line lit, a line
+        unlit, or the gap."""
+        key = (w, h)
+        cached = getattr(self, "_meter_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        info = self.layout.info
+        bpp = max(2, info.get("bpp", 16) // 8)
+        col_w = max(2, (w - max(2, w // 8)) // 2)
+        col_gap = w - col_w * 2
+        line = max(1, h // 600)
+        pitch = line * 2
+        bg = fb.pack(info, *BG)
+        off = fb.pack(info, *METER_OFF)
+        rows = []                       # per row: (is_line, lit bytes)
+        for y in range(h):
+            from_bottom = h - 1 - y
+            if from_bottom % pitch >= line:
+                rows.append(None)       # the gap between two lines
+                continue
+            share = from_bottom / max(1, h - 1)
+            rows.append(fb.pack(info, *self.meter_colour(share)) * col_w)
+        gap_px = bg * col_gap
+        blank = bg * w
+        result = (col_w, col_gap, rows, off * col_w, gap_px, blank)
+        self._meter_cache = (key, result)
+        return result
+
     def draw_meter(self, left: float, right: float,
                    target: str | None = None) -> canvas.Canvas | None:
         """The master level, as two columns of fine lines.
 
-        Thin lines with a gap between them, coloured along the scale rather
-        than in three blocks - close to what the player draws, and it reads
-        as a meter at a glance instead of as a bar chart.
-        """
+        Levels are 0..1 of full scale; the scale runs the bottom 48 dB, which
+        is where a DJ mix lives."""
         x, y, w, h = self.meter_rect()
         if w <= 0 or h <= 0:
             return None
         meter = canvas.Canvas(self.layout.info, x, y, w, h)
-        meter.fill(BG)
+        col_w, col_gap, rows, off_row, gap_px, blank = self.meter_columns(w, h)
 
-        line_h = max(1, h // 150)          # thin
-        gap = max(1, line_h)
-        step = line_h + gap
-        segments = max(8, h // step)
-        col_w = (w - max(2, w // 10)) // 2
-        col_gap = w - col_w * 2
+        def lit_rows(level):
+            if level <= 0.00001:
+                return 0
+            db = 20.0 * math.log10(level)
+            share = (db + self.METER_FLOOR_DB) / self.METER_FLOOR_DB
+            return int(max(0.0, min(1.0, share)) * h)
 
-        for column, level in enumerate((left, right)):
-            cx = column * (col_w + col_gap)
-            db = -60.0 if level <= 0.0005 else 20.0 * math.log10(level)
-            filled = int(round((db + 48.0) / 48.0 * segments))
-            for index in range(segments):
-                top = h - (index + 1) * step + gap
-                colour = (METER_OFF if index >= filled
-                          else self.meter_colour(index / max(1, segments - 1)))
-                meter.rect(cx, top, col_w, line_h, colour)
+        tops = (h - lit_rows(left), h - lit_rows(right))
+        stride = meter.stride
+        for row in range(h):
+            line = rows[row]
+            at = row * stride
+            if line is None:
+                meter.buf[at:at + stride] = blank
+                continue
+            meter.buf[at:at + stride] = (
+                (line if row >= tops[0] else off_row) + gap_px +
+                (line if row >= tops[1] else off_row))
 
         # where the player puts its red line
         line_y = h - int(h * 0.88) - 1
         meter.rect(0, line_y, w, 1, (86, 38, 34))
-        scale = meter.fit_scale("LR", w, max(6, h // 40))
-        meter.text(0, h - font.text_height(scale) - 1, "L", FX_OFF, scale)
-        meter.text(col_w + col_gap, h - font.text_height(scale) - 1, "R",
-                   FX_OFF, scale)
         if target is not False:
             meter.blit(target or self.cfg.get("display.fbdev", "/dev/fb0"))
         return meter
@@ -661,6 +694,10 @@ class OverlayDaemon:
         self.splash_started = 0.0
         self.splash_frames = -1
         self.splash_sample = b""
+        # Once the player has drawn, the boot screen is over for good.  A late
+        # "splash" step from the launcher used to put it back over the player,
+        # who then took it down again - the loading flicker.
+        self.splash_done = False
         self.splash_min = float(cfg.get("overlay.splash_min_seconds", 2.0))
         self.splash_max = float(cfg.get("overlay.splash_max_seconds", 75.0))
         self.meter_on = bool(cfg.get("overlay.meter", True))
@@ -762,6 +799,8 @@ class OverlayDaemon:
 
     # -- modes -------------------------------------------------------------
     def splash(self, progress: float, message: str = "") -> None:
+        if self.splash_done:
+            return
         if self.overlay.mode != "splash":
             self.splash_started = time.monotonic()
             self.splash_frames = self.overlay.frame_count()
@@ -821,10 +860,20 @@ class OverlayDaemon:
             return
         self.meter_at = now
         left, right, seq = self.overlay.read_levels()
-        if seq == self.meter_seq and (left, right) == self.meter_last:
+        # Up at once, down smoothly (about 20 dB a second), the way a peak
+        # meter falls back - instead of jumping to wherever the last 50ms
+        # happened to be.
+        dt = now - getattr(self, "meter_fell_at", now)
+        self.meter_fell_at = now
+        fall = 10 ** (-20.0 * min(dt, 0.2) / 20.0)
+        shown = getattr(self, "meter_shown", (0.0, 0.0))
+        left = max(left, shown[0] * fall)
+        right = max(right, shown[1] * fall)
+        self.meter_shown = (left, right)
+        if (round(left, 3), round(right, 3)) == self.meter_last:
             return
         self.meter_seq = seq
-        self.meter_last = (left, right)
+        self.meter_last = (round(left, 3), round(right, 3))
         self.overlay.draw_meter(left, right)
 
     def poll_player(self) -> None:
@@ -881,7 +930,20 @@ class OverlayDaemon:
             left, right, _seq = self.overlay.read_levels()
             self.overlay.draw_meter(left, right)
 
+    def adopt_splash(self) -> None:
+        """The launcher put the boot screen up before this daemon existed.
+
+        Carry on from it rather than drawing the bar and the effect list over
+        it, and then the whole boot screen again on the first step - which is
+        what made the start of the loading flicker."""
+        self.overlay.mode = "splash"
+        self.overlay.write_state()
+        self.splash_started = time.monotonic()
+        self.splash_frames = self.overlay.frame_count()
+        self.splash_sample = self.sample_frame()
+
     def end_splash(self) -> None:
+        self.splash_done = True
         if self.overlay.mode == "splash":
             self.overlay.mode = "none"
             self.overlay.hold_screen(False)
@@ -970,16 +1032,21 @@ class OverlayDaemon:
                   f"{over.layout.frame[2]}x{over.layout.frame[3]} at "
                   f"{over.layout.frame[0]},{over.layout.frame[1]}")
         self.open_fifo()
-        over.draw_bar()
+        if Path(MODAL_FILE).exists() and self.cfg.get("overlay.splash", True):
+            self.adopt_splash()
+        else:
+            over.draw_bar()
         if over.fx_rect()[2] > 0:
-            over.draw_fx_strip()
+            if over.mode != "splash":
+                over.draw_fx_strip()
             util.info(f"overlay: the effect list is in the left bar "
                       f"({over.fx_rect()[2]}px wide, {len(over.fx)} effects)")
         else:
             util.info("overlay: no left border to put the effect list in "
                       "(the picture fills the panel)")
         if self.meter_on and over.meter_rect()[2] > 0:
-            over.draw_meter(0.0, 0.0)
+            if over.mode != "splash":
+                over.draw_meter(0.0, 0.0)
             util.info(f"overlay: master meter in the right bar "
                       f"({over.meter_rect()[2]}px wide)")
         elif self.meter_on:

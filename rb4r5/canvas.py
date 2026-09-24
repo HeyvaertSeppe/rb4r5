@@ -231,11 +231,19 @@ class Canvas:
     def blit(self, target: str = "/dev/fb0") -> None:
         """Copy the canvas into the framebuffer, one row per seek."""
         stride = self.info["line_length"]
-        with open(target, "r+b", buffering=0) as handle:
-            for line in range(self.h):
-                handle.seek((self.y + line) * stride + self.x * self.bpp)
-                handle.write(self.buf[line * self.stride:
-                                      (line + 1) * self.stride])
+        view = memoryview(self.buf)
+        fd = os.open(target, os.O_RDWR)
+        try:
+            if self.x == 0 and self.stride == stride:
+                # the full width: one write, not one per row
+                os.pwrite(fd, view, self.y * stride)
+            else:
+                for line in range(self.h):
+                    os.pwrite(fd, view[line * self.stride:
+                                       (line + 1) * self.stride],
+                              (self.y + line) * stride + self.x * self.bpp)
+        finally:
+            os.close(fd)
 
     def to_png(self, path: str) -> str:
         """For tests and for looking at the thing without a panel."""

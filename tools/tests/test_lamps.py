@@ -137,11 +137,12 @@ with tempfile.TemporaryDirectory() as tmp:
     ctrl.write_bytes(b"")
     state = tmp / "rb-state.dat"
     player = Player(state)
+    DIM = 3
     player.decks[0] = deck(loaded=1, playing=1, play_led=ON, meter=11,
-                           pads=[OFF, OFF, ON, OFF, OFF, OFF, OFF, OFF])
+                           pads=[DIM, DIM, ON, DIM, DIM, DIM, DIM, DIM])
     player.decks[1] = deck(loaded=1, playing=0, play_led=BLINK, meter=0,
                            pfl=1)
-    player.bfx = ON
+    player.bfx = BLINK             # what rbp reports with the effect OFF
     player.thread.start()
 
     proc = subprocess.Popen(
@@ -158,13 +159,28 @@ with tempfile.TemporaryDirectory() as tmp:
               flx.seen.get((0x91, 0x0B), set()) >= {0x00, 0x7F})
         check("a hot cue the player holds is lit", flx.lamps.get((0x97, 0x02)), 0x7F)
         check("... on the SHIFT channel too", flx.lamps.get((0x98, 0x02)), 0x7F)
-        check("an empty hot cue is dark", flx.lamps.get((0x97, 0x03)), 0x00)
+        check("an empty hot cue is dark (rbp keeps it dim)",
+              flx.lamps.get((0x97, 0x03)), 0x00)
         check("the HOT CUE mode lamp is on the deck channel",
               flx.lamps.get((0x90, 0x1B)), 0x7F)
         check("and the other modes are dark", flx.lamps.get((0x90, 0x20)), 0x00)
         check("deck 2's headphone CUE is lit", flx.lamps.get((0x91, 0x54)), 0x7F)
-        check("BEAT FX ON/OFF is lit", flx.lamps.get((0x94, 0x47)), 0x7F)
+        flx.seen.pop((0x94, 0x47), None)    # past the startup lamp test
+        flx.pump(0.9)
+        check("BEAT FX ON/OFF stays dark while the effect is off, whatever "
+              "rbp's lamp says", 0x7F not in flx.seen.get((0x94, 0x47), set())
+              and flx.lamps.get((0x94, 0x47)) == 0)
         check("no loop, so LOOP IN is dark", flx.lamps.get((0x90, 0x10)), 0x00)
+
+        flx.send(0x94, 0x47, 0x7F)          # effect ON
+        flx.send(0x94, 0x47, 0x00)
+        flx.seen.pop((0x94, 0x47), None)
+        flx.pump(1.0)
+        check("and blinks once it is on",
+              flx.seen.get((0x94, 0x47), set()) >= {0x00, 0x7F})
+        flx.send(0x94, 0x47, 0x7F)          # and OFF again
+        flx.send(0x94, 0x47, 0x00)
+        flx.pump(0.2)
 
         print("\n== each meter is its own deck")
         check("deck 1 playing loud: full", flx.lamps.get((0xB0, 0x02)), 127)
@@ -243,6 +259,34 @@ with tempfile.TemporaryDirectory() as tmp:
               [r[0] - 0x4117 + 1 for r in pads], [3])
         check("and not the Beat FX's BEAT key",
               [r for r in records(ctrl)[before:] if r[0] in (0x4490, 0x4491)], [])
+        print("\n== SHIFT + RELOOP/EXIT is key lock")
+        before = len(records(ctrl))
+        flx.send(0x90, 0x50, 0x7F)
+        flx.send(0x90, 0x50, 0x00)
+        flx.pump(0.2)
+        check("it sends MASTER TEMPO for that deck",
+              [(r[0], r[1]) for r in records(ctrl)[before:] if r[2] == 0],
+              [(0x4108, 1)])
+
+        print("\n== a backspin runs down instead of stopping dead")
+        before = len(records(ctrl))
+        flx.send(0x90, 0x36, 0x7F)          # hand on the plate
+        for _ in range(12):                 # fling it backwards, hard
+            flx.send(0xB0, 0x22, 0x80 - 40)
+            time.sleep(0.01)
+        flx.send(0x90, 0x36, 0x00)          # and let go
+        flx.pump(1.6)
+        recs = records(ctrl)[before:]
+        release_at = [i for i, r in enumerate(recs)
+                      if r[0] == 0x4306 and r[2] == 2]
+        spins = [r for r in recs if r[0] == 0x4305]
+        after_letgo = [r for r in spins
+                       if release_at and recs.index(r) < release_at[0]
+                       and r[4] < -0.1]
+        check("the plate is let go of only once the spin has run down",
+              bool(release_at) and len(after_letgo) > 5)
+        check("and the spin slows rather than stops",
+              len({round(r[4], 1) for r in after_letgo}) > 3)
     finally:
         proc.terminate()
         out = proc.communicate(timeout=5)[0].decode(errors="replace")

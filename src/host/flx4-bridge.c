@@ -126,6 +126,7 @@
 #define K_BEATPREV    0x4490
 #define K_BEATNEXT    0x4491
 #define K_TAP         0x4492
+#define K_MT          0x4108   /* MASTER TEMPO (key lock), per deck */
 #define K_SRFWD       0x411f   /* SEARCH >, per deck */
 #define K_SRREV       0x4120   /* SEARCH <, per deck */
 
@@ -514,6 +515,8 @@ struct jog {
     long long last_emit_ms;
     long long touch_ms;    /* when the touch arrived, for the stuck guard */
     float last_speed;      /* what it was doing, so it can spin down       */
+    int engine_held;       /* what the ENGINE was last told about the plate */
+    int coasting;          /* let go while spinning: a backspin running down */
 };
 static struct jog jogs[2];
 
@@ -532,17 +535,46 @@ static struct jog *jog_for(int midi_ch)
     return NULL;
 }
 
+/* A backspin: the plate let go while it was being flung backwards (or
+ * spun hard forwards).  On a turntable the record keeps turning and runs
+ * down; on the RX3 letting go of the plate hands the deck straight back to
+ * the motor, so the spin stopped dead.  So the ENGINE is kept "held" while
+ * the spin runs down (jog_tick), and only let go when it has stopped. */
+#define JOG_FLING_BACK   -0.8f     /* rev/s: any real backwards fling      */
+#define JOG_FLING_FWD     3.0f     /* rev/s: only a hard forward spin      */
+
+static void jog_engine_touch(struct jog *s, int on)
+{
+    if (s->engine_held == on)
+        return;
+    s->engine_held = on;
+    send_ctrl(K_JOG_TOUCH, on ? OP_PRESS : OP_RELEASE, s->send_ch, 0, 0.0f, 0);
+}
+
 static void jog_touch_set(struct jog *s, int on, int automatic)
 {
+    long long t = now_ms();
+
     if (s->touched == on)
         return;
     s->touched = on;
     s->auto_touch = on ? automatic : 0;
-    s->touch_ms = now_ms();
-    send_ctrl(K_JOG_TOUCH, on ? OP_PRESS : OP_RELEASE, s->send_ch, 0, 0.0f, 0);
+    s->touch_ms = t;
+    if (on) {
+        s->coasting = 0;                   /* a hand on it stops the spin */
+        jog_engine_touch(s, 1);
+    } else if (!automatic && jog_spindown_ms > 0 && t - s->last_ms < 150 &&
+               (s->last_speed <= JOG_FLING_BACK ||
+                s->last_speed >= JOG_FLING_FWD)) {
+        s->coasting = 1;                   /* keep the engine held: coast */
+        s->moving = 1;
+    } else {
+        jog_engine_touch(s, 0);
+    }
     if (opt_verbose)
-        logmsg("  jog deck%d: plate %s%s\n", s->send_ch,
-               on ? "held" : "let go", automatic ? " (from the wheel)" : "");
+        logmsg("  jog deck%d: plate %s%s%s\n", s->send_ch,
+               on ? "held" : "let go", automatic ? " (from the wheel)" : "",
+               s->coasting ? " - spinning down" : "");
 }
 
 /* Only accumulate here.  Working out a speed from the gap between two MIDI
@@ -567,6 +599,12 @@ static void jog_delta(int midi_ch, int delta, int mode)
      * If the plate's own note never arrives - and on some units it does not -
      * moving the plate says so on its behalf, and moving the rim takes it
      * back. */
+    if (s->coasting) {
+        /* the FLX4's own wheel is still turning after the fling: its ticks
+         * ARE the spin, so they drive it rather than bend the pitch */
+        s->mode = JOG_SCRATCH;
+        return;
+    }
     if (mode == JOG_SCRATCH || mode == JOG_SEARCH) {
         if (!s->touched)
             jog_touch_set(s, 1, 1);
@@ -598,7 +636,7 @@ static void jog_emit(struct jog *s, long long t)
      * turning still counted as the rim - a quarter-speed nudge - whenever the
      * FLX4 sent the rim's CC, which is what "captive touch feels like the
      * side" was. */
-    if (s->mode == JOG_BEND && !s->touched)
+    if (s->mode == JOG_BEND && !s->touched && !s->coasting)
         speed *= jog_bend_scale;     /* the rim nudges, it does not scratch */
     s->last_speed = speed;
     if (speed > 8.0f) speed = 8.0f;
@@ -643,24 +681,37 @@ static void jog_tick(void)
                        "movement\n", s->send_ch, t - s->touch_ms);
             jog_touch_set(s, 0, 0);
         }
+        /* A backspin running down: once the wheel's own ticks stop, the
+         * spin decays on its own - about 95% gone after spindown_ms - and
+         * the engine is let go of when it has stopped. */
+        if (s->coasting) {
+            if (t - s->last_ms < jog_idle_ms || t - s->last_emit_ms < jog_emit_ms)
+                continue;
+            {
+                float dt = (float)(t - s->last_emit_ms) / 1000.0f;
+                float tau = (float)jog_spindown_ms / 3000.0f;
+                s->last_speed *= expf(-dt / (tau > 0.01f ? tau : 0.01f));
+                s->vpos += s->last_speed * jog_ppr * dt;
+                while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
+                while (s->vpos < 0.0f)     s->vpos += jog_ppr;
+                s->last_emit_ms = t;
+            }
+            if (s->last_speed > 0.08f || s->last_speed < -0.08f) {
+                send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, s->last_speed,
+                          (int)s->vpos);
+                continue;
+            }
+            s->coasting = 0;
+            s->moving = 0;
+            s->last_speed = 0.0f;
+            send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, 0.0f, (int)s->vpos);
+            if (!s->touched)
+                jog_engine_touch(s, 0);        /* the motor takes it back */
+            continue;
+        }
         if (t - s->last_emit_ms < jog_idle_ms)
             continue;
 
-        /* A real platter does not stop the instant you let go.  Let the last
-         * speed run down instead of cutting it to zero, so a backspin carries
-         * on turning and the wheel feels heavier than it is. */
-        if (jog_spindown_ms > 0 && !s->touched &&
-            (s->last_speed > 0.15f || s->last_speed < -0.15f)) {
-            float per = (float)jog_emit_ms / (float)jog_spindown_ms;
-            s->last_speed -= s->last_speed * per;
-            s->vpos += s->last_speed * jog_ppr * (float)jog_emit_ms / 1000.0f;
-            while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
-            while (s->vpos < 0.0f)     s->vpos += jog_ppr;
-            s->last_emit_ms = t;
-            send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, s->last_speed,
-                      (int)s->vpos);
-            continue;
-        }
         s->moving = 0;
         s->last_speed = 0.0f;
         send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, 0.0f, (int)s->vpos);
@@ -771,6 +822,7 @@ static long long g_rs_fresh_at = 0;
 static long long g_rs_read_at = 0;
 
 static void player_state_up(void);
+static void player_restarted(void);
 
 static void state_tick(long long t)
 {
@@ -787,6 +839,10 @@ static void state_tick(long long t)
         if (n == (ssize_t)sizeof(st) && st.magic == RB_STATE_MAGIC &&
             st.version == RB_STATE_VERSION && st.seq == st.seq_end) {
             if (st.seq != g_rs_seq) {
+                /* keyshim counts from 1 in every new player: a count that
+                 * went backwards is a player that was restarted under us */
+                if (g_rs_seq && st.seq < g_rs_seq)
+                    player_restarted();
                 g_rs_seq = st.seq;
                 g_rs_fresh_at = t;
             }
@@ -836,7 +892,7 @@ struct deck_model {
     int cue_held, cue_preview, at_cue;
     long long cue_released_at;
     int looping, armed, has_loop, loop_pad, prev_looping;
-    int sync, pfl;
+    int sync, pfl, keylock;
 };
 static struct deck_model g_deck[2] = {
     { .loop_pad = -1 }, { .loop_pad = -1 },
@@ -941,6 +997,10 @@ static void model_key(int d, int key, int on)
         if (on)
             m->sync = !m->sync;
         break;
+    case K_MT:
+        if (on)
+            m->keylock = !m->keylock;
+        break;
     }
 }
 
@@ -958,6 +1018,7 @@ static void model_follow_player(int d)
     if (!m->cue_held)
         m->playing = k->playing;
     m->sync = k->sync_on;
+    m->keylock = k->master_tempo;
     looping = k->looping;
     if (looping || (m->prev_looping && !looping))
         m->armed = 0;                  /* a loop started, or one ended */
@@ -1129,8 +1190,13 @@ static int pad_lamp(int d, int m, int p)
     /* rbp's own pad lamps, while it has the deck in the bank these pads
      * belong to (its lamps show ITS bank, which the touchscreen can change) */
     if (rs_has(RBS_LEDSTAT) && rbp_bank(d) == pad_modes[m].key &&
-        k->pad_led[p] != RBL_UNKNOWN)
-        return lamp_level(k->pad_led[p], 0) || held;
+        k->pad_led[p] != RBL_UNKNOWN) {
+        /* rbp keeps an EMPTY hot cue slot dimly lit (state 3) - which on a
+         * lamp that is only on or off lit every pad whether it held a cue or
+         * not.  Only a real ON or BLINK lights one here. */
+        int st = k->pad_led[p];
+        return (st == RBL_ON || (st == RBL_BLINK && blink_on())) || held;
+    }
 
     switch (m) {
     case PM_HOTCUE:
@@ -1298,6 +1364,9 @@ static void lamps_refresh(void)
         led_set(ch, 0x11, looping ? blink : 0);
         led_set(ch, 0x4D, looping);
 
+        /* key lock, on the SHIFT layer of RELOOP/EXIT where it is pressed */
+        led_set(ch, 0x50, m->keylock);
+
         /* headphone CUE */
         v = (rs_has(RBS_MIXER) && k->pfl <= 1) ? k->pfl : m->pfl;
         led_set(ch, 0x54, v);
@@ -1309,13 +1378,16 @@ static void lamps_refresh(void)
         pads_refresh(d);
     }
 
-    /* BEAT FX ON/OFF: rbp blinks it while an effect is on */
+    /* BEAT FX ON/OFF: blinks while the effect is on, dark when it is off.
+     * rbp's own lamp for it (LedStat 48) reads "blink" with the effect OFF
+     * too - on the SC Live 4 that id is a different lamp - so its state is
+     * only trusted to say ON, never to light an effect that is off. */
     {
-        int v = g_bfx_on;
-        if (rs_has(RBS_LEDSTAT))
-            v = lamp_level(g_rs.bfx_led, v);
-        led_set(MC_FX1, 0x47, v);
-        led_set(MC_FX2, 0x47, v);
+        int on = g_bfx_on;
+        if (rs_has(RBS_LEDSTAT) && g_rs.bfx_led == RBL_ON)
+            on = 1;
+        led_set(MC_FX1, 0x47, on ? blink_on() : 0);
+        led_set(MC_FX2, 0x47, on ? blink_on() : 0);
     }
 }
 
@@ -1325,7 +1397,7 @@ static int lamp_owned(int key)
 {
     switch (key) {
     case K_PLAY: case K_CUE: case K_SYNC: case K_LOOPIN: case K_LOOPOUT:
-    case K_RELOOP: case K_BFX: case K_MASTERCUE:
+    case K_RELOOP: case K_BFX: case K_MASTERCUE: case K_MT:
         return 1;
     }
     return 0;
@@ -1375,9 +1447,23 @@ static void positions_tick(long long t)
 static void player_state_up(void)
 {
     positions_window(30000);
-    /* the player may have been restarted under us: start from its banks */
-    for (int d = 0; d < 2; d++)
+}
+
+static void player_restarted(void)
+{
+    logmsg("flx4: the player restarted - its decks are back in HOT CUE\n");
+    positions_window(30000);
+    /* A new player is in HOT CUE again, whatever the model said.  A stale
+     * model is what made a pad-mode button "not switch" after a restart: it
+     * believed the deck was already in that bank and sent nothing. */
+    for (int d = 0; d < 2; d++) {
+        g_bank[d] = K_HOTCUE;
+        g_sub[d] = 0;
+        g_sub_want[d] = -1;
         g_bank_settle[d] = 0;
+        if (g_padmode[d] != PM_HOTCUE)
+            pad_mode_enter(d, g_padmode[d]);   /* put it back where the FLX4 is */
+    }
 }
 
 /* ---------------- note mapping table ---------------- */
@@ -1422,9 +1508,10 @@ static struct notemap notemap[NMAP_MAX] = {
     { MC_DECK2, 0x3E, K_SRREV, 0, "SHIFT+LOOP CALL < (search back)" },
     { MC_DECK1, 0x3D, K_SRFWD, 0, "SHIFT+LOOP CALL > (search forward)" },
     { MC_DECK2, 0x3D, K_SRFWD, 0, "SHIFT+LOOP CALL > (search forward)" },
-    /* SHIFT + RELOOP/EXIT toggles quantize */
-    { MC_DECK1, 0x50, K_EFFECTQUANT, CH_GLOBAL, "SHIFT+RELOOP (quantize)" },
-    { MC_DECK2, 0x50, K_EFFECTQUANT, CH_GLOBAL, "SHIFT+RELOOP (quantize)" },
+    /* SHIFT + RELOOP/EXIT: KEY LOCK (master tempo) - the tempo changes and
+     * the pitch does not */
+    { MC_DECK1, 0x50, K_MT, 0, "SHIFT+RELOOP (key lock)" },
+    { MC_DECK2, 0x50, K_MT, 0, "SHIFT+RELOOP (key lock)" },
     /* headphone CUE, per channel: toggled in the player's mixer directly
      * (handle_pfl), because the RX3 has no keycode for it.  MASTER CUE is
      * only the fallback for a player that cannot take the direct toggle. */

@@ -17,7 +17,9 @@
 
 #include <stdint.h>
 
+#ifndef RB_STATE_PATH
 #define RB_STATE_PATH     "/tmp/rb-state.dat"
+#endif
 #define RB_STATE_MAGIC    0x54534252u        /* "RBST" little-endian */
 #define RB_STATE_VERSION  1u
 

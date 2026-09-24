@@ -33,6 +33,25 @@ if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
         && echo "  keyshim.c ok as soft-float ARM"
 fi
 
+echo "== C: keyshim's probes survive a wrong address"
+cc -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+    -DRB_STATE_PATH="\"$TMP/state.dat\"" -DKLOG_PATH="\"$TMP/klog.txt\"" \
+    -o "$TMP/probeguard" tools/tests/test_probe_guard.c -lpthread
+"$TMP/probeguard" || fail=1
+if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1 && \
+   command -v qemu-arm-static >/dev/null 2>&1; then
+    # and as the soft-float ARM that runs inside the player, where the
+    # compiler once moved a read above the marker that names its probe
+    arm-linux-gnueabi-gcc -O2 -march=armv5t -mfloat-abi=soft -static \
+        -Wall -Wno-unused-parameter -Wno-unused-function \
+        -DRB_STATE_PATH="\"$TMP/state-arm.dat\"" \
+        -DKLOG_PATH="\"$TMP/klog.txt\"" \
+        -o "$TMP/probeguard-arm" tools/tests/test_probe_guard.c -lpthread \
+        2>/dev/null
+    qemu-arm-static "$TMP/probeguard-arm" > "$TMP/probeguard-arm.txt" || fail=1
+    tail -1 "$TMP/probeguard-arm.txt"
+fi
+
 echo "== C: framebuffer publish path (src/directfb/rb4r5_scale.h)"
 cc -O2 -Wall -Wextra -o "$TMP/fbscale" tools/tests/test_fbscale.c
 "$TMP/fbscale" | tail -1

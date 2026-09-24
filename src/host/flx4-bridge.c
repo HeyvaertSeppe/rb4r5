@@ -176,7 +176,14 @@ static const char *jog_conf = "/tmp/rb-jog.conf";  /* live tuning          */
 static float jog_bend_scale = 0.25f;   /* the rim, relative to the plate  */
 static int   jog_reverse = 0;      /* the platter turns the other way     */
 static float jog_scale = 1.0f;     /* how hard a turn pushes the engine   */
-static int   jog_spindown_ms = 900; /* how long a let-go wheel keeps turning */
+static int   jog_spindown_ms = 900; /* 0 turns the backspin off            */
+/* A let-go platter is a heavy disc slowing under steady friction: the
+ * speed falls by the same amount every second (not by the same SHARE, which
+ * sounds like a tape stop - the pitch sagging from the first moment), so a
+ * backspin holds its speed and then runs out.  momentum > 1 makes it carry
+ * on a little further than the FLX4's own light wheel would. */
+static float jog_friction = 2.2f;   /* rev/s lost per second, let go       */
+static float jog_momentum = 1.25f;  /* the spin, relative to the fling     */
 
 /* SMART FADER holds the pitch.
  *
@@ -318,17 +325,25 @@ static float g_fader[2] = { 1.0f, 1.0f };
 static float g_meter_floor_db = 36.0f;
 static float g_meter_gain_db  = 0.0f;
 
-/* The master level knob, if it sends anything.  Not mapped by default -
- * `launch.py sniff` says whether yours does - and published for the
- * launcher's on-screen meter as well as used here. */
-static int   g_master_ch = -1;
-static int   g_master_cc = 0;
+/* The MASTER LEVEL knob, published for the on-screen meter so its red line
+ * is reached only when the knob puts the output there.
+ *
+ * Its MIDI number is not in the FLX4 mapping this bridge was built from, so
+ * it is found rather than assumed: the first 7-bit CC on the mixer channel
+ * that no control here uses is taken to be it (and said so in the log), and
+ * `masterlevel ch7 cc <n>` in the map file pins it.  If the knob sends
+ * nothing at all - it may be purely analogue on the FLX4 - the meter shows
+ * the level leaving the player, and the log says so once. */
+static int   g_master_ch = MC_MIXER;
+static int   g_master_cc = -1;       /* not known yet */
+static int   g_master_pinned = 0;    /* set by the map file: no guessing */
 static float g_master = 1.0f;
+static const char *master_path = "/tmp/rb-master.dat";   /* -M, for tests */
 
 static void publish_master(void)
 {
     char text[32];
-    int fd = open("/tmp/rb-master.dat", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd = open(master_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0)
         return;
     int len = snprintf(text, sizeof(text), "%.4f\n", (double)g_master);
@@ -484,6 +499,10 @@ static void reload_jog_conf(int announce)
         else if (!strcmp(line, "emit_ms") && value >= 1) jog_emit_ms = (int)value;
         else if (!strcmp(line, "spindown") && value >= 0)
             jog_spindown_ms = (int)value;
+        else if (!strcmp(line, "friction") && value > 0.05)
+            jog_friction = (float)value;
+        else if (!strcmp(line, "momentum") && value >= 0.5 && value <= 3.0)
+            jog_momentum = (float)value;
     }
     fclose(f);
     if (announce)
@@ -517,6 +536,8 @@ struct jog {
     float last_speed;      /* what it was doing, so it can spin down       */
     int engine_held;       /* what the ENGINE was last told about the plate */
     int coasting;          /* let go while spinning: a backspin running down */
+    float fling;           /* fastest turn of the last moment, for the spin */
+    long long fling_ms;
 };
 static struct jog jogs[2];
 
@@ -563,11 +584,17 @@ static void jog_touch_set(struct jog *s, int on, int automatic)
     if (on) {
         s->coasting = 0;                   /* a hand on it stops the spin */
         jog_engine_touch(s, 1);
-    } else if (!automatic && jog_spindown_ms > 0 && t - s->last_ms < 150 &&
-               (s->last_speed <= JOG_FLING_BACK ||
-                s->last_speed >= JOG_FLING_FWD)) {
+    } else if (!automatic && jog_spindown_ms > 0 && t - s->fling_ms < 150 &&
+               (s->fling <= JOG_FLING_BACK || s->fling >= JOG_FLING_FWD)) {
+        /* The hand comes off a spinning plate: the spin carries on from the
+         * fastest moment of the throw (the last message is often the finger
+         * already slowing as it lets go), with some extra momentum. */
+        s->last_speed = s->fling * jog_momentum;
+        if (s->last_speed > 8.0f) s->last_speed = 8.0f;
+        if (s->last_speed < -8.0f) s->last_speed = -8.0f;
         s->coasting = 1;                   /* keep the engine held: coast */
         s->moving = 1;
+        s->last_emit_ms = t;
     } else {
         jog_engine_touch(s, 0);
     }
@@ -626,11 +653,31 @@ static void jog_emit(struct jog *s, long long t)
     s->last_emit_ms = t;
     s->moving = 1;
 
+    speed = revs / dt * jog_scale;
+    if (s->coasting) {
+        /* The FLX4's own wheel is still turning after the throw.  Its speed
+         * can keep the spin going, never slow it: this platter is heavier.
+         * The position follows the spin, not the light wheel, so the two
+         * things the engine is told agree. */
+        float carried = speed * jog_momentum;
+        if ((carried < 0.0f) == (s->last_speed < 0.0f) &&
+            fabsf(carried) > fabsf(s->last_speed))
+            s->last_speed = carried;
+        s->vpos += s->last_speed * jog_ppr * dt;
+        while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
+        while (s->vpos < 0.0f)     s->vpos += jog_ppr;
+        send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, s->last_speed,
+                  (int)s->vpos);
+        return;
+    }
     s->vpos += revs * jog_ppr;
     while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
     while (s->vpos < 0.0f)     s->vpos += jog_ppr;
-
-    speed = revs / dt * jog_scale;
+    if (fabsf(speed) >= fabsf(s->fling) || t - s->fling_ms > 80 ||
+        (speed < 0.0f) != (s->fling < 0.0f)) {
+        s->fling = speed;
+        s->fling_ms = t;
+    }
     /* What makes a turn a scratch is the plate being HELD, not which CC
      * carried it.  Deciding on the CC alone meant that touching the top and
      * turning still counted as the rim - a quarter-speed nudge - whenever the
@@ -681,16 +728,21 @@ static void jog_tick(void)
                        "movement\n", s->send_ch, t - s->touch_ms);
             jog_touch_set(s, 0, 0);
         }
-        /* A backspin running down: once the wheel's own ticks stop, the
-         * spin decays on its own - about 95% gone after spindown_ms - and
-         * the engine is let go of when it has stopped. */
+        /* A backspin running down: between the wheel's own ticks the spin
+         * loses the same speed every second - friction on a heavy platter -
+         * so it holds its pitch and then runs out, rather than sagging from
+         * the first moment.  The engine is let go of when it has stopped. */
         if (s->coasting) {
-            if (t - s->last_ms < jog_idle_ms || t - s->last_emit_ms < jog_emit_ms)
+            if (t - s->last_ms < 2 * jog_emit_ms ||
+                t - s->last_emit_ms < jog_emit_ms)
                 continue;
             {
                 float dt = (float)(t - s->last_emit_ms) / 1000.0f;
-                float tau = (float)jog_spindown_ms / 3000.0f;
-                s->last_speed *= expf(-dt / (tau > 0.01f ? tau : 0.01f));
+                float drop = jog_friction * dt;
+                if (s->last_speed > 0.0f)
+                    s->last_speed = s->last_speed > drop ? s->last_speed - drop : 0.0f;
+                else
+                    s->last_speed = -s->last_speed > drop ? s->last_speed + drop : 0.0f;
                 s->vpos += s->last_speed * jog_ppr * dt;
                 while (s->vpos >= jog_ppr) s->vpos -= jog_ppr;
                 while (s->vpos < 0.0f)     s->vpos += jog_ppr;
@@ -1181,31 +1233,54 @@ static int handle_padmode(int ch, int deck, int note, int on)
     return 0;
 }
 
-/* ---- the pads ---- */
+/* ---- the pads ----
+ *
+ * Off unless there is a reason: a hot cue pad is lit when its slot holds a
+ * cue; every other mode's pads are dark and light while pressed (the beat
+ * loop that is running stays lit).  rbp's own pad lamps light EVERY pad in
+ * the bank's colour, empty or not - which on the FLX4's one-colour pads was
+ * "all the hot cues on with no hot cues" - so they are only believed for a
+ * hot cue slot when they are lit brightly.
+ *
+ * A finger on a hot cue pad flips its lamp at once - a stored cue goes dark
+ * while it is held, an empty slot lights and stays lit, because pressing it
+ * stored one - so the pad answers the press before the player does. */
+static int g_pad_was[2][8];            /* lit when the finger went down */
+
+static int hotcue_stored(int d, int p)
+{
+    const struct rb_state_deck *k = &g_rs.deck[d];
+    if (g_hotcue[d][p])
+        return 1;
+    if (rs_has(RBS_LEDSTAT) && rbp_bank(d) == K_HOTCUE &&
+        (k->pad_led[p] == RBL_ON || k->pad_led[p] == RBL_BLINK)) {
+        int r = k->pad_rgb[p][0], g = k->pad_rgb[p][1], b = k->pad_rgb[p][2];
+        int top = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        return top >= 0x60;
+    }
+    return 0;
+}
+
 static int pad_lamp(int d, int m, int p)
 {
     int held = g_pad_held[d][p];
-    const struct rb_state_deck *k = &g_rs.deck[d];
-
-    /* rbp's own pad lamps, while it has the deck in the bank these pads
-     * belong to (its lamps show ITS bank, which the touchscreen can change) */
-    if (rs_has(RBS_LEDSTAT) && rbp_bank(d) == pad_modes[m].key &&
-        k->pad_led[p] != RBL_UNKNOWN) {
-        /* rbp keeps an EMPTY hot cue slot dimly lit (state 3) - which on a
-         * lamp that is only on or off lit every pad whether it held a cue or
-         * not.  Only a real ON or BLINK lights one here. */
-        int st = k->pad_led[p];
-        return (st == RBL_ON || (st == RBL_BLINK && blink_on())) || held;
-    }
 
     switch (m) {
     case PM_HOTCUE:
-        return g_hotcue[d][p] || held;
+        return held ? !g_pad_was[d][p] : hotcue_stored(d, p);
     case PM_BEATLOOP:
-        return (deck_looping(d) && g_deck[d].loop_pad == p) || held;
+        return held || (deck_looping(d) && g_deck[d].loop_pad == p);
     default:
         return held;
     }
+}
+
+/* The track is about to end: every pad of that deck flashes, at the pace
+ * the RX3's jog display flashes its end warning. */
+static int end_warning_on(int d)
+{
+    return g_rs_ok && (g_rs.flags & RBS_LEDSTAT) &&
+           g_rs.deck[d].end_warn == 1 && deck_playing(d);
 }
 
 static void pads_refresh(int d)
@@ -1215,10 +1290,14 @@ static void pads_refresh(int d)
 
     /* Every mode's pad notes, so leaving a mode darkens what it lit.  The
      * SHIFT channel gets the same, or the pads go dark under SHIFT. */
+    int warn = end_warning_on(d);
+    int flash = (int)((now_ms() / 250) & 1);
+
     for (int m = 0; m < PM_COUNT; m++)
         for (int p = 0; p < 8; p++) {
             int note = (pad_modes[m].base << 4) | p;
-            int v = (m == g_padmode[d]) ? pad_lamp(d, m, p) : 0;
+            int v = (m != g_padmode[d]) ? 0
+                  : warn ? flash : pad_lamp(d, m, p);
             led_set(plain, note, v);
             led_set(shift, note, v);
         }
@@ -1242,7 +1321,6 @@ static void handle_pad(int ch, int deck, int note, int on)
      * pressed, so a pad says which mode the controller is really in. */
     if (on)
         pad_mode_enter(deck, m);
-    g_pad_held[deck][idx] = on;
 
     /* The RX3 has no SHIFT key for the pads, so SHIFT + a hot cue pad
      * would CALL the cue the DJ meant to delete.  Better that it does
@@ -1254,6 +1332,9 @@ static void handle_pad(int ch, int deck, int note, int on)
         return;
     }
 
+    if (on)
+        g_pad_was[deck][idx] = (m == PM_HOTCUE) && hotcue_stored(deck, idx);
+    g_pad_held[deck][idx] = on;
     if (on && m == PM_HOTCUE)
         g_hotcue[deck][idx] = 1;           /* an empty pad stores one */
     if (on && m == PM_BEATLOOP) {
@@ -1281,18 +1362,30 @@ static void handle_pad(int ch, int deck, int note, int on)
  * pad to its right.  `loopcall reverse` in the map file flips that.
  */
 static int g_loopcall_reverse = 0;
+/* The RX3's own CUE/LOOP CALL keys, once `launch.py loophunt` has found
+ * them (map file: `loopcall keys <halve> <double>`).  They halve and double
+ * ANY running loop, which the beat-loop pads cannot do for a loop set with
+ * LOOP IN / OUT. */
+static int g_loopcall_halve = 0, g_loopcall_double = 0;
 
 static void loop_call(int d, int longer)
 {
     int cur = -1, next;
 
+    if (g_loopcall_halve && g_loopcall_double) {
+        send_tap(longer ? g_loopcall_double : g_loopcall_halve, d + 1);
+        if (opt_verbose)
+            logmsg("  deck%d loop %s\n", d + 1, longer ? "doubled" : "halved");
+        return;
+    }
     if (!deck_looping(d)) {
         logmsg("flx4: deck%d LOOP CALL: no loop running\n", d + 1);
         return;
     }
     if (rbp_bank(d) != K_ALOOP) {
         logmsg("flx4: deck%d LOOP CALL: only a beat loop (BEAT LOOP pads) "
-               "can be halved or doubled\n", d + 1);
+               "can be halved or doubled until the RX3's own keys are found "
+               "- run `sudo python3 launch.py loophunt`\n", d + 1);
         return;
     }
     if (rs_has(RBS_LEDSTAT))
@@ -1378,16 +1471,14 @@ static void lamps_refresh(void)
         pads_refresh(d);
     }
 
-    /* BEAT FX ON/OFF: blinks while the effect is on, dark when it is off.
-     * rbp's own lamp for it (LedStat 48) reads "blink" with the effect OFF
-     * too - on the SC Live 4 that id is a different lamp - so its state is
-     * only trusted to say ON, never to light an effect that is off. */
+    /* BEAT FX ON/OFF: lit while the effect is off (ready), blinking while
+     * it is on - the RX3's convention.  rbp's own lamp for it (LedStat 48)
+     * reads "blink" with the effect off on this build, so the on/off state
+     * is the one the button presses leave. */
     {
-        int on = g_bfx_on;
-        if (rs_has(RBS_LEDSTAT) && g_rs.bfx_led == RBL_ON)
-            on = 1;
-        led_set(MC_FX1, 0x47, on ? blink_on() : 0);
-        led_set(MC_FX2, 0x47, on ? blink_on() : 0);
+        int v = g_bfx_on ? blink_on() : 1;
+        led_set(MC_FX1, 0x47, v);
+        led_set(MC_FX2, 0x47, v);
     }
 }
 
@@ -1785,14 +1876,24 @@ static void load_map_file(const char *path)
             g_master_ch = parse_ch(chs) - 1;
             if (g_master_ch < 0) g_master_ch = 0;
             g_master_cc = number;
+            g_master_pinned = 1;
             logmsg("flx4: master level knob on ch%d CC %#x\n",
                    g_master_ch + 1, number);
             n++;
         } else if (!strcmp(kind, "loopcall")) {
             char how[16] = "";
-            if (sscanf(line, "%15s %15s", kind, how) == 2 &&
-                !strcmp(how, "reverse"))
+            int halve = 0, dbl = 0;
+            int got = sscanf(line, "%15s %15s %i %i", kind, how, &halve, &dbl);
+            if (got >= 2 && !strcmp(how, "reverse"))
                 g_loopcall_reverse = 1;
+            if (got == 4 && !strcmp(how, "keys")) {
+                g_loopcall_halve = halve;
+                g_loopcall_double = dbl;
+                logmsg("flx4: LOOP CALL < / > send 0x%04x / 0x%04x\n",
+                       halve, dbl);
+                n++;
+                continue;
+            }
             logmsg("flx4: LOOP CALL arrows %s\n", g_loopcall_reverse
                    ? "reversed (> is the pad to the left)"
                    : "normal (< halves, > doubles)");
@@ -2047,7 +2148,9 @@ static void handle_cc(int ch, int cc, int val)
         return;
     }
 
-    if (g_master_ch >= 0 && ch == g_master_ch && cc == g_master_cc) {
+    if (g_master_cc >= 0 && ch == g_master_ch && cc == g_master_cc + 0x20)
+        return;                          /* its fine half: the coarse is plenty */
+    if (g_master_cc >= 0 && ch == g_master_ch && cc == g_master_cc) {
         g_master = (float)val / 127.0f;
         publish_master();
         if (opt_verbose)
@@ -2104,6 +2207,17 @@ static void handle_cc(int ch, int cc, int val)
         return;
     }
 
+    /* a control on the mixer channel that nothing here knows: the MASTER
+     * LEVEL knob is the one mixer control without a binding */
+    if (ch == MC_MIXER && cc < 0x20 && g_master_cc < 0 && !g_master_pinned) {
+        g_master_cc = cc;
+        logmsg("flx4: ch7 CC %#x is no known control - taking it as the MASTER "
+               "LEVEL knob for the on-screen meter (pin it with `masterlevel "
+               "ch7 cc %#x` in the map file)\n", cc, cc);
+        g_master = (float)val / 127.0f;
+        publish_master();
+        return;
+    }
     if (opt_verbose)
         logmsg("  unmapped ch%d cc 0x%02x val=%d\n", ch + 1, cc, val);
 }
@@ -2211,7 +2325,7 @@ int main(int argc, char **argv)
 
     /* -l is handled after the whole option list, so `-l -m map.conf` and
      * `-m map.conf -l` behave the same. */
-    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:c:P:RLFN")) != -1) {
+    while ((opt = getopt(argc, argv, "vsld:f:m:J:O:S:T:H:B:E:c:P:M:RLFN")) != -1) {
         switch (opt) {
         case 'v': opt_verbose = 1; break;
         case 's': opt_sniff = 1; opt_verbose = 1; break;
@@ -2231,6 +2345,7 @@ int main(int argc, char **argv)
         case 'F': opt_filter_init = 1; break;
         case 'N': opt_engine_state = 0; break;
         case 'P': state_path = optarg; break;
+        case 'M': master_path = optarg; break;
         case 'l': opt_list = 1; break;
         default:
             fprintf(stderr, "usage: %s [-v] [-s] [-l] [-d dev] [-f fifo] "
@@ -2245,6 +2360,8 @@ int main(int argc, char **argv)
 
     notemap_count();
     build_cc14();
+    publish_master();          /* 1.0 until the knob says otherwise: not a
+                                  value left over from the last session */
     if (map_file)
         load_map_file(map_file);
     if (opt_list) {

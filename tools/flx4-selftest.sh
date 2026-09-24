@@ -89,7 +89,8 @@ PY
     sleep 0.3
 fi
 
-"$BRIDGE" -v -d "$MIDI" -f "$CTRL" > "$WORK/bridge.log" 2>&1 &
+"$BRIDGE" -v -d "$MIDI" -f "$CTRL" -M "$WORK/master.dat" -P "$WORK/state.dat" \
+    > "$WORK/bridge.log" 2>&1 &
 BPID=$!
 sleep 0.5
 

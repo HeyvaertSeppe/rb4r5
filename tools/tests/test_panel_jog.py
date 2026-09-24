@@ -102,7 +102,7 @@ check("s->last_speed = speed" in emit,
 
 tick = bridge_src[bridge_src.index("static void jog_tick("):]
 tick = tick[:tick.index("\n}\n")]
-check("jog_spindown_ms" in tick,
+check("jog_friction" in tick and "s->coasting" in tick,
       "a let-go wheel runs down instead of stopping dead")
 check("!s->touched" in tick,
       "and only while nobody is holding it")

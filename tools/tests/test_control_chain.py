@@ -134,6 +134,8 @@ with tempfile.TemporaryDirectory() as tmp:
     os.mkfifo(overlay_fifo)
     proc = subprocess.Popen([str(bridge), "-d", str(midi_fifo),
                              "-f", str(ctrl_fifo),
+                             "-M", str(tmp / "master.dat"),
+                             "-P", str(tmp / "state.dat"),
                              "-O", str(overlay_fifo)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.5)

@@ -344,5 +344,13 @@ check(_FakeDaemon(False, "bar").idle_wait() >= 0.15,
 check(_FakeDaemon(True, "splash").idle_wait() >= 0.15,
       "and it idles behind the splash too")
 
+# The overlay's own JSON state and the player's binary lamp state are two
+# files.  They once shared a name, and each overwrote the other - the lamps
+# then flapped between the player's state and the buttons' model.
+check(overlay.STATE_FILE != overlay.PLAYER_STATE,
+      "the overlay's state and the player's state are different files")
+check(overlay.PLAYER_STATE == "/tmp/rb-state.dat",
+      "and the player's is where keyshim writes it (rb_state.h)")
+
 print("\n" + ("all overlay tests passed" if not FAIL else f"{FAIL} FAILURES"))
 sys.exit(1 if FAIL else 0)

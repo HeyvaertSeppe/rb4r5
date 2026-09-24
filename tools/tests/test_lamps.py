@@ -35,11 +35,14 @@ def check(label, got, want=True):
 
 
 def deck(loaded=0, playing=0, sync=0, looping=0, play_led=UNKNOWN,
-         sync_led=UNKNOWN, pads=None, meter=0, pfl=0, pad_mode=0, pad_sub=0):
+         sync_led=UNKNOWN, pads=None, meter=0, pfl=0, pad_mode=0, pad_sub=0,
+         rgb=None, end_warn=0):
     pads = pads or [OFF] * 8
+    rgb = rgb or [(0x30, 0x30, 0x30)] * 8        # rbp's dim bank colour
     return (bytes([loaded, playing, sync, looping, 0, 0, 0, 0,
-                   0, pfl, play_led, sync_led]) + bytes(pads) + bytes(24)
-            + bytes([meter, pad_mode, pad_sub, 0]))
+                   0, pfl, play_led, sync_led]) + bytes(pads)
+            + b"".join(bytes(c) for c in rgb)
+            + bytes([meter, pad_mode, pad_sub, end_warn]))
 
 
 class Player:
@@ -139,7 +142,9 @@ with tempfile.TemporaryDirectory() as tmp:
     player = Player(state)
     DIM = 3
     player.decks[0] = deck(loaded=1, playing=1, play_led=ON, meter=11,
-                           pads=[DIM, DIM, ON, DIM, DIM, DIM, DIM, DIM])
+                           pads=[DIM, ON, ON, DIM, DIM, DIM, DIM, DIM],
+                           rgb=[(0x30, 0x30, 0x30), (0x30, 0x30, 0x30),
+                                (0xFF, 0x20, 0x20)] + [(0x30, 0x30, 0x30)] * 5)
     player.decks[1] = deck(loaded=1, playing=0, play_led=BLINK, meter=0,
                            pfl=1)
     player.bfx = BLINK             # what rbp reports with the effect OFF
@@ -147,6 +152,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     proc = subprocess.Popen(
         [str(bridge), "-d", slave_path, "-f", str(ctrl), "-P", str(state),
+         "-M", str(tmp / "master.dat"),
          "-O", str(tmp / "overlay.fifo"), "-c", str(tmp / "jog.conf")],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     flx = Controller(master)
@@ -161,17 +167,17 @@ with tempfile.TemporaryDirectory() as tmp:
         check("... on the SHIFT channel too", flx.lamps.get((0x98, 0x02)), 0x7F)
         check("an empty hot cue is dark (rbp keeps it dim)",
               flx.lamps.get((0x97, 0x03)), 0x00)
+        check("and so is one rbp lights only in the bank's dim colour",
+              flx.lamps.get((0x97, 0x01)), 0x00)
         check("the HOT CUE mode lamp is on the deck channel",
               flx.lamps.get((0x90, 0x1B)), 0x7F)
         check("and the other modes are dark", flx.lamps.get((0x90, 0x20)), 0x00)
         check("deck 2's headphone CUE is lit", flx.lamps.get((0x91, 0x54)), 0x7F)
         flx.seen.pop((0x94, 0x47), None)    # past the startup lamp test
         flx.pump(0.9)
-        check("BEAT FX ON/OFF stays dark while the effect is off, whatever "
-              "rbp's lamp says", 0x7F not in flx.seen.get((0x94, 0x47), set())
-              and flx.lamps.get((0x94, 0x47)) == 0)
-        check("no loop, so LOOP IN is dark", flx.lamps.get((0x90, 0x10)), 0x00)
-
+        check("BEAT FX ON/OFF is lit, steady, while the effect is off",
+              0x00 not in flx.seen.get((0x94, 0x47), set())
+              and flx.lamps.get((0x94, 0x47)) == 0x7F)
         flx.send(0x94, 0x47, 0x7F)          # effect ON
         flx.send(0x94, 0x47, 0x00)
         flx.seen.pop((0x94, 0x47), None)
@@ -181,6 +187,40 @@ with tempfile.TemporaryDirectory() as tmp:
         flx.send(0x94, 0x47, 0x7F)          # and OFF again
         flx.send(0x94, 0x47, 0x00)
         flx.pump(0.2)
+
+        print("\n== hot cue pads answer the finger at once")
+        flx.send(0x97, 0x02, 0x7F)          # a stored cue: dark while held
+        flx.pump(0.05)
+        check("a stored hot cue goes dark while it is pressed",
+              flx.lamps.get((0x97, 0x02)), 0x00)
+        flx.send(0x97, 0x02, 0x00)
+        flx.pump(0.05)
+        check("and lights again on release", flx.lamps.get((0x97, 0x02)), 0x7F)
+        flx.send(0x97, 0x05, 0x7F)          # an empty one: lights, and stays
+        flx.pump(0.05)
+        check("an empty pad lights when pressed", flx.lamps.get((0x97, 0x05)),
+              0x7F)
+        flx.send(0x97, 0x05, 0x00)
+        flx.pump(0.05)
+        check("and stays lit: it holds a cue now", flx.lamps.get((0x97, 0x05)),
+              0x7F)
+
+        print("\n== the track is about to end: the pads flash")
+        saved = player.decks[0]
+        player.decks[0] = deck(loaded=1, playing=1, play_led=ON, end_warn=1)
+        flx.seen.pop((0x97, 0x00), None)
+        flx.pump(1.2)
+        check("pad 1 flashes", flx.seen.get((0x97, 0x00), set()) >= {0, 0x7F})
+        player.decks[0] = saved
+        flx.pump(0.4)
+
+        print("\n== the MASTER LEVEL knob reaches the on-screen meter")
+        flx.send(0xB6, 0x08, 0x20)
+        flx.pump(0.2)
+        knob = tmp / "master.dat"
+        check("an unknown mixer knob is taken as MASTER LEVEL and published",
+              knob.exists() and abs(float(knob.read_text()) - 0x20 / 127)
+              < 0.01)
 
         print("\n== each meter is its own deck")
         check("deck 1 playing loud: full", flx.lamps.get((0xB0, 0x02)), 127)
@@ -275,18 +315,19 @@ with tempfile.TemporaryDirectory() as tmp:
             flx.send(0xB0, 0x22, 0x80 - 40)
             time.sleep(0.01)
         flx.send(0x90, 0x36, 0x00)          # and let go
-        flx.pump(1.6)
+        flx.pump(4.5)
         recs = records(ctrl)[before:]
-        release_at = [i for i, r in enumerate(recs)
-                      if r[0] == 0x4306 and r[2] == 2]
-        spins = [r for r in recs if r[0] == 0x4305]
-        after_letgo = [r for r in spins
-                       if release_at and recs.index(r) < release_at[0]
-                       and r[4] < -0.1]
+        letgo = [i for i, r in enumerate(recs) if r[0] == 0x4306 and r[2] == 2]
+        spin = [r[4] for i, r in enumerate(recs)
+                if r[0] == 0x4305 and letgo and i < letgo[0] and r[4] < -0.05]
         check("the plate is let go of only once the spin has run down",
-              bool(release_at) and len(after_letgo) > 5)
-        check("and the spin slows rather than stops",
-              len({round(r[4], 1) for r in after_letgo}) > 3)
+              bool(letgo) and len(spin) > 20)
+        check("the spin keeps more speed than the throw (momentum)",
+              bool(spin) and min(spin) < -6.0)
+        half = spin[:len(spin) // 2]
+        check("and holds its speed before running out - not a tape stop "
+              "(steady loss per second, so half-way it is still fast)",
+              bool(half) and half[-1] < min(spin) / 2.5)
     finally:
         proc.terminate()
         out = proc.communicate(timeout=5)[0].decode(errors="replace")

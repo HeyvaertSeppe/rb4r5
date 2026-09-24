@@ -621,6 +621,64 @@ static uint8_t ledstat_state(unsigned char *arr, unsigned int count,
     return st > 3 ? RBL_ON : (uint8_t)st;
 }
 
+/* ---- the end-of-track warning ----
+ * Near the end of a track the RX3 flashes its jog display.  Which LedStat
+ * id that is has not been pinned down, so it is recognised by what it does:
+ * a lamp on a PLAYING deck's channel that blinks while no loop is running,
+ * and is none of the lamps that blink for other reasons (PLAY, SYNC, the
+ * pads).  Each id seen doing that is logged once, so the right one can be
+ * pinned with RB_ENDWARN_ID=<id>, which then is the only one looked at. */
+static int endwarn_id = -2;              /* -2 not read yet, -1 heuristic */
+static unsigned char endwarn_seen[LED_TABLE_MAX][4];
+/* A lamp already blinking in the first two seconds of play blinks BECAUSE
+ * the deck plays - it is not a warning, and is never taken for one. */
+static unsigned char endwarn_never[LED_TABLE_MAX][4];
+static unsigned int played_ticks[2];
+
+static uint8_t end_warning(unsigned char *arr, unsigned int count, int deck,
+                           int playing, int looping)
+{
+    unsigned int ch = (unsigned)deck + 1;
+    if (endwarn_id == -2) {
+        const char *v = getenv("RB_ENDWARN_ID");
+        endwarn_id = (v && *v) ? atoi(v) : -1;
+    }
+    if (endwarn_id >= 0) {
+        uint8_t st = ledstat_state(arr, count, (unsigned)endwarn_id, ch);
+        return st == RBL_UNKNOWN ? 0xff : (st == RBL_BLINK);
+    }
+    if (!playing) {
+        played_ticks[deck & 1] = 0;
+        return 0;
+    }
+    if (played_ticks[deck & 1] < 0xffffu)
+        played_ticks[deck & 1]++;
+    if (looping)
+        return 0;
+    for (unsigned int i = 0; i < count; i++) {
+        unsigned char *e = arr + LED_ENTRY_SIZE * i;
+        unsigned int id = *(unsigned int *)e;
+        if (*(unsigned int *)(e + 4) != ch ||
+            *(unsigned int *)(e + 16) != RBL_BLINK)
+            continue;
+        if (id == LEDSTAT_PLAY || id == LEDSTAT_SYNC ||
+            (id >= LEDSTAT_PAD0 && id < LEDSTAT_PAD0 + 8) ||
+            id >= LED_TABLE_MAX || endwarn_never[id][ch & 3])
+            continue;
+        if (played_ticks[deck & 1] < 80) {          /* 2 s at 40 Hz */
+            endwarn_never[id][ch & 3] = 1;
+            continue;
+        }
+        if (!endwarn_seen[id][ch & 3]) {
+            endwarn_seen[id][ch & 3] = 1;
+            klog_dec("keyshim: end warning? LedStat id blinking on a playing "
+                     "deck: ", (int)id);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* ---- rbp's own level meters ---- */
 static volatile unsigned int g_meter_bits[3];      /* master, ch1, ch2 */
 static volatile unsigned int g_meter_calls;
@@ -975,7 +1033,10 @@ static void state_tick(void)
                     k->pad_rgb[p][2] = e[42];
                 }
             }
+            k->end_warn = end_warning(leds, count, d, k->playing, k->looping);
             probe_worked(P_LEDSTAT);
+        } else {
+            k->end_warn = 0xff;
         }
         k->pfl = 0xff;
         if (probe(P_MIXER)) {

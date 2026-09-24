@@ -356,10 +356,21 @@ launcher restarts it without the hook, and after a second crash without the
 reader at all — for that run only, with keyshim's log printed so the cause
 is on screen.
 
-Two lamps do not follow rbp's table: **BEAT FX ON/OFF** blinks while the
-effect is on and is dark when it is off (rbp's id 48 reads "blink" with the
-effect off on this build), and **hot cue pads** light only for a stored cue
-— rbp keeps an empty slot "dim", which an on/off lamp would show as lit.
+Some lamps do not simply copy rbp's table:
+
+* **BEAT FX ON/OFF** is lit steady while the effect is off and blinks while
+  it is on (rbp's id 48 reads "blink" with the effect off on this build).
+* **pads** are dark unless there is a reason. A hot cue pad is lit when its
+  slot holds a cue — rbp lights every pad of the bank in a dim colour, so its
+  lamp is only believed when it is bright — and a finger on it flips it at
+  once (a stored cue goes dark while held; an empty slot lights and stays
+  lit, because pressing it stored one). Other modes light while pressed; the
+  running beat loop stays lit.
+* **near the end of a track** every pad of that deck flashes, at the pace
+  the RX3's jog display flashes its warning. Which LedStat id is the warning
+  is not pinned down yet: keyshim takes a lamp that starts blinking on a
+  playing deck (not PLAY, SYNC or the pads, not one that blinked from the
+  start of play) and logs its id — `RB_ENDWARN_ID=<id>` then pins it.
 
 If the state is missing (an old shim, the player still starting,
 `controller.engine_state=false`) the same lamps are drawn from a model of the
@@ -387,14 +398,28 @@ deck is not already there, reads which function the bank opened on from the
 player, and flips it once if needed: PAD FX1 lands on RELEASE FX, SAMPLER on
 SLIP LOOP, and pressing either again changes nothing.
 
+### MASTER LEVEL and the on-screen meter
+
+The on-screen meter follows the FLX4's MASTER LEVEL knob, so its red line is
+reached only when the knob puts the output there. The knob's MIDI number is
+not in the mapping, so the first unknown 7-bit CC on the mixer channel is
+taken as it (logged); `masterlevel ch7 cc <n>` pins it. If the knob sends
+nothing at all — it may be purely analogue — the meter shows what leaves the
+player.
+
 ### CUE/LOOP CALL < >
 
 With a beat loop running in the BEAT LOOP bank, `<` halves it and `>` doubles
 it by pressing the neighbouring beat-loop pad (rbp's sizes run 4, 2, 1 … 1/32
 beats from pad 1 to 8). They used to send BEAT < / >, which is the Beat FX's
-beat, not the loop's. The RX3's own CUE/LOOP CALL keycodes are not verified,
-so a manual (IN/OUT) loop cannot be resized from here. `loopcall reverse` in
-the map file flips the direction. SHIFT + `<` / `>` are SEARCH.
+beat, not the loop's. `loopcall reverse` in the map file flips the direction.
+SHIFT + `<` / `>` are SEARCH.
+
+To resize ANY loop — one set with LOOP IN / OUT too — the RX3's own
+CUE/LOOP CALL keys are needed, and they are not in any key table this port
+has. `sudo python3 launch.py loophunt` finds them: with a loop running on the
+left deck it presses each unnamed deck key once and asks what the loop did,
+then writes `loopcall keys <halve> <double>` to the map file.
 
 ### SHIFT + RELOOP/EXIT is KEY LOCK
 
@@ -404,11 +429,16 @@ not. Its lamp is on the SHIFT layer of RELOOP/EXIT (`0x50`).
 ### Backspin
 
 Letting go of the plate while it is flung backwards (or spun hard forwards)
-keeps the engine "held" while the spin runs down — about 95% gone after
-`spindown` ms (`/tmp/rb-jog.conf`, default 900) — and hands the deck back to
+keeps the engine "held" while the spin runs down, and hands the deck back to
 the motor only when it has stopped. It used to stop dead, because letting go
-of the plate is what hands it back. If the FLX4's own wheel is still turning
-its ticks drive the spin.
+of the plate is what hands it back.
+
+It runs down like a heavy platter under friction: it starts from the
+fastest moment of the throw times `momentum` (1.25 — a little more than the
+FLX4's light wheel), and loses `friction` rev/s every second (2.2), so it
+holds its pitch and then runs out rather than sagging like a tape stop. If
+the FLX4's own wheel is still turning, its ticks can keep the spin going but
+never slow it. Both are in `/tmp/rb-jog.conf`; `spindown=0` turns it off.
 
 ### Where the faders are
 

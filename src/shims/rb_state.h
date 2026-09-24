@@ -56,7 +56,9 @@ struct rb_state_deck {
      * 0x4113..0x4116) and the byte that holds a bank's second function.
      * 0xff when the object has not been found. */
     uint8_t pad_mode, pad_sub;
-    uint8_t reserved;
+    /* the track is about to end: rbp is blinking its end warning (on the
+     * RX3 the jog display flashes).  0/1, 0xff unknown. */
+    uint8_t end_warn;
 };
 
 struct rb_state {

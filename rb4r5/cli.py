@@ -418,6 +418,67 @@ def cmd_fxhunt(args, cfg) -> int:
     return 0
 
 
+# The RX3 deck keys nobody has named yet, in the order worth trying: the
+# ones after SEARCH (0x411f/0x4120) first, then the gaps below it.
+LOOPCALL_CANDIDATES = ([0x4121 + i for i in range(15)] +
+                       [0x4103, 0x4105, 0x4106, 0x410a, 0x410b, 0x4100])
+
+
+def cmd_loophunt(args, cfg) -> int:
+    """Find the RX3's own CUE/LOOP CALL keys: halve and double a loop.
+
+    They are not in any key table this port has, and without them the FLX4's
+    LOOP CALL arrows can only resize a beat loop, through its pads.  So this
+    presses each unnamed deck key once, with a loop running on deck 1, and
+    you say what the loop did.  When both are found they go into the map
+    file and the arrows resize ANY loop.
+    """
+    util.require_root("sending keys to the player")
+    if not Path(config.FIFO_CTRL).exists():
+        raise util.Fail(f"{config.FIFO_CTRL} is not there - is the player "
+                        "running?")
+    candidates = ([int(k, 0) for k in args.keys.split(",")] if args.keys
+                  else LOOPCALL_CANDIDATES)
+    print("\nOn the LEFT deck: load a track, press PLAY, and set a loop with "
+          "LOOP IN then\nLOOP OUT (a few beats long is easiest to judge).  "
+          "Each key is pressed once;\nwatch the loop and answer.  If "
+          "something else happens, answer o, put things\nback (and the loop), "
+          "and carry on.\n")
+    input("Press Enter when the loop is running... ")
+    halve = double = None
+    for code in candidates:
+        if halve and double:
+            break
+        if not keys.tap_ctrl(code, 1):
+            util.warn(f"nothing is reading {config.FIFO_CTRL}")
+            return 1
+        answer = input(f"  0x{code:04x}: the loop got [s]horter, [l]onger, "
+                       f"[n]othing, [o]ther? ").strip().lower()[:1]
+        if answer == "s" and not halve:
+            halve = code
+        elif answer == "l" and not double:
+            double = code
+        elif answer == "o":
+            input("    note it, put things back as they were, then Enter... ")
+    if not (halve and double):
+        print(f"\nNot both found (halve={halve}, double={double}).  Try "
+              f"others with --keys 0x4130,0x4131,...")
+        return 1
+    line = f"loopcall keys 0x{halve:04x} 0x{double:04x}"
+    map_file = Path(cfg.get("controller.map_file") or "/etc/rb4r5/flx4-map.conf")
+    try:
+        old = map_file.read_text().splitlines() if map_file.exists() else []
+        kept = [l for l in old if not l.strip().startswith("loopcall keys")]
+        map_file.write_text("\n".join(kept + [line]) + "\n")
+        print(f"\nFound them.  Written to {map_file}:\n    {line}\n"
+              f"Restart to use them:  sudo python3 launch.py stop && "
+              f"sudo python3 launch.py run")
+    except OSError as exc:
+        print(f"\nFound them, but could not write {map_file} ({exc}).  "
+              f"Add this line to it:\n    {line}")
+    return 0
+
+
 def cmd_ledsweep(args, cfg) -> int:
     """Light the controller's lamps one at a time, so they can be mapped.
 
@@ -785,6 +846,13 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--pause", type=float, default=2.5,
                       help="seconds between each attempt (default 2.5)")
     hunt.set_defaults(func=cmd_fxhunt)
+
+    loops = sub.add_parser("loophunt", help="find the RX3's own keys that "
+                                           "halve and double a running loop, "
+                                           "for the LOOP CALL arrows")
+    loops.add_argument("--keys", help="comma-separated keycodes to try "
+                                      "instead of the usual candidates")
+    loops.set_defaults(func=cmd_loophunt)
 
     sweep = sub.add_parser("ledsweep", help="light the controller's lamps one "
                                             "at a time, to find out which "

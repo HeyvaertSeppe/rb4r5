@@ -42,7 +42,9 @@ LEVELS_FILE = "/tmp/rb-levels.dat"      # written by audioshim, 5 x int32
 MASTER_FILE = "/tmp/rb-master.dat"      # the controller's MASTER knob, 0..1
 # What the player itself says it is doing, published from inside it by
 # keyshim.so (src/shims/rb_state.h).  Only the Beat FX position is read here.
-STATE_FILE = "/tmp/rb-state.dat"
+# (PLAYER_STATE, not STATE_FILE: that name is the overlay's own JSON state,
+# and reusing it made the two write over each other.)
+PLAYER_STATE = "/tmp/rb-state.dat"
 STATE_MAGIC, STATE_VERSION, STATE_SIZE = 0x54534252, 1, 120
 STATE_BFX_POS = 115                      # offset of bfx_pos in the record
 MODAL_FILE = "/tmp/rb-overlay.modal"    # while this exists the player holds off
@@ -469,7 +471,7 @@ class Overlay:
     def player_fx(self) -> int | None:
         """The Beat FX position the PLAYER is on, if it says; else None."""
         try:
-            blob = Path(STATE_FILE).read_bytes()
+            blob = Path(PLAYER_STATE).read_bytes()
         except OSError:
             return None
         if len(blob) != STATE_SIZE:

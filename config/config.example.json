@@ -57,8 +57,8 @@
     "tap_slop": 0.02,
     "scroll_step": 0.035,
     "jog_scale": 3.0,
-    "native": false,
-    "native_format": "fxy",
+    "native": true,
+    "native_format": "rx3",
     "verbose": false
   },
   "keyboard": {

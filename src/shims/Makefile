@@ -23,8 +23,17 @@ RX3LIB  := $(RX3)/lib
 RX3ULIB := $(RX3)/usr/lib
 
 # armv5t/soft keeps the binary loadable by the RX3 loader on any ARM core.
+BUILD_ID ?= dev
+# The RX3's glibc 2.13 has 32-bit time_t and off_t.  Toolchains from Debian 13
+# ("trixie", the base of current Raspberry Pi OS) turn on 64-bit time and file
+# offsets BY DEFAULT for 32-bit ARM - which makes memshim fail to build at
+# all (open64 defined twice) and the other shims call __clock_gettime64 and
+# friends, which glibc 2.13 does not have, so rbp cannot preload them.
+# Undefine both, always.
+ABI32   := -U_TIME_BITS -U_FILE_OFFSET_BITS
 CFLAGS  := -O2 -march=armv5t -mfloat-abi=soft -fno-stack-protector -fPIC \
-           -Wall -Wextra -Wno-unused-parameter
+           $(ABI32) -Wall -Wextra -Wno-unused-parameter \
+           -DRB_BUILD_ID=\"$(BUILD_ID)\"
 LDFLAGS := $(if $(COMPAT),-L$(COMPAT),) -L$(RX3LIB) -L$(RX3ULIB) \
            -Wl,-rpath-link,$(RX3LIB):$(RX3ULIB)
 
@@ -47,14 +56,14 @@ $(OUT)/memshim.so: memshim.c | $(OUT)
 # syscalls so the glibc-2.13 loader accepts it with no dependencies at all.
 $(OUT)/fbshim.so: fbshim.c | $(OUT)
 	$(CC) -O2 -march=armv5t -mfloat-abi=soft -fno-stack-protector -fPIC \
-	    -shared -nostdlib -o $@ $<
+	    $(ABI32) -shared -nostdlib -o $@ $<
 
 # audioshim must bind dlopen/dlsym to libdl GLIBC_2.4 (the .symver directives
 # are in the source), so link the RX3's own libdl explicitly.
 $(OUT)/audioshim.so: audioshim.c | $(OUT)
 	$(CC) $(CFLAGS) -shared -o $@ $< $(RX3LIB)/libdl.so.2 -lc $(LDFLAGS)
 
-$(OUT)/keyshim.so: keyshim.c | $(OUT)
+$(OUT)/keyshim.so: keyshim.c rb_state.h | $(OUT)
 	$(CC) $(CFLAGS) -shared -o $@ $< -lpthread -lc $(LDFLAGS)
 
 # Fail the build if a GLIBC version above 2.13 or a hard-float tag sneaks in.

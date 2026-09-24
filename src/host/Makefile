@@ -11,6 +11,10 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter
 OUT     ?= .
+# the launcher passes a hash of the sources, which the daemons print at start,
+# so the log says which code is actually running
+BUILD_ID ?= dev
+CFLAGS  += -DRB_BUILD_ID=\"$(BUILD_ID)\"
 
 TOOLS := $(OUT)/flx4-bridge $(OUT)/rbkeyd $(OUT)/fakekbd $(OUT)/fbpublish
 
@@ -21,7 +25,7 @@ $(OUT):
 	mkdir -p $(OUT)
 
 # -lm: the level meters scale in dBFS, like the ones on the player
-$(OUT)/flx4-bridge: flx4-bridge.c | $(OUT)
+$(OUT)/flx4-bridge: flx4-bridge.c ../shims/rb_state.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(OUT)/rbkeyd: rbkeyd.c | $(OUT)

@@ -127,6 +127,8 @@ class Supervisor:
 
     # -- setup -------------------------------------------------------------
     def preflight(self, strict: bool = True) -> None:
+        for note in getattr(self.cfg, "migrated", []):
+            util.info(f"config: {note}")
         if self.cfg.get("build.auto_rebuild", True):
             for note in build.refresh_stale(self.cfg, self.repo):
                 util.info(note)
@@ -341,8 +343,85 @@ class Supervisor:
                 "usbwatch", [python, launcher, "usbwatch"], logs / "usbwatch.log"))
 
     # -- lifecycle ---------------------------------------------------------
+    # -- one of us at a time -------------------------------------------------
+    DAEMONS = ("touchd", "overlay", "subucom", "usbwatch")
+
+    def other_supervisors(self) -> list[int]:
+        """Other `launch.py run` (or bare `launch.py`) processes."""
+        found = []
+        me, parent = os.getpid(), os.getppid()
+        for pid in util.pgrep("launch.py"):
+            if pid in (me, parent):
+                continue
+            try:
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            argv = [a.decode(errors="replace") for a in argv if a]
+            at = next((i for i, a in enumerate(argv)
+                       if a.endswith("launch.py")), None)
+            if at is None:
+                continue
+            rest = [a for a in argv[at + 1:] if not a.startswith("-")]
+            if not rest or rest[0] in ("run", "auto"):
+                found.append(pid)
+        return found
+
+    def take_over(self) -> None:
+        """Make this the only rb4r5 running.
+
+        The boot service starts the port by itself.  Running `launch.py run`
+        by hand on top of it used to stop only the other PLAYER: the service's
+        controller bridge, overlay and touch daemon kept running - the old
+        bridge kept the FLX4's MIDI port, so the new one could not open it and
+        every change "did nothing", and two overlays drew over each other.
+        Now the service is stopped (so it does not restart what is killed),
+        any other launcher is ended, and everything they started with it."""
+        if not os.environ.get("INVOCATION_ID") and util.have("systemctl"):
+            state = util.run(["systemctl", "is-active", "rb4r5.service"],
+                             check=False, capture=True)
+            if (getattr(state, "stdout", "") or "").strip() == "active":
+                util.warn("the rb4r5 boot service is running - stopping it so "
+                          "this run is the only one")
+                util.run(["systemctl", "stop", "rb4r5.service"], check=False,
+                         timeout=90)
+        others = self.other_supervisors()
+        for pid in others:
+            util.warn(f"another rb4r5 launcher is running (pid {pid}) - "
+                      f"ending it")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.monotonic() + 15
+        while others and time.monotonic() < deadline:
+            others = [p for p in others if Path(f"/proc/{p}").exists()]
+            time.sleep(0.3)
+        for pid in others:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
     def stop_stale(self) -> None:
-        """Never leave a second player behind (two fight over the screen)."""
+        """Never leave a second player behind (two fight over the screen) -
+        nor a second bridge (it keeps the FLX4), overlay or touch daemon."""
+        for name in ("flx4-bridge", "rbkeyd", "fakekbd"):
+            for pid in util.pgrep_arg(str(self.cfg.bindir / name)):
+                util.warn(f"stopping a leftover {name} ({pid})")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        for daemon in self.DAEMONS:
+            for pid in util.pgrep(f"launch.py {daemon}"):
+                if pid in (os.getpid(), os.getppid()):
+                    continue
+                util.warn(f"stopping a leftover {daemon} ({pid})")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
         for arg in ("/root/pdj/rbp", "/usr/bin/edb_streamd"):
             for pid in util.pgrep_arg(arg):
                 util.warn(f"killing a leftover process {pid} ({arg})")
@@ -504,8 +583,11 @@ class Supervisor:
                 util.info(note)
 
     def run(self, foreground: bool = True, force: bool = False) -> int:
+        self.take_over()
         self.preflight(strict=not force)
         self.stop_stale()
+        util.info(f"sources {build.build_id(self.repo)} - flx4-bridge.log and "
+                  f"/tmp/keyshim.log print the build they were made from")
         self.show_splash_now()          # before anything slow happens
         self.prepare_system()
         self.build_children()
@@ -523,6 +605,7 @@ class Supervisor:
 
         util.step("starting the player")
         self.start_all()
+        self.check_builds_later()
         util.ok("rb4r5 is running - the rekordbox UI should be on the screen")
         self.capture_screenshot()
         util.info("logs: " + str(self.cfg.logs) + "  (rbp.log, flx4-bridge.log, "
@@ -556,6 +639,48 @@ class Supervisor:
         finally:
             self.shutdown()
         return 0
+
+    # -- is the code that runs the code in the tree? -----------------------
+    def check_builds_later(self, after: float = 20.0) -> None:
+        """Say plainly whether the bridge and keyshim are this tree's build.
+
+        "I changed it and nothing changed" has had one cause more than any
+        other here: the running binary was not the new one.  Both print the
+        build they were made from; this compares that with the tree."""
+        want = build.build_id(self.repo)
+        logs = Path(self.cfg.logs)
+
+        def last_build(path: Path, marker: str) -> str | None:
+            try:
+                text = path.read_text(errors="replace")[-200000:]
+            except OSError:
+                return None
+            at = text.rfind(marker)
+            if at < 0:
+                return None
+            return text[at + len(marker):].split()[0] if \
+                text[at + len(marker):].split() else None
+
+        def check():
+            time.sleep(after)
+            for name, path, marker in (
+                    ("controller bridge", logs / "flx4-bridge.log",
+                     "flx4-bridge: build "),
+                    ("keyshim (inside the player)", self.KEYSHIM_LOG,
+                     "keyshim: build ")):
+                got = last_build(path, marker)
+                if got == want:
+                    util.ok(f"{name}: running this tree's build ({want})")
+                elif got is None:
+                    util.warn(f"{name}: has not said which build it is - it "
+                              f"is OLDER than this tree.  Rebuild: sudo "
+                              f"python3 launch.py build")
+                else:
+                    util.error(f"{name}: running build {got}, but the tree is "
+                               f"{want} - your changes are NOT running.  "
+                               f"Rebuild: sudo python3 launch.py build")
+
+        threading.Thread(target=check, daemon=True).start()
 
     # -- the controller's view into the player, if it is what crashes it ---
     KEYSHIM_LOG = Path("/tmp/keyshim.log")

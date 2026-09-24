@@ -142,9 +142,11 @@ with tempfile.TemporaryDirectory() as tmp:
     player = Player(state)
     DIM = 3
     player.decks[0] = deck(loaded=1, playing=1, play_led=ON, meter=11,
-                           pads=[DIM, ON, ON, DIM, DIM, DIM, DIM, DIM],
-                           rgb=[(0x30, 0x30, 0x30), (0x30, 0x30, 0x30),
-                                (0xFF, 0x20, 0x20)] + [(0x30, 0x30, 0x30)] * 5)
+                           # every empty slot lit in the bank's (bright)
+                           # colour, one stored cue in its own
+                           pads=[ON] * 8,
+                           rgb=[(0xC0, 0xC0, 0xC0)] * 2 + [(0xFF, 0x20, 0x20)]
+                               + [(0xC0, 0xC0, 0xC0)] * 5)
     player.decks[1] = deck(loaded=1, playing=0, play_led=BLINK, meter=0,
                            pfl=1)
     player.bfx = BLINK             # what rbp reports with the effect OFF
@@ -165,10 +167,11 @@ with tempfile.TemporaryDirectory() as tmp:
               flx.seen.get((0x91, 0x0B), set()) >= {0x00, 0x7F})
         check("a hot cue the player holds is lit", flx.lamps.get((0x97, 0x02)), 0x7F)
         check("... on the SHIFT channel too", flx.lamps.get((0x98, 0x02)), 0x7F)
-        check("an empty hot cue is dark (rbp keeps it dim)",
-              flx.lamps.get((0x97, 0x03)), 0x00)
-        check("and so is one rbp lights only in the bank's dim colour",
-              flx.lamps.get((0x97, 0x01)), 0x00)
+        check("an empty hot cue is dark, though rbp lights it in the bank "
+              "colour", flx.lamps.get((0x97, 0x03)), 0x00)
+        check("and so are all the other empty ones",
+              [flx.lamps.get((0x97, p)) for p in (0, 1, 4, 5, 6, 7)],
+              [0] * 6)
         check("the HOT CUE mode lamp is on the deck channel",
               flx.lamps.get((0x90, 0x1B)), 0x7F)
         check("and the other modes are dark", flx.lamps.get((0x90, 0x20)), 0x00)

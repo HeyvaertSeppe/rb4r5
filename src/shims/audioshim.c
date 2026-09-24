@@ -61,6 +61,7 @@
 /* the rate governor, shared with tools/tests/test_rate_gate.c */
 #include "rate_gate.h"
 #include <sys/syscall.h>
+#include "abi213.h"   /* last: see the header */
 
 /* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13.
  *

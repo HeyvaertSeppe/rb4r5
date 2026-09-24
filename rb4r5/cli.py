@@ -278,6 +278,94 @@ def cmd_zones(args, cfg) -> int:
     return 1 if problems else 0
 
 
+def _tail(path, lines: int) -> list[str]:
+    try:
+        return Path(path).read_text(errors="replace").splitlines()[-lines:]
+    except OSError as exc:
+        return [f"(cannot read {path}: {exc})"]
+
+
+def _decode_player_state(path: str = "/tmp/rb-state.dat") -> list[str]:
+    import struct
+    try:
+        blob = Path(path).read_bytes()
+    except OSError as exc:
+        return [f"(no player state: {exc})"]
+    if len(blob) != 120:
+        return [f"(player state is {len(blob)} bytes, not 120 - not keyshim's)"]
+    magic, version, seq, flags = struct.unpack_from("<IIII", blob, 0)
+    out = [f"magic {magic:#x} version {version} seq {seq} flags {flags:#x} "
+           f"(1 engine, 2 lamps, 4 meters, 8 headphone cue)"]
+    for d in range(2):
+        k = blob[16 + 48 * d: 16 + 48 * (d + 1)]
+        out.append(f"deck{d + 1}: loaded {k[0]} playing {k[1]} sync {k[2]} "
+                   f"looping {k[3]} vinyl {k[7]} keylock {k[8]} pfl {k[9]} "
+                   f"play_led {k[10]} sync_led {k[11]}")
+        pads = " ".join(f"{k[12 + p]}/{k[20 + 3 * p]:02x}{k[21 + 3 * p]:02x}"
+                        f"{k[22 + 3 * p]:02x}" for p in range(8))
+        out.append(f"       pads {pads}  meter {k[44]} bank {k[45]} "
+                   f"sub {k[46]} end_warn {k[47]}")
+    out.append(f"bfx_led {blob[112]} master_cue {blob[113]} "
+               f"master_meter {blob[114]} bfx_pos {blob[115]}")
+    return out
+
+
+def cmd_report(args, cfg) -> int:
+    """Everything needed to see what is really happening, in one file."""
+    from . import build as build_mod
+    lines = [f"rb4r5 report {time.strftime('%Y-%m-%d %H:%M:%S')}"]
+    head = util.run(["git", "-C", str(REPO), "log", "-1", "--format=%h %s"],
+                    check=False, capture=True)
+    lines.append(f"tree: {(getattr(head, 'stdout', '') or '').strip()}  "
+                 f"sources {build_mod.build_id(REPO)}")
+    for tool in ("gcc", build_mod.CROSS + "gcc"):
+        ver = util.run([tool, "--version"], check=False, capture=True)
+        lines.append(f"{tool}: " + ((getattr(ver, 'stdout', '') or '')
+                                    .splitlines() or ['missing'])[0])
+    lines.append("")
+    lines.append("== processes")
+    seen = set()
+    for needle in ("launch.py", "flx4-bridge", "/root/pdj/rbp", "rbkeyd"):
+        for pid in util.pgrep(needle):
+            if pid in seen or pid == os.getppid():
+                continue
+            seen.add(pid)
+            try:
+                cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+                    b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            lines.append(f"  {pid}: {cmd[:160]}")
+    lines.append("")
+    lines.append("== config (what differs from the defaults, and migrations)")
+    lines.append("  " + json.dumps(config._changes(config.DEFAULTS, cfg.data)))
+    for note in getattr(cfg, "migrated", []):
+        lines.append(f"  migrated: {note}")
+    lines.append("")
+    lines.append("== the player's own state (keyshim, /tmp/rb-state.dat)")
+    lines += ["  " + l for l in _decode_player_state()]
+    for title, path, count in (
+            ("flx4-bridge.log", cfg.logs / "flx4-bridge.log", 80),
+            ("keyshim.log", "/tmp/keyshim.log", 60),
+            ("touchd.log", cfg.logs / "touchd.log", 30),
+            ("overlay.log", cfg.logs / "overlay.log", 30),
+            ("supervisor.log", cfg.logs / "supervisor.log", 60),
+            ("rbp.log", cfg.logs / "rbp.log", 40)):
+        lines.append("")
+        lines.append(f"== {title} (last {count} lines)")
+        lines += ["  " + l for l in _tail(path, count)]
+    out = Path(cfg.logs) / "report.txt"
+    try:
+        util.ensure_dir(out.parent)
+        out.write_text("\n".join(lines) + "\n")
+    except OSError:
+        out = Path("/tmp/rb4r5-report.txt")
+        out.write_text("\n".join(lines) + "\n")
+    print("\n".join(lines[:12]))
+    print(f"\n... the whole report is in {out} - send that file.")
+    return 0
+
+
 def cmd_logs(args, cfg) -> int:
     if args.prune:
         return prune_logs(cfg)
@@ -949,6 +1037,11 @@ def build_parser() -> argparse.ArgumentParser:
     zone_cmd.add_argument("--path")
     zone_cmd.add_argument("--write-default", action="store_true")
     zone_cmd.set_defaults(func=cmd_zones)
+
+    report = sub.add_parser("report", help="collect what is running, the "
+                                           "logs and the player's state into "
+                                           "one file to send")
+    report.set_defaults(func=cmd_report)
 
     logs = sub.add_parser("logs", help="tail the logs")
     logs.add_argument("name", nargs="?")

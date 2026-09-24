@@ -72,6 +72,21 @@ int ioctl(int fd, unsigned long request, ...)
     va_end(ap);
 
     switch (request) {
+    /* The RX3's touch device (/dev/tsc2007_2-0048, a stub file here): rbp's
+     * TouchPanelComm reads and writes its limits before it takes a single
+     * touch, and on a stub those ioctls fail - so native touch never got
+     * going.  These are the values the Prime GO / SC Live 4 ports answer,
+     * verified on the same rbp (rblive4 fbshim-tsc.c). */
+    case 0x80046b00:                    /* _IOR('k', 0, 4): max X */
+        if (arg) *(unsigned int *)arg = 3;
+        return 0;
+    case 0x40046b00:                    /* _IOW('k', 0, 4) */
+        return 0;
+    case 0x80026b01:                    /* _IOR('k', 1, 2): max Y */
+        if (arg) *(unsigned short *)arg = 3900;
+        return 0;
+    case 0x40026b01:                    /* _IOW('k', 1, 2) */
+        return 0;
     case FBIOGET_VSCREENINFO: {
         struct fb_var_screeninfo *v = arg;
         int r = (int)raw_ioctl(fd, request, v);

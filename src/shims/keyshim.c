@@ -31,6 +31,10 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
+#include <setjmp.h>
+#include <signal.h>
+#include "abi213.h"   /* last: see the header */
 
 static int real_open(const char *p, int flags)
 {
@@ -52,6 +56,9 @@ static int real_close(int fd)
  * hundred records a second per deck.  That was thousands of syscalls a second
  * on the path between the wheel and the engine, and a log that grew without
  * end until /tmp filled.  Per-event lines now need KEYSHIM_VERBOSE=1. */
+#ifndef RB_BUILD_ID
+#define RB_BUILD_ID "dev"
+#endif
 #ifndef KLOG_PATH
 #define KLOG_PATH "/tmp/keyshim.log"
 #endif
@@ -448,9 +455,7 @@ static void *key_thread(void *arg)
  * XDJ-RX3 v1.20 rbp - the build whose UI_OBJ_MGR_GLOBAL this file already
  * depends on.  Set RB_ENGINE_STATE=0 to turn all of it off.
  */
-#include <sys/mman.h>
 #include "rb_state.h"
-#include <stdio.h>
 
 /* djengine PlayEngine: the object DjEngineIF::isPlaying() etc. delegate to */
 #define PLAYENGINE_GLOBAL  0x011497d0UL
@@ -630,15 +635,20 @@ static uint8_t ledstat_state(unsigned char *arr, unsigned int count,
  * pinned with RB_ENDWARN_ID=<id>, which then is the only one looked at. */
 static int endwarn_id = -2;              /* -2 not read yet, -1 heuristic */
 static unsigned char endwarn_seen[LED_TABLE_MAX][4];
-/* A lamp already blinking in the first two seconds of play blinks BECAUSE
- * the deck plays - it is not a warning, and is never taken for one. */
+/* Lamps that have blinked where an end warning cannot be - paused, in a
+ * loop, just after a loop, or in the first seconds of play - blink for some
+ * other reason and are never taken for it. */
 static unsigned char endwarn_never[LED_TABLE_MAX][4];
-static unsigned int played_ticks[2];
+static unsigned short endwarn_run[LED_TABLE_MAX][4];   /* ticks blinking */
+static unsigned int played_ticks[2], since_loop[2];
 
 static uint8_t end_warning(unsigned char *arr, unsigned int count, int deck,
                            int playing, int looping)
 {
     unsigned int ch = (unsigned)deck + 1;
+    int d = deck & 1;
+    int suspect = 0;
+
     if (endwarn_id == -2) {
         const char *v = getenv("RB_ENDWARN_ID");
         endwarn_id = (v && *v) ? atoi(v) : -1;
@@ -647,32 +657,47 @@ static uint8_t end_warning(unsigned char *arr, unsigned int count, int deck,
         uint8_t st = ledstat_state(arr, count, (unsigned)endwarn_id, ch);
         return st == RBL_UNKNOWN ? 0xff : (st == RBL_BLINK);
     }
-    if (!playing) {
-        played_ticks[deck & 1] = 0;
-        return 0;
-    }
-    if (played_ticks[deck & 1] < 0xffffu)
-        played_ticks[deck & 1]++;
     if (looping)
-        return 0;
+        since_loop[d] = 0;
+    else if (since_loop[d] < 0xffffu)
+        since_loop[d]++;
+    if (!playing)
+        played_ticks[d] = 0;
+    else if (played_ticks[d] < 0xffffu)
+        played_ticks[d]++;
+    /* where an end warning cannot be: anything blinking here is something
+     * else (the CUE lamp while paused, the loop lamps, ...) */
+    suspect = !playing || looping || played_ticks[d] < 120 ||
+              since_loop[d] < 160;
+
     for (unsigned int i = 0; i < count; i++) {
         unsigned char *e = arr + LED_ENTRY_SIZE * i;
         unsigned int id = *(unsigned int *)e;
-        if (*(unsigned int *)(e + 4) != ch ||
-            *(unsigned int *)(e + 16) != RBL_BLINK)
+        if (*(unsigned int *)(e + 4) != ch || id >= LED_TABLE_MAX)
             continue;
+        if (*(unsigned int *)(e + 16) != RBL_BLINK) {
+            endwarn_run[id][ch & 3] = 0;
+            continue;
+        }
         if (id == LEDSTAT_PLAY || id == LEDSTAT_SYNC ||
             (id >= LEDSTAT_PAD0 && id < LEDSTAT_PAD0 + 8) ||
-            id >= LED_TABLE_MAX || endwarn_never[id][ch & 3])
+            endwarn_never[id][ch & 3])
             continue;
-        if (played_ticks[deck & 1] < 80) {          /* 2 s at 40 Hz */
+        if (suspect) {
             endwarn_never[id][ch & 3] = 1;
             continue;
         }
+        /* and it has to KEEP blinking: a warning lasts the last half minute
+         * of a track, not a moment */
+        if (endwarn_run[id][ch & 3] < 0xffffu)
+            endwarn_run[id][ch & 3]++;
+        if (endwarn_run[id][ch & 3] < 80)            /* 2 s at 40 Hz */
+            continue;
         if (!endwarn_seen[id][ch & 3]) {
             endwarn_seen[id][ch & 3] = 1;
-            klog_dec("keyshim: end warning? LedStat id blinking on a playing "
-                     "deck: ", (int)id);
+            klog_dec("keyshim: end warning from LedStat id ", (int)id);
+            klog_str("keyshim: (if that is wrong, RB_ENDWARN_ID=<id> pins "
+                     "the right one)\n");
         }
         return 1;
     }
@@ -870,8 +895,6 @@ static void publish_state(const struct rb_state *st)
  * that, for a fault in THIS thread, jumps back to the top of the tick and
  * switches the probe that faulted off for good.  A fault in any other thread
  * goes to whatever handler rbp had, exactly as before. */
-#include <setjmp.h>
-#include <signal.h>
 
 enum {
     P_ENGINE  = 1 << 0,     /* PlayEngine transport flags     */
@@ -1255,6 +1278,7 @@ static void keyshim_init(void)
         return;                 /* the loader and helpers get nothing */
     rbp_checked = 1;
     klog_dec("keyshim: loaded into rbp, pid ", (int)getpid());
+    klog_str("keyshim: build " RB_BUILD_ID "\n");
     if (engine_state_enabled())
         g_hooked = install_meter_hook();
     if (pthread_create(&tid, NULL, key_thread, NULL) == 0)

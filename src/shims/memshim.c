@@ -62,6 +62,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include "abi213.h"   /* last: see the header */
 
 #ifndef SYS_poll
 #define SYS_poll __NR_poll
@@ -111,10 +112,11 @@ struct rb_touch_state {
     uint32_t y;
 };
 
-enum { TFMT_FXY = 0, TFMT_XYF, TFMT_XYP, TFMT_BXY };
+enum { TFMT_FXY = 0, TFMT_XYF, TFMT_XYP, TFMT_BXY, TFMT_RX3 };
 
 static int      touch_native = -1;      /* -1 = not resolved yet */
-static int      touch_fmt    = TFMT_FXY;
+static int      touch_fmt    = TFMT_RX3;
+static int      touch_invx   = 1;
 static int      touch_swap   = 0;
 static unsigned touch_maxx   = 1280;
 static unsigned touch_maxy   = 800;
@@ -141,9 +143,13 @@ static void touch_env_init(void)
         if (!strcmp(s, "xyf"))      touch_fmt = TFMT_XYF;
         else if (!strcmp(s, "xyp")) touch_fmt = TFMT_XYP;
         else if (!strcmp(s, "bxy")) touch_fmt = TFMT_BXY;
-        else                        touch_fmt = TFMT_FXY;
+        else if (!strcmp(s, "fxy")) touch_fmt = TFMT_FXY;
+        else                        touch_fmt = TFMT_RX3;
     }
 
+    s = getenv("RB_TOUCH_INVX");
+    if (s && *s)
+        touch_invx = *s != '0';
     s = getenv("RB_TOUCH_SWAP");
     if (s && *s && *s != '0')
         touch_swap = 1;
@@ -183,6 +189,21 @@ static void touch_pack(unsigned char *buf, const struct rb_touch_state *st)
 
     memset(buf, 0, 6);
     switch (touch_fmt) {
+    case TFMT_RX3:
+        /* Verified on this rbp by the Prime GO / SC Live 4 ports:
+         * { u8 flag, u8 0, u16 x, u16 y }, little-endian, in the 1280x800
+         * UI - with X mirrored, because the firmware's commRxDataProc
+         * computes calX = 1280 - rawX (its panel is wired invertX = 1).
+         * That needs the identity calibration files the launcher installs
+         * (TouchCalib_User.dat / TouchCalib_Factory.dat). */
+        if (touch_invx)
+            x = touch_maxx - 1 - x;
+        buf[0] = (unsigned char)down;
+        buf[2] = (unsigned char)(x & 0xff);
+        buf[3] = (unsigned char)(x >> 8);
+        buf[4] = (unsigned char)(y & 0xff);
+        buf[5] = (unsigned char)(y >> 8);
+        return;
     case TFMT_XYF:
         a = (unsigned short)x; b = (unsigned short)y; c = (unsigned short)down;
         break;

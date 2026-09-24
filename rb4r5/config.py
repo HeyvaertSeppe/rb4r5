@@ -161,10 +161,16 @@ DEFAULTS: dict = {
         "tap_slop": 0.02,                # movement (0..1) still counted as a tap
         "scroll_step": 0.035,            # drag distance per browse-knob step
         "jog_scale": 3.0,                # jog revolutions per screen width
-        # Native RX3 touch injection through memshim.  OFF by default: the
-        # 6-byte tsc2007 record layout is unverified (docs/07-touch.md).
-        "native": False,
-        "native_format": "fxy",
+        # Native RX3 touch: the player gets the finger itself, through the
+        # RX3's own touch device (memshim), and does with it what an RX3
+        # does - tap a row, drop the needle on the waveform, the on-screen
+        # buttons, everything.  The record ("rx3") is the one the Prime GO
+        # and SC Live 4 ports verified on this same player.  False = the
+        # older zone map (touch-zones.json), which only presses keys.
+        "native": True,
+        "native_format": "rx3",
+        "native_invert_x": True,         # the RX3 panel is wired mirrored
+        "native_min_tap_ms": 90,         # a tap is held at least this long
         "verbose": False,
     },
     # ---- keyboard (optional fallback control) ------------------------------
@@ -289,9 +295,54 @@ class Config:
 
     # -- persistence --------------------------------------------------------
     def save(self, path: Path | None = None) -> None:
+        """Write only what differs from the defaults.
+
+        It used to write EVERY value, which froze the defaults of the day the
+        Pi was set up into its config: change a default later - the jog's
+        ticks per turn, native touch - and the saved copy of the old one
+        quietly won, for ever."""
         path = path or self.path
         util.ensure_dir(path.parent)
-        util.write_text(path, json.dumps(self.data, indent=2) + "\n")
+        util.write_text(path, json.dumps(_changes(DEFAULTS, self.data),
+                                         indent=2) + "\n")
+
+
+def _changes(base: dict, data: dict) -> dict:
+    """The part of `data` that is not simply `base`."""
+    out = {}
+    for key, value in data.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            inner = _changes(base[key], value)
+            if inner:
+                out[key] = inner
+        elif key not in base or base[key] != value:
+            out[key] = value
+    return out
+
+
+# Defaults that have been replaced, with the old values that configs saved
+# before could still carry (see Config.save).  A config holding exactly an
+# old default gets the new one - it was never anybody's choice.
+SUPERSEDED = {
+    "controller.jog_ticks_per_rev": [1800],   # the RX3's wheel, not the FLX4's
+    "touch.native": [False],                  # the touch record is verified now
+    "touch.native_format": ["fxy"],
+}
+
+
+def _migrate(data: dict, user: dict) -> list[str]:
+    notes = []
+    for dotted, old_values in SUPERSEDED.items():
+        section, _, key = dotted.partition(".")
+        mine = user.get(section, {})
+        if not isinstance(mine, dict) or key not in mine:
+            continue
+        if mine[key] in old_values:
+            new = DEFAULTS[section][key]
+            data[section][key] = new
+            notes.append(f"{dotted} was {mine[key]!r}, an old default - "
+                         f"using the new one, {new!r}")
+    return notes
 
 
 def load(path: Path | None = None) -> Config:
@@ -302,10 +353,17 @@ def load(path: Path | None = None) -> Config:
     data = copy.deepcopy(DEFAULTS)
     if path.exists():
         try:
-            data = _merge(DEFAULTS, json.loads(path.read_text()))
+            user = json.loads(path.read_text())
+            data = _merge(DEFAULTS, user)
+            migrated = _migrate(data, user if isinstance(user, dict) else {})
         except (OSError, ValueError) as exc:
             util.warn(f"{path} is not readable JSON ({exc}); using defaults")
-    return Config(data, path)
+            migrated = []
+    else:
+        migrated = []
+    cfg = Config(data, path)
+    cfg.migrated = migrated               # the launcher says these once
+    return cfg
 
 
 # Paths that live in /tmp because the chroot bind-mounts the host /tmp, which

@@ -1247,18 +1247,90 @@ static int handle_padmode(int ch, int deck, int note, int on)
  * stored one - so the pad answers the press before the player does. */
 static int g_pad_was[2][8];            /* lit when the finger went down */
 
-static int hotcue_stored(int d, int p)
+/* How a pad looks in rbp's table: lit or not, and its colour, coarsely. */
+static int pad_look(const struct rb_state_deck *k, int p)
+{
+    int on = k->pad_led[p] == RBL_ON || k->pad_led[p] == RBL_BLINK;
+    return on ? (1 << 12) | ((k->pad_rgb[p][0] >> 5) << 6) |
+                ((k->pad_rgb[p][1] >> 5) << 3) | (k->pad_rgb[p][2] >> 5) : 0;
+}
+
+static int pad_top(const struct rb_state_deck *k, int p)
+{
+    int r = k->pad_rgb[p][0], g = k->pad_rgb[p][1], b = k->pad_rgb[p][2];
+    return r > g ? (r > b ? r : b) : (g > b ? g : b);
+}
+
+/* Does this hot cue slot hold a cue, by the player's own pads?
+ *
+ * Empty slots all look the same - the bank's colour - and a stored cue
+ * looks different: its own colour.  So the look most of the eight share is
+ * "empty", and a pad is a cue when it looks otherwise.  (Unless that
+ * majority is bright and small, which is five or so cues of one colour:
+ * then the dimmest look is the empty one.)  A threshold on brightness
+ * alone was the "every pad lit with no hot cues". */
+static int hotcue_from_player(int d, int p)
 {
     const struct rb_state_deck *k = &g_rs.deck[d];
+    int looks[8], count[8], empty = 0, best = -1, dimmest = 0;
+
+    for (int i = 0; i < 8; i++) {
+        looks[i] = pad_look(k, i);
+        count[i] = 0;
+        for (int j = 0; j < 8; j++)
+            if (pad_look(k, j) == looks[i])
+                count[i]++;
+        if (best < 0 || count[i] > count[best])
+            best = i;
+        if (!looks[i] || (looks[dimmest] && pad_top(k, i) < pad_top(k, dimmest)))
+            dimmest = i;
+    }
+    empty = looks[best];
+    if (empty && count[best] < 6 && pad_top(k, best) >= 0x60)
+        empty = looks[dimmest];
+    return looks[p] != 0 && looks[p] != empty;
+}
+
+static int hotcue_stored(int d, int p)
+{
     if (g_hotcue[d][p])
         return 1;
-    if (rs_has(RBS_LEDSTAT) && rbp_bank(d) == K_HOTCUE &&
-        (k->pad_led[p] == RBL_ON || k->pad_led[p] == RBL_BLINK)) {
-        int r = k->pad_rgb[p][0], g = k->pad_rgb[p][1], b = k->pad_rgb[p][2];
-        int top = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        return top >= 0x60;
+    return rs_has(RBS_LEDSTAT) && rbp_bank(d) == K_HOTCUE &&
+           g_rs.deck[d].pad_led[p] != RBL_UNKNOWN && hotcue_from_player(d, p);
+}
+
+/* What the player says its pads are, whenever that changes (at most once a
+ * second) - so a log shows what the pad lamps were decided from. */
+static void log_player_pads(void)
+{
+    static uint8_t last[2][8][4];
+    static long long at = 0;
+    long long t;
+    if (!rs_has(RBS_LEDSTAT))
+        return;
+    t = now_ms();
+    if (t - at < 1000)
+        return;
+    for (int d = 0; d < 2; d++) {
+        const struct rb_state_deck *k = &g_rs.deck[d];
+        uint8_t now[8][4];
+        for (int p = 0; p < 8; p++) {
+            now[p][0] = k->pad_led[p];
+            memcpy(&now[p][1], k->pad_rgb[p], 3);
+        }
+        if (!memcmp(now, last[d], sizeof(now)))
+            continue;
+        memcpy(last[d], now, sizeof(now));
+        at = t;
+        logmsg("flx4: deck%d player pads (bank %d):", d + 1, k->pad_mode);
+        for (int p = 0; p < 8; p++)
+            logmsg(" %d/%02x%02x%02x", now[p][0], now[p][1], now[p][2],
+                   now[p][3]);
+        logmsg("  -> cues:");
+        for (int p = 0; p < 8; p++)
+            logmsg("%c", hotcue_from_player(d, p) ? '1' + p : '.');
+        logmsg("\n");
     }
-    return 0;
 }
 
 static int pad_lamp(int d, int m, int p)
@@ -1417,6 +1489,7 @@ static void lamps_refresh(void)
 
     if (midi_fd < 0 || !opt_leds)
         return;
+    log_player_pads();
     for (int d = 0; d < 2; d++) {
         int ch = d == 0 ? MC_DECK1 : MC_DECK2;
         struct deck_model *m = &g_deck[d];
@@ -2269,6 +2342,63 @@ static char *find_midi_node(int card)
     return NULL;
 }
 
+/* Who has this device open?  A MIDI port is opened by one program at a time,
+ * and a second bridge that cannot get the FLX4 used to say only "waiting for
+ * a DDJ-FLX4" - while an OLD bridge from an earlier start kept driving it and
+ * every change seemed to do nothing. */
+static void name_holder(const char *node)
+{
+    char want[256], link[256], path[64];
+    DIR *procs, *fds;
+    struct dirent *p, *f;
+    ssize_t n;
+
+    if (!realpath(node, want))
+        snprintf(want, sizeof(want), "%s", node);
+    procs = opendir("/proc");
+    if (!procs)
+        return;
+    while ((p = readdir(procs))) {
+        int pid = atoi(p->d_name);
+        if (pid <= 0 || pid == (int)getpid())
+            continue;
+        snprintf(path, sizeof(path), "/proc/%d/fd", pid);
+        fds = opendir(path);
+        if (!fds)
+            continue;
+        while ((f = readdir(fds))) {
+            char fdpath[400];
+            snprintf(fdpath, sizeof(fdpath), "%s/%s", path, f->d_name);
+            n = readlink(fdpath, link, sizeof(link) - 1);
+            if (n <= 0)
+                continue;
+            link[n] = '\0';
+            if (strcmp(link, want) == 0) {
+                char cmd[200] = "";
+                FILE *c;
+                snprintf(fdpath, sizeof(fdpath), "/proc/%d/cmdline", pid);
+                c = fopen(fdpath, "r");
+                if (c) {
+                    size_t got = fread(cmd, 1, sizeof(cmd) - 1, c);
+                    for (size_t i = 0; i < got; i++)
+                        if (!cmd[i]) cmd[i] = ' ';
+                    cmd[got] = '\0';
+                    fclose(c);
+                }
+                logmsg("flx4: %s is held by pid %d: %s\n"
+                       "flx4: stop that (sudo python3 launch.py stop) - "
+                       "until then it, not this bridge, drives the FLX4\n",
+                       node, pid, cmd);
+                closedir(fds);
+                closedir(procs);
+                return;
+            }
+        }
+        closedir(fds);
+    }
+    closedir(procs);
+}
+
 static int open_midi(void)
 {
     if (midi_dev)
@@ -2287,10 +2417,15 @@ static int open_midi(void)
      * controller, and without writing to it every light stays dark and the
      * unit goes on blinking as though no host had claimed it. */
     {
+        static int told = 0;
         int fd = open(node, O_RDWR | O_NONBLOCK);
+        if (fd < 0 && errno == EBUSY && !told++)
+            name_holder(node);
         if (fd < 0 && errno == EACCES)
             fd = open(node, O_RDONLY | O_NONBLOCK);   /* read-only is better
                                                          than nothing */
+        if (fd >= 0)
+            told = 0;
         return fd;
     }
 }
@@ -2372,6 +2507,10 @@ int main(int argc, char **argv)
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
 
+#ifndef RB_BUILD_ID
+#define RB_BUILD_ID "dev"
+#endif
+    logmsg("flx4-bridge: build %s\n", RB_BUILD_ID);
     logmsg("flx4-bridge: %s -> %s (jog: engine %g/rev, wheel %g/rev, "
            "scale %g%s)\n",
            opt_sniff ? "SNIFF (no output)" : "bridge", fifo_path,

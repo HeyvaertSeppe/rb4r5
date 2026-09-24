@@ -353,6 +353,9 @@ def make_stubs(cfg) -> list[str]:
             path.unlink()
             notes.append(f"removed dev/{name} (must not exist)")
 
+    if cfg.get("touch.enabled", True) and cfg.get("touch.native", True):
+        notes += touch_calibration(cfg)
+
     # /dev/mem: memshim denies the open, but make the permission bits say no too
     for mem in (Path("/dev/mem"), dev / "mem"):
         if mem.exists():
@@ -362,6 +365,36 @@ def make_stubs(cfg) -> list[str]:
                 pass
 
     util.ensure_dir(cfg.chroot_media)
+    return notes
+
+
+# rbp reads its touch calibration from these (User first, then Factory):
+# offX, offY, scaleX, scaleY, checkX, checkY - one per line, order matters.
+# The native touch record is already in UI coordinates, so the calibration
+# has to be the identity, which is these six numbers (verified by the SC Live
+# 4 port; without them rbp does not accept the taps).  The firmware's own
+# files describe the RX3's resistive panel and would bend every touch.
+TOUCH_CALIB = "0\n0\n320\n200\n1280\n800\n"
+TOUCH_CALIB_FILES = ("root/settings/TouchCalib_User.dat",
+                     "root/settings/TouchCalib_Factory.dat")
+
+
+def touch_calibration(cfg) -> list[str]:
+    notes = []
+    for rel in TOUCH_CALIB_FILES:
+        path = inside(cfg.chroot, rel)
+        try:
+            if path.exists() and path.read_text() == TOUCH_CALIB:
+                continue
+            util.ensure_dir(path.parent)
+            if path.exists():
+                keep = path.with_name(path.name + ".rb4r5-orig")
+                if not keep.exists():
+                    shutil.copy2(path, keep)
+            path.write_text(TOUCH_CALIB)
+            notes.append(f"identity touch calibration in {rel}")
+        except OSError as exc:
+            notes.append(f"could not write {rel}: {exc}")
     return notes
 
 
@@ -485,7 +518,9 @@ def player_env(cfg, audio_env: dict) -> dict:
         env.update({
             "RB_TOUCH_NATIVE": "1",
             "RB_TOUCH_STATE": config.TOUCH_STATE,
-            "RB_TOUCH_FMT": str(cfg.get("touch.native_format", "fxy")),
+            "RB_TOUCH_FMT": str(cfg.get("touch.native_format", "rx3")),
+            "RB_TOUCH_INVX": "1" if cfg.get("touch.native_invert_x", True)
+                             else "0",
             "RB_TOUCH_MAXX": str(cfg.get("display.ui_width", 1280)),
             "RB_TOUCH_MAXY": str(cfg.get("display.ui_height", 800)),
         })

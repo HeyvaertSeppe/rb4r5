@@ -27,10 +27,22 @@ done
 if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
     # keyshim reads the player's memory at fixed ARM addresses and patches
     # one of its functions, so it is worth compiling as the ARM it will be
-    arm-linux-gnueabi-gcc -O2 -march=armv5t -mfloat-abi=soft \
-        -fno-stack-protector -fPIC -Wall -Wextra -Wno-unused-parameter \
-        -Werror -shared -o "$TMP/keyshim.so" src/shims/keyshim.c -lpthread \
-        && echo "  keyshim.c ok as soft-float ARM"
+    for shim in keyshim memshim audioshim; do
+        arm-linux-gnueabi-gcc -O2 -march=armv5t -mfloat-abi=soft \
+            -fno-stack-protector -fPIC -U_TIME_BITS -U_FILE_OFFSET_BITS \
+            -Wall -Wextra -Wno-unused-parameter -Wno-maybe-uninitialized \
+            -shared -o "$TMP/$shim.so" "src/shims/$shim.c" -lpthread -ldl \
+            || { echo "  $shim.c does NOT build as soft-float ARM"; fail=1; continue; }
+        # nothing newer than glibc 2.13 may be asked for (pthread_* are
+        # left out: they resolve in the RX3's own libpthread at 2.4)
+        new=$(arm-linux-gnueabi-objdump -T "$TMP/$shim.so" | grep -v pthread_ \
+              | grep -oE 'GLIBC_2\.(1[4-9]|[2-9][0-9])' | sort -u | tr '\n' ' ')
+        if [ -n "$new" ]; then
+            echo "  $shim.c asks for $new - glibc 2.13 cannot give it"; fail=1
+        else
+            echo "  $shim.c ok as soft-float ARM, glibc 2.13 symbols only"
+        fi
+    done
 fi
 
 echo "== C: keyshim's probes survive a wrong address"
@@ -43,6 +55,7 @@ if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1 && \
     # and as the soft-float ARM that runs inside the player, where the
     # compiler once moved a read above the marker that names its probe
     arm-linux-gnueabi-gcc -O2 -march=armv5t -mfloat-abi=soft -static \
+        -U_TIME_BITS -U_FILE_OFFSET_BITS \
         -Wall -Wno-unused-parameter -Wno-unused-function \
         -DRB_STATE_PATH="\"$TMP/state-arm.dat\"" \
         -DKLOG_PATH="\"$TMP/klog.txt\"" \
@@ -50,6 +63,13 @@ if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1 && \
         2>/dev/null
     qemu-arm-static "$TMP/probeguard-arm" > "$TMP/probeguard-arm.txt" || fail=1
     tail -1 "$TMP/probeguard-arm.txt"
+    echo "== C: the player's touch record (memshim, as ARM)"
+    arm-linux-gnueabi-gcc -O2 -march=armv5t -mfloat-abi=soft -static \
+        -U_TIME_BITS -U_FILE_OFFSET_BITS -Wall -Wno-unused-function \
+        -Wno-unused-parameter -Wno-maybe-uninitialized \
+        -o "$TMP/touchrec-arm" tools/tests/test_touch_record.c 2>/dev/null
+    qemu-arm-static "$TMP/touchrec-arm" > "$TMP/touchrec-arm.txt" || fail=1
+    tail -1 "$TMP/touchrec-arm.txt"
 fi
 
 echo "== C: framebuffer publish path (src/directfb/rb4r5_scale.h)"

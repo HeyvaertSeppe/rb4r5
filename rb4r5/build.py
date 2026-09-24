@@ -104,8 +104,12 @@ def build_host_tools(cfg, repo: Path, install: bool = True) -> list[str]:
     """Compile the daemons that run outside the chroot."""
     out = util.ensure_dir(cfg.work / "host")
     notes = []
-    util.run(["make", "-C", str(repo / "src/host"), f"OUT={out}",
-              f"-j{jobs(cfg)}"], timeout=600)
+    # -B: always rebuild.  make decides by file times, and a Pi without an
+    # RTC battery can boot with its clock behind - then freshly pulled
+    # sources look OLDER than the old binaries, "nothing to be done", and the
+    # old bridge is installed again as if it were new.  It takes seconds.
+    util.run(["make", "-B", "-C", str(repo / "src/host"), f"OUT={out}",
+              f"BUILD_ID={build_id(repo)}", f"-j{jobs(cfg)}"], timeout=600)
     for name in HOST_TOOLS:
         built = out / name
         if not built.exists():
@@ -133,6 +137,12 @@ def sources_digest(*dirs: Path) -> str:
                 h.update(str(path.relative_to(directory)).encode())
                 h.update(path.read_bytes())
     return h.hexdigest()
+
+
+def build_id(repo: Path) -> str:
+    """Twelve hex digits naming the sources a build came from.  The bridge
+    and keyshim print it when they start, so a log says which code ran."""
+    return sources_digest(repo / "src/host", repo / "src/shims")[:12]
 
 
 def _stamp_matches(stamp: Path, digest: str) -> bool:
@@ -174,9 +184,10 @@ def refresh_stale(cfg, repo: Path) -> list[str]:
             notes += build_host_tools(cfg, repo)
             host_stamp.write_text(host_digest + "\n")
         except (util.Fail, OSError) as exc:
-            util.warn(f"could not rebuild the host tools: {exc}\n"
-                      f"    the previous build keeps running; fix it with "
-                      f"`sudo python3 launch.py build`")
+            util.error(f"could not rebuild the controller bridge: {exc}\n"
+                       f"    THE OLD ONE KEEPS RUNNING - none of the bridge's "
+                       f"changes are in.\n    See the output above, or run "
+                       f"`sudo python3 launch.py build`")
 
     shim_digest = sources_digest(repo / "src/shims")
     shim_stamp = cfg.work / "shims" / ".rb4r5-shim-sources"
@@ -184,8 +195,8 @@ def refresh_stale(cfg, repo: Path) -> list[str]:
                     for n in SHIMS)
     if installed and not _stamp_matches(shim_stamp, shim_digest):
         if not util.have(CROSS + "gcc"):
-            util.warn("the shims' sources changed but the soft-float cross "
-                      "compiler is missing, so the player keeps the old ones:"
+            util.error("the shims' sources changed but the soft-float cross "
+                       "compiler is missing, so the player keeps the OLD ones:"
                       "\n    sudo apt-get install gcc-arm-linux-gnueabi "
                       "libc6-dev-armel-cross && sudo python3 launch.py build")
             return notes
@@ -196,9 +207,10 @@ def refresh_stale(cfg, repo: Path) -> list[str]:
             util.ensure_dir(shim_stamp.parent)
             shim_stamp.write_text(shim_digest + "\n")
         except (util.Fail, OSError) as exc:
-            util.warn(f"could not rebuild the shims: {exc}\n"
-                      f"    the player keeps the previous ones; fix it with "
-                      f"`sudo python3 launch.py build`")
+            util.error(f"could not rebuild the player's shims: {exc}\n"
+                       f"    THE OLD ONES KEEP RUNNING - none of keyshim's "
+                       f"changes are in.\n    See the output above, or run "
+                       f"`sudo python3 launch.py build`")
     return notes
 
 
@@ -236,8 +248,9 @@ def build_shims(cfg, repo: Path) -> list[str]:
         if not (compat / stub).exists():
             util.run([CROSS + "ar", "rcs", str(compat / stub)])
 
-    util.run(["make", "-C", str(repo / "src/shims"), f"RX3={root}",
-              f"OUT={out}", f"COMPAT={compat}", f"-j{jobs(cfg)}"], timeout=900)
+    util.run(["make", "-B", "-C", str(repo / "src/shims"), f"RX3={root}",
+              f"OUT={out}", f"COMPAT={compat}", f"BUILD_ID={build_id(repo)}",
+              f"-j{jobs(cfg)}"], timeout=900)
 
     notes = []
     for name in SHIMS:

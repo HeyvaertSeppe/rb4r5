@@ -35,6 +35,8 @@ for name in ("send_key", "tap_key", "send_ctrl", "tap_ctrl", "rotate", "value"):
 
 def daemon(**overrides):
     cfg = config.load("/nonexistent-rb4r5.json")
+    # these checks are about the zone map; native touch has its own below
+    overrides.setdefault("touch__native", False)
     for dotted, value in overrides.items():
         cfg.set(dotted.replace("__", "."), value)
     dae = touchd.TouchDaemon(cfg)
@@ -216,6 +218,27 @@ check("a press on the bar presses nothing", (lambda: (
     dae.handle_events([(EV_ABS, MTX, 10), (EV_ABS, MTY, 500),
                        (EV_ABS, TRACK, 3), SYN]),
     list(sent))[-1])(), [])
+
+# ------------------------------------------------------ native RX3 touch
+# The player reads the finger itself through the RX3's touch device and does
+# what an RX3 does with it.  The daemon only hands the position over: a zone
+# key as well would do every touch twice.
+published = []
+sent.clear()
+dae = daemon(touch__native=True)
+dae.publish_state = lambda down, nx, ny: published.append(
+    (down, round(nx, 2), round(ny, 2), time.monotonic()))
+touch_at(dae, 800, 900)          # where the play2 zone is
+move_to(dae, 700, 900)
+release(dae)
+check("native: no zone keys are pressed", sent, [])
+check("native: the finger goes to the player - down, moved, up",
+      [(d, x, y) for d, x, y, _ in published],
+      [(True, 0.8, 0.9), (True, 0.7, 0.9), (False, 0.7, 0.9)])
+check("native: a quick tap is held long enough for the player to see",
+      published[-1][3] - published[0][3] >= 0.085, True)
+check("native is the default", touchd.TouchDaemon(
+    config.load("/nonexistent-rb4r5.json")).native, True)
 
 print()
 if failures:

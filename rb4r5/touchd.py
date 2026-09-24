@@ -69,6 +69,13 @@ class TouchDaemon:
         self.on_zone = None        # callback for `calibrate`
         self.highlight: dict[str, int] = {}     # zone name -> highlighted row
         self.hold_ms = float(cfg.get("touch.hold_ms", 600))
+        # Native: the player reads the finger itself through the RX3's touch
+        # device, and handles it exactly as an RX3 does.  This daemon then
+        # only hands over where the finger is - pressing keys for zones as
+        # well would do every touch twice.
+        self.native = bool(cfg.get("touch.native", True))
+        self.min_tap = float(cfg.get("touch.native_min_tap_ms", 90)) / 1000.0
+        self.down_published_at = 0.0
 
     def _frame_fractions(self) -> tuple[float, float, float, float]:
         """Where the UI sits on the panel, as fractions of the panel.
@@ -174,6 +181,9 @@ class TouchDaemon:
         zone = contact.zone
         if self.on_zone:
             self.on_zone(nx, ny, zone)
+        if self.native:
+            self.log(f"native touch at {nx:.3f},{ny:.3f}")
+            return
         if not zone or zone.get("type") == "none":
             return
         kind = zone.get("type", "key")
@@ -199,7 +209,7 @@ class TouchDaemon:
                             abs(nx - contact.start_nx) + abs(ny - contact.start_ny))
         zone = contact.zone
         contact.nx, contact.ny = nx, ny
-        if not zone:
+        if not zone or self.native:
             return
         kind = zone.get("type", "key")
         if kind in ("scroll", "list"):
@@ -279,7 +289,7 @@ class TouchDaemon:
             return
         zone = contact.zone
         held_ms = (time.monotonic() - contact.t0) * 1000.0
-        if zone:
+        if zone and not self.native:
             kind = zone.get("type", "key")
             if kind == "key":
                 keys.send_key(zone["key"], zone.get("ch", 1), False)
@@ -356,6 +366,14 @@ class TouchDaemon:
         if frame.get("up"):
             # A release always wins, even in the same frame as a new contact.
             self._down_pending = False
+            if self.native and self.contact.active:
+                # The player samples its touch device about 60 times a second
+                # and throws the first "down" away as debounce, so a quick
+                # tap could come and go between two samples.  Hold it down
+                # long enough to be seen.
+                short = self.min_tap - (time.monotonic() - self.down_published_at)
+                if short > 0:
+                    time.sleep(min(short, 0.2))
             self.publish_state(False, self.contact.nx, self.contact.ny)
             self.up()
             return
@@ -379,12 +397,14 @@ class TouchDaemon:
                 return
             self.down(nx, ny)
             self.publish_state(True, nx, ny)
+            self.down_published_at = time.monotonic()
         elif self._down_pending and have_position:
             self._down_pending = False
             if not inside:
                 return
             self.down(nx, ny)
             self.publish_state(True, nx, ny)
+            self.down_published_at = time.monotonic()
         elif self.contact.active and have_position:
             self.move(nx, ny)
             self.publish_state(True, nx, ny)
@@ -394,8 +414,12 @@ class TouchDaemon:
     _down_pending = False
 
     def run(self, once: bool = False) -> int:
-        util.info("touch daemon starting "
-                  f"(zones: {self.cfg.get('touch.zones_file')})")
+        if self.native:
+            util.info("touch daemon starting: NATIVE - the player gets every "
+                      "touch through the RX3's own touch device")
+        else:
+            util.info("touch daemon starting "
+                      f"(zones: {self.cfg.get('touch.zones_file')})")
         util.info(self.frame_note())
         self.publish_state(False, 0.0, 0.0)
         backoff = 1.0

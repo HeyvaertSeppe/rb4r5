@@ -346,17 +346,39 @@ class Supervisor:
     # -- one of us at a time -------------------------------------------------
     DAEMONS = ("touchd", "overlay", "subucom", "usbwatch")
 
-    def other_supervisors(self) -> list[int]:
-        """Other `launch.py run` (or bare `launch.py`) processes."""
+    @staticmethod
+    def ancestors() -> set[int]:
+        """This process and every process it runs under.
+
+        `sudo python3 launch.py run` has "launch.py run" in sudo's own command
+        line too - and sudo can sit two levels up (it keeps a monitor process
+        for the terminal).  Taking it for another launcher killed the very
+        run that was starting, and with it the SSH session."""
+        out, pid = set(), os.getpid()
+        while pid > 1 and pid not in out:
+            out.add(pid)
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text()
+                pid = int(stat.rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+        return out
+
+    @classmethod
+    def other_supervisors(cls) -> list[int]:
+        """Other `launch.py run` (or bare `launch.py`) Python processes."""
         found = []
-        me, parent = os.getpid(), os.getppid()
+        mine = cls.ancestors()
         for pid in util.pgrep("launch.py"):
-            if pid in (me, parent):
+            if pid in mine:
                 continue
             try:
+                comm = Path(f"/proc/{pid}/comm").read_text().strip()
                 argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             except OSError:
                 continue
+            if not comm.startswith("python"):
+                continue                     # sudo, a shell, an editor...
             argv = [a.decode(errors="replace") for a in argv if a]
             at = next((i for i, a in enumerate(argv)
                        if a.endswith("launch.py")), None)
@@ -382,7 +404,8 @@ class Supervisor:
                              check=False, capture=True)
             if (getattr(state, "stdout", "") or "").strip() == "active":
                 util.warn("the rb4r5 boot service is running - stopping it so "
-                          "this run is the only one")
+                          "this run is the only one (this can take up to a "
+                          "minute)")
                 util.run(["systemctl", "stop", "rb4r5.service"], check=False,
                          timeout=90)
         others = self.other_supervisors()
@@ -414,8 +437,15 @@ class Supervisor:
                 except OSError:
                     pass
         for daemon in self.DAEMONS:
+            mine = self.ancestors()
             for pid in util.pgrep(f"launch.py {daemon}"):
-                if pid in (os.getpid(), os.getppid()):
+                if pid in mine:
+                    continue
+                try:
+                    if not Path(f"/proc/{pid}/comm").read_text().startswith(
+                            "python"):
+                        continue             # not the daemon, something naming it
+                except OSError:
                     continue
                 util.warn(f"stopping a leftover {daemon} ({pid})")
                 try:
